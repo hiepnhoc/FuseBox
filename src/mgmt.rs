@@ -227,10 +227,10 @@ async fn callback(State(app): State<Arc<App>>, Query(q): Query<CallbackQuery>) -
     };
     // Served from the OAuth callback port, so the page carries its own styles and no assets.
     Html(format!(
-        r##"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><meta name="theme-color" content="#0b0b0a"><title>{title} · Fusebox</title>
+        r##"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><meta name="theme-color" content="#0b0b0a"><title>{title} · HiBox</title>
 <body style="margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0b0a;color:#f2efe8;font:14px/1.45 'IBM Plex Sans',system-ui,-apple-system,sans-serif">
 <main style="box-sizing:border-box;width:min(420px,calc(100% - 32px));padding:22px 24px 24px;background:#121210;border:1px solid #24231f;border-radius:8px">
-<div style="font:600 11px/1 'IBM Plex Sans Condensed','IBM Plex Sans',system-ui,sans-serif;letter-spacing:.12em;text-transform:uppercase;color:#857f74">Fusebox</div>
+<div style="font:600 11px/1 'IBM Plex Sans Condensed','IBM Plex Sans',system-ui,sans-serif;letter-spacing:.12em;text-transform:uppercase;color:#857f74">HiBox</div>
 <h1 style="display:flex;align-items:center;gap:10px;font-size:17px;font-weight:600;margin:14px 0 6px"><span style="width:8px;height:8px;border-radius:50%;background:{dot}"></span>{title}</h1>
 <p style="color:#b4afa4;margin:0;font-size:13px">{body}</p></main></body>"##
     ))

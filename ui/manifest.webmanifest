@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "Fusebox",
-  "short_name": "Fusebox",
+  "name": "HiBox",
+  "short_name": "HiBox",
   "description": "All your AI subscriptions, one fast API: accounts, quota, live traffic and what has tripped.",
   "start_url": "/#/overview",
   "scope": "/",

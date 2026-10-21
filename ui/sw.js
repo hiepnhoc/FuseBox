@@ -21,14 +21,14 @@ function offline() {
   const host = self.location.host.replace(/[<>&"]/g, '');
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark"><meta name="theme-color" content="#0b0b0a"><title>Fusebox</title>
+<meta name="color-scheme" content="dark"><meta name="theme-color" content="#0b0b0a"><title>HiBox</title>
 <style>
 html,body{height:100%;margin:0;background:#0b0b0a;color:#f2efe8;font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
 main{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center;box-sizing:border-box}
 h1{margin:6px 0 0;font-size:19px;font-weight:600}p{margin:0;max-width:34ch;color:#b4afa4}b{color:#f2efe8;font-weight:500}
 button{margin-top:6px;height:44px;padding:0 20px;font:inherit;color:#0b0b0a;background:#f2efe8;border:0;border-radius:6px}
 button:focus-visible{outline:2px solid #4a4740;outline-offset:2px}
-</style></head><body><main>${MARK}<h1>Can’t reach Fusebox</h1>
+</style></head><body><main>${MARK}<h1>Can’t reach HiBox</h1>
 <p><b>${host}</b> isn’t answering. This page reloads by itself once it’s back.</p>
 <button type="button" onclick="location.reload()">Try again</button></main>
 <script>setInterval(function(){fetch('/healthz',{cache:'no-store'}).then(function(r){if(r.ok)location.reload()}).catch(function(){})},5000)</script>
@@ -42,7 +42,7 @@ self.addEventListener('push', (event) => {
   let msg = {};
   try { msg = event.data ? event.data.json() : {}; } catch {}
   const n = msg.notification || {};
-  const shown = self.registration.showNotification(n.title || 'Fusebox', {
+  const shown = self.registration.showNotification(n.title || 'HiBox', {
     body: n.body || '',
     tag: n.tag || undefined,
     renotify: !!n.tag,

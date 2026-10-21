@@ -269,7 +269,8 @@ h1, h2, h3, p { margin: 0; }
 }
 .brand { display: flex; align-items: center; flex: none; color: var(--fg); }
 .brand:hover { color: var(--fg); }
-.brand .wordmark { display: block; height: 16px; width: auto; aspect-ratio: 4327 / 914; }
+.brand .wordmark { display: block; font: 600 18px/1 var(--cond); letter-spacing: 0.01em; }
+.brand .wordmark .bkt { color: var(--brand); font-weight: 500; margin: 0 1px; }
 .brand .mark { display: none; width: 18px; height: 21px; }
 @media (max-width: 899px) { .brand .wordmark { display: none; } .brand .mark { display: block; } }
 .tabs { display: flex; flex: none; align-self: stretch; gap: clamp(14px, 1.6vw, 22px); margin-left: clamp(0px, 1vw, 12px); }

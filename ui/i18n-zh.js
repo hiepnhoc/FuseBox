@@ -222,7 +222,7 @@
       "Cached": "缓存",
       "CALLS": "调用",
       "Calls": "调用",
-      "Can't reach Fusebox": "无法连接 Fusebox",
+      "Can't reach HiBox": "无法连接 HiBox",
       "Cancel": "取消",
       "Cancelled": "已取消",
       "Certificate path": "证书路径",

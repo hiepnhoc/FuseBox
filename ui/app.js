@@ -3932,7 +3932,7 @@ async function boot() {
     await loadAll();
   } catch (e) {
     if (!(e instanceof ApiError && (e.status === 401 || e.status === 403))) {
-      view.innerHTML = `<div class="lock"><h1>Can't reach Fusebox</h1><p>${esc(e.message)}. Check that the server is running, then reload.</p></div>`;
+      view.innerHTML = `<div class="lock"><h1>Can't reach HiBox</h1><p>${esc(e.message)}. Check that the server is running, then reload.</p></div>`;
     }
     return;
   }
