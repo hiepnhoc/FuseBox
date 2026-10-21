@@ -376,6 +376,7 @@ fn views(app: &App) -> Vec<AccountView> {
                 Provider::Xai => "Grok",
                 Provider::Meta => "Meta",
                 Provider::Devin => "Devin",
+                Provider::Kiro => "Kiro",
                 Provider::Compat => compat.as_str(),
             }
             .to_string();

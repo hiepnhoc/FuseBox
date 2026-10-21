@@ -369,6 +369,11 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
             let v: Value = rb.send().await?.error_for_status()?.json().await?;
             (codex_windows(&v), v["plan_type"].as_str().map(String::from))
         }
+        Provider::Kiro => {
+            let Some((token, profile, region, machine)) = crate::kiro::account_creds(acct) else { return Ok(()) };
+            let v = crate::kiro::fetch_usage(&http, &token, profile.as_deref(), &region, &machine).await?;
+            crate::kiro::windows(&v)
+        }
         _ => return Ok(()),
     };
     let mut st = acct.state.lock();
@@ -475,6 +480,7 @@ pub fn usage(st: &mut crate::accounts::AccountState, provider: Provider, value: 
     let (windows, plan) = match provider {
         Provider::Claude => (claude_windows(value), None),
         Provider::Codex => (codex_windows(value), value["plan_type"].as_str().map(String::from)),
+        Provider::Kiro => crate::kiro::windows(value),
         _ => return,
     };
     authoritative(st, windows, plan);
@@ -515,6 +521,27 @@ async fn poll_account(app: &Arc<App>, acct: Arc<Account>) -> bool {
             Err(e) => tracing::debug!(account = %acct.label, "antigravity setup failed: {e:#}"),
         }
     }
+    // Kiro accounts learn their profile's models once, then follow their monthly credits.
+    if acct.provider == Provider::Kiro {
+        if !acct.is_oauth() || acct.state.lock().disabled {
+            return changed;
+        }
+        if acct.discovered.read().is_empty()
+            && crate::oauth::ensure_fresh(app, &acct, chrono::Duration::minutes(5), false).await.is_ok()
+            && let Some((token, profile, region, machine)) = crate::kiro::account_creds(&acct)
+        {
+            let http = app.http.control(acct.proxy_url.as_deref());
+            match crate::kiro::fetch_models(&http, &token, profile.as_deref(), &region, &machine).await {
+                Ok(models) if !models.is_empty() => {
+                    *acct.discovered.write() = models;
+                    changed = true;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!(account = %acct.label, "kiro model list failed: {e:#}"),
+            }
+        }
+        return changed | poll_usage(app, &acct).await;
+    }
     if !matches!(acct.provider, Provider::Claude | Provider::Codex) || !acct.is_oauth() {
         return changed;
     }
@@ -545,25 +572,32 @@ async fn poll_account(app: &Arc<App>, acct: Arc<Account>) -> bool {
         let st = acct.state.lock();
         changed |= (st.quota.plan.clone(), st.quota.subscription_plan.clone()) != before;
     }
+    changed | poll_usage(app, &acct).await
+}
+
+/// Asks the usage endpoint when the last reading is stale; true when it answered.
+async fn poll_usage(app: &Arc<App>, acct: &Arc<Account>) -> bool {
     let stale = {
         let st = acct.state.lock();
         !st.disabled && st.quota.needs_refresh(Utc::now(), st.quota_cooldowns.values().copied())
     };
-    if !stale || crate::oauth::ensure_fresh(app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
-        return changed;
+    if !stale || crate::oauth::ensure_fresh(app, acct, chrono::Duration::minutes(5), false).await.is_err() {
+        return false;
     }
     let before = acct.state.lock().quota.refreshed_at;
-    let result = poll(app, &acct).await;
+    let result = poll(app, acct).await;
     {
         let mut st = acct.state.lock();
         let refreshed = st.quota.refreshed_at.is_some() && st.quota.refreshed_at != before;
         st.quota.checked(Utc::now(), refreshed);
     }
     match result {
-        Ok(()) => changed = true,
-        Err(e) => tracing::debug!(account = %acct.label, "quota check failed: {e:#}"),
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!(account = %acct.label, "quota check failed: {e:#}");
+            false
+        }
     }
-    changed
 }
 
 #[cfg(test)]

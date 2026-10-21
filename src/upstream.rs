@@ -130,6 +130,7 @@ pub fn prepare(t: &Target, body: Value) -> Prepared {
         Kimi => kimi(t, body),
         Xai | Meta => responses_api(t, body),
         Devin => crate::devin::prepare(t, body),
+        Kiro => crate::kiro::prepare(t, body),
         Compat => compat(t, body),
     };
     push_custom(t.acct, &mut p.headers);
@@ -140,7 +141,9 @@ pub fn prepare(t: &Target, body: Value) -> Prepared {
 
 fn claude(t: &Target, mut body: Value) -> Prepared {
     let (token, base, oauth, account_uuid) = creds(t.acct);
-    let base = base.unwrap_or_else(|| CLAUDE_API.into());
+    // Anthropic-style base URLs end at the host; one given with `/v1` (the OpenAI habit)
+    // would otherwise be asked for `/v1/v1/messages`.
+    let base = base.map(|b| b.trim_end_matches("/v1").to_string()).unwrap_or_else(|| CLAUDE_API.into());
     let path = if t.count_tokens { "/v1/messages/count_tokens" } else { "/v1/messages" };
     let url = if oauth { format!("{base}{path}?beta=true") } else { format!("{base}{path}") };
     body["model"] = t.model.into();

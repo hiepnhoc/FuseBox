@@ -1042,6 +1042,9 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
             );
         }
         let devin = provider == Provider::Devin;
+        let kiro = provider == Provider::Kiro;
+        // Providers with their own dialect are built from the IR and decoded by their module.
+        let custom = devin || kiro;
         // Freeform (custom) tools only exist on OpenAI's own Responses backends.
         let custom_tools = call.format == Format::Responses
             && call.body["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["type"] == "custom"));
@@ -1089,7 +1092,7 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
                 original
             };
             if native == Format::Claude
-                && !devin
+                && !custom
                 && let Err(message) = formats::claude::validate_thinking_budget(req, &upstream_model)
             {
                 tracker.finish(400, &Usage::default(), Some(message.clone()));
@@ -1097,6 +1100,7 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
             }
             match native {
                 _ if devin => crate::devin::build_request(req, &upstream_model),
+                _ if kiro => crate::kiro::build_request(req, &upstream_model),
                 Format::Claude => formats::claude::build_request(req, &upstream_model),
                 Format::Responses => formats::responses::build_request(
                     req,
@@ -1158,7 +1162,7 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
             }
         }
         if native == Format::Claude
-            && !devin
+            && !custom
             && let Err(message) = formats::claude::validate_native_thinking_budget(&body, &upstream_model)
         {
             tracker.finish(400, &Usage::default(), Some(message.clone()));
@@ -1349,7 +1353,7 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
         // A stream is held back until it shows content, so an overload or rate limit
         // that arrives inside a 200 still goes to another account (see `bootstrap`).
         let mut body: Option<ByteStream> = None;
-        if is_sse && !devin {
+        if is_sse && !custom {
             let stream: ByteStream = Box::pin(resp.take().expect("response").bytes_stream());
             match bootstrap(stream, native, first_token).await {
                 Boot::Ready(stream) => body = Some(stream),
@@ -1447,6 +1451,8 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
 
         let events = if devin {
             crate::devin::event_stream(resp.take().expect("response"), names)
+        } else if kiro {
+            crate::kiro::event_stream(resp.take().expect("response"), names, upstream_model.clone())
         } else if let Some(body) = body {
             sse_events(body, native, names, acct.clone(), model.clone(), tracker.usage_tap())
         } else {

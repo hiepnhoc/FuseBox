@@ -219,12 +219,7 @@ fn route_scope(pool: &Pool, model: &str, only: Option<&Only>) -> String {
         Some(Only::Provider(p)) => format!("provider:{}", p.as_str()),
         None => {
             let vendor = |name: &str| {
-                PROVIDERS
-                    .iter()
-                    .find(|p| {
-                        !matches!(p, Provider::Antigravity | Provider::Devin | Provider::Compat) && p.family(name)
-                    })
-                    .copied()
+                PROVIDERS.iter().find(|p| !p.is_aggregator() && **p != Provider::Compat && p.family(name)).copied()
             };
             vendor(model)
                 .or_else(|| {

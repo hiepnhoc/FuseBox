@@ -26,11 +26,12 @@ pub enum Provider {
     Xai,
     Meta,
     Devin,
+    Kiro,
     #[serde(rename = "openai-compat")]
     Compat,
 }
 
-pub const PROVIDERS: [Provider; 10] = [
+pub const PROVIDERS: [Provider; 11] = [
     Provider::Claude,
     Provider::Codex,
     Provider::Gemini,
@@ -40,6 +41,7 @@ pub const PROVIDERS: [Provider; 10] = [
     Provider::Xai,
     Provider::Meta,
     Provider::Devin,
+    Provider::Kiro,
     Provider::Compat,
 ];
 
@@ -87,6 +89,18 @@ const DEVIN_MODELS: &[&str] = &[
     "swe-1-7-lightning",
 ];
 
+/// What Kiro profiles were serving when this was written. Each account's own list
+/// (`ListAvailableModels`) replaces it: organisations switch models off.
+const KIRO_MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5-1",
+    "claude-haiku-4-5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+];
+
 impl Provider {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -99,6 +113,7 @@ impl Provider {
             Provider::Xai => "xai",
             Provider::Meta => "meta",
             Provider::Devin => "devin",
+            Provider::Kiro => "kiro",
             Provider::Compat => "openai-compat",
         }
     }
@@ -115,6 +130,7 @@ impl Provider {
             "xai" | "grok" => Provider::Xai,
             "meta" | "muse" => Provider::Meta,
             "devin" | "windsurf" | "codeium" => Provider::Devin,
+            "kiro" | "codewhisperer" | "amazon-q" => Provider::Kiro,
             "compat" | "openai-compat" | "openai-compatibility" => Provider::Compat,
             _ => return None,
         })
@@ -129,8 +145,8 @@ impl Provider {
             Provider::Codex | Provider::Xai | Provider::Meta => &[Format::Responses],
             Provider::Gemini | Provider::Vertex | Provider::Antigravity => &[Format::Gemini],
             Provider::Kimi => &[Format::Chat, Format::Claude, Format::Responses],
-            // Devin speaks its own protobuf dialect, built from the IR.
-            Provider::Devin => &[],
+            // Devin (protobuf) and Kiro (conversation state) speak their own dialects, built from the IR.
+            Provider::Devin | Provider::Kiro => &[],
             Provider::Compat => &[Format::Chat],
         }
     }
@@ -140,9 +156,9 @@ impl Provider {
     pub fn serves(self, model: &str) -> bool {
         let aggregator_only = || {
             let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(model));
-            (known(ANTIGRAVITY_MODELS) || known(DEVIN_MODELS)) && !known(self.builtin_models())
+            (known(ANTIGRAVITY_MODELS) || known(DEVIN_MODELS) || known(KIRO_MODELS)) && !known(self.builtin_models())
         };
-        self.family(model) && (matches!(self, Provider::Antigravity | Provider::Devin) || !aggregator_only())
+        self.family(model) && (self.is_aggregator() || !aggregator_only())
     }
 
     /// Model-name families this provider can serve (used for explicit `provider/model`).
@@ -160,20 +176,23 @@ impl Provider {
             Provider::Kimi => m.starts_with("kimi-") || m.starts_with("moonshot-"),
             Provider::Xai => m.starts_with("grok-"),
             Provider::Meta => m.starts_with("muse-"),
-            Provider::Antigravity | Provider::Devin => {
+            Provider::Antigravity | Provider::Devin | Provider::Kiro => {
                 self.builtin_models().iter().any(|b| b.eq_ignore_ascii_case(model))
             }
             Provider::Compat => false,
         }
     }
 
+    /// Serves other vendors' models (Claude, GPT, Gemini) through one account.
+    pub fn is_aggregator(self) -> bool {
+        matches!(self, Provider::Antigravity | Provider::Devin | Provider::Kiro)
+    }
+
     /// Aggregators (Antigravity, Devin) also serve other vendors' models;
     /// requests prefer the vendor's own provider and overflow to them.
     pub fn first_party(self, model: &str) -> bool {
-        !matches!(self, Provider::Antigravity | Provider::Devin)
-            || !PROVIDERS
-                .iter()
-                .any(|p| !matches!(p, Provider::Antigravity | Provider::Devin | Provider::Compat) && p.serves(model))
+        !self.is_aggregator()
+            || !PROVIDERS.iter().any(|p| !p.is_aggregator() && *p != Provider::Compat && p.serves(model))
     }
 
     pub fn builtin_models(self) -> &'static [&'static str] {
@@ -250,6 +269,7 @@ impl Provider {
             ],
             Provider::Meta => &["muse-spark-1.3", "muse-spark-1.2", "muse-spark-1.1"],
             Provider::Devin => DEVIN_MODELS,
+            Provider::Kiro => KIRO_MODELS,
             Provider::Compat => &[],
         }
     }
@@ -568,8 +588,11 @@ impl Account {
         if self.aliases.iter().any(|a| a.name.eq_ignore_ascii_case(model) && !a.fork) {
             return None;
         }
-        let aggregator = matches!(self.provider, Provider::Antigravity | Provider::Devin);
-        let known = if forced { aggregator || self.provider.family(model) } else { self.provider.serves(model) }
+        let aggregator = self.provider.is_aggregator();
+        // A Kiro account that has read its profile's list serves nothing outside it.
+        let listed = self.provider == Provider::Kiro && !self.discovered.read().is_empty();
+        let known = (!listed
+            && if forced { aggregator || self.provider.family(model) } else { self.provider.serves(model) })
             || self.discovered.read().iter().any(|m| m.eq_ignore_ascii_case(model))
             || self.extra.iter().any(|m| m.eq_ignore_ascii_case(model));
         known.then(|| self.upstream_name(model))
@@ -577,6 +600,9 @@ impl Account {
 
     /// Kimi Code exposes `k3`, `kimi-for-coding`, ... while clients use `kimi-*` names.
     fn upstream_name(&self, model: &str) -> String {
+        if self.provider == Provider::Kiro {
+            return crate::kiro::model_id(model);
+        }
         if self.provider != Provider::Kimi || self.custom_base() {
             return model.to_string();
         }
@@ -586,6 +612,15 @@ impl Account {
             "kimi-k2.8" | "kimi-k2.8-code" | "kimi-k2.7-code" | "kimi-for-coding" => "kimi-for-coding".into(),
             "kimi-k2.7-code-highspeed" | "kimi-for-coding-highspeed" => "kimi-for-coding-highspeed".into(),
             other => other.strip_prefix("kimi-").unwrap_or(other).to_string(),
+        }
+    }
+
+    /// The provider's built-in names, unless the account's own list has replaced them.
+    fn builtin(&self) -> &'static [&'static str] {
+        if self.provider == Provider::Kiro && !self.discovered.read().is_empty() {
+            &[]
+        } else {
+            self.provider.builtin_models()
         }
     }
 
@@ -606,7 +641,7 @@ impl Account {
         }
         let shown =
             |m: &str| !self.excludes(m) && !self.aliases.iter().any(|a| a.name.eq_ignore_ascii_case(m) && !a.fork);
-        let first = match self.provider.builtin_models().iter().find(|m| same(m)) {
+        let first = match self.builtin().iter().find(|m| same(m)) {
             Some(m) => Some(shown(m)),
             None => match self.discovered.read().iter().find(|m| same(m)) {
                 Some(m) => Some(shown(m)),
@@ -620,7 +655,7 @@ impl Account {
         if !self.models.is_empty() {
             return self.models.iter().filter(|m| !self.excludes(&m.name)).map(|m| m.public().to_string()).collect();
         }
-        let mut out: Vec<String> = self.provider.builtin_models().iter().map(|s| s.to_string()).collect();
+        let mut out: Vec<String> = self.builtin().iter().map(|s| s.to_string()).collect();
         for m in self.discovered.read().iter().chain(&self.extra) {
             if !out.iter().any(|o| o.eq_ignore_ascii_case(m)) {
                 out.push(m.clone());

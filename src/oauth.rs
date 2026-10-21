@@ -496,6 +496,11 @@ async fn refresh_locked(acct: &Arc<Account>, http: reqwest::Client, old: OAuth) 
             let (token, expires) = crate::vertex::mint(&http, &sa).await?;
             OAuth { access_token: token, expires_at: Some(expires), ..old.clone() }
         }
+        Provider::Kiro => {
+            let (new, more) = crate::kiro::refresh(&http, &old).await?;
+            extra.extend(more);
+            new
+        }
         _ => return Ok(()),
     };
     publish_refreshed(acct, new, extra);

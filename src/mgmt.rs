@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocketUpgrade};
@@ -34,8 +34,18 @@ pub struct Login {
     pub user_code: Option<String>,
     #[serde(skip)]
     pub verifier: String,
+    /// Kiro: the OIDC client registered for this sign-in.
+    #[serde(skip)]
+    pub kiro: Option<crate::kiro::Pending>,
     #[serde(skip)]
     pub created: Instant,
+}
+
+/// What a sign-in may need beyond the provider (Kiro's Identity Center).
+#[derive(Clone, Default, Deserialize)]
+pub struct LoginOpts {
+    pub start_url: Option<String>,
+    pub region: Option<String>,
 }
 
 static CLAUDE_CB: AtomicBool = AtomicBool::new(false);
@@ -64,7 +74,7 @@ fn settle(app: &Arc<App>, state: &str, result: &Result<String>) {
     app.broadcast("login", json!({ "state": state }));
 }
 
-pub async fn start_login(app: &Arc<App>, provider: Provider) -> Result<(String, Login)> {
+pub async fn start_login_with(app: &Arc<App>, provider: Provider, opts: LoginOpts) -> Result<(String, Login)> {
     let state = oauth::random_state();
     match provider {
         Provider::Claude | Provider::Codex | Provider::Antigravity => {
@@ -80,6 +90,7 @@ pub async fn start_login(app: &Arc<App>, provider: Provider) -> Result<(String, 
                 kind: "redirect",
                 user_code: None,
                 verifier: pkce.verifier,
+                kiro: None,
                 created: Instant::now(),
             };
             remember(app, &state, &login);
@@ -96,6 +107,7 @@ pub async fn start_login(app: &Arc<App>, provider: Provider) -> Result<(String, 
                 kind: "device",
                 user_code: Some(dev.user_code.clone()),
                 verifier: String::new(),
+                kiro: None,
                 created: Instant::now(),
             };
             remember(app, &state, &login);
@@ -130,6 +142,68 @@ pub async fn start_login(app: &Arc<App>, provider: Provider) -> Result<(String, 
                 kind: "redirect",
                 user_code: None,
                 verifier: pkce.verifier,
+                kiro: None,
+                created: Instant::now(),
+            };
+            remember(app, &state, &login);
+            Ok((state, login))
+        }
+        Provider::Kiro => {
+            let http = app.http.control(None);
+            let region = opts
+                .region
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .unwrap_or(crate::kiro::DEFAULT_REGION)
+                .to_string();
+            let start_url = opts.start_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+            let Some(start_url) = start_url else {
+                // AWS Builder ID: approve a code in the browser.
+                let dev = crate::kiro::begin_device(&http, &region).await?;
+                let login = Login {
+                    provider,
+                    status: "pending",
+                    message: None,
+                    url: dev.verification_uri.clone(),
+                    callback: true,
+                    kind: "device",
+                    user_code: Some(dev.user_code.clone()),
+                    verifier: String::new(),
+                    kiro: None,
+                    created: Instant::now(),
+                };
+                remember(app, &state, &login);
+                let (app2, state2) = (app.clone(), state.clone());
+                tokio::spawn(async move {
+                    let result = async {
+                        let signed = crate::kiro::wait_device(&http, &dev).await?;
+                        save_signed(&app2, provider, signed)
+                    }
+                    .await;
+                    settle(&app2, &state2, &result);
+                });
+                return Ok((state, login));
+            };
+            // IAM Identity Center: the redirect must be registered with AWS, port and all.
+            let pkce = oauth::pkce();
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .context("cannot listen on localhost for the AWS redirect")?;
+            let port = listener.local_addr()?.port();
+            let redirect = format!("http://127.0.0.1:{port}/oauth/callback");
+            let (url, pending) = crate::kiro::begin_pkce(&http, start_url, &region, &redirect, &state, &pkce).await?;
+            serve_callback(app, listener, "/oauth/callback", provider, None);
+            let login = Login {
+                provider,
+                status: "pending",
+                message: None,
+                url,
+                callback: true,
+                kind: "redirect",
+                user_code: None,
+                verifier: pkce.verifier,
+                kiro: Some(pending),
                 created: Instant::now(),
             };
             remember(app, &state, &login);
@@ -241,7 +315,7 @@ fn html_escape(s: &str) -> String {
 }
 
 pub async fn complete_login(app: &Arc<App>, state: &str, code: &str) -> Result<String> {
-    let (provider, verifier) = {
+    let (provider, verifier, kiro) = {
         let logins = app.logins.lock();
         let l = logins.get(state).ok_or_else(|| anyhow!("unknown or expired login, start again"))?;
         if l.status != "pending" {
@@ -250,11 +324,16 @@ pub async fn complete_login(app: &Arc<App>, state: &str, code: &str) -> Result<S
         if l.kind == "device" {
             return Err(anyhow!("approve the code in your browser; there is nothing to paste"));
         }
-        (l.provider, l.verifier.clone())
+        (l.provider, l.verifier.clone(), l.kiro.clone())
     };
     let result = async {
         if provider == Provider::Devin {
             let signed = crate::devin::complete_login(app, code.trim(), &verifier).await?;
+            return save_signed(app, provider, signed);
+        }
+        if provider == Provider::Kiro {
+            let pending = kiro.ok_or_else(|| anyhow!("this Kiro sign-in has no registered client; start again"))?;
+            let signed = crate::kiro::complete_pkce(&app.http.control(None), &pending, code.trim()).await?;
             return save_signed(app, provider, signed);
         }
         let (cred, name, extra) = oauth::exchange(app, provider, code.trim(), state, &verifier).await?;
@@ -901,10 +980,10 @@ async fn apply_banked_reset(
 }
 async fn refresh_quota(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
-    if !matches!(acct.provider, Provider::Codex | Provider::Claude) || !acct.is_oauth() {
+    if !matches!(acct.provider, Provider::Codex | Provider::Claude | Provider::Kiro) || !acct.is_oauth() {
         return err(
             StatusCode::BAD_REQUEST,
-            "Subscription quota is only available for Codex and Claude OAuth accounts",
+            "Subscription quota is only available for Codex, Claude and Kiro OAuth accounts",
         );
     }
     if oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
@@ -1172,9 +1251,16 @@ async fn patch_settings(State(app): State<Arc<App>>, Json(body): Json<SettingsBo
     Json(response).into_response()
 }
 
-async fn login_start(State(app): State<Arc<App>>, Path(target): Path<String>) -> Response {
+async fn login_start(State(app): State<Arc<App>>, Path(target): Path<String>, body: String) -> Response {
     let Some(provider) = Provider::parse(&target) else { return err(StatusCode::BAD_REQUEST, "unknown provider") };
-    match start_login(&app, provider).await {
+    let opts = match body.trim() {
+        "" => LoginOpts::default(),
+        text => match serde_json::from_str::<LoginOpts>(text) {
+            Ok(o) => o,
+            Err(e) => return err(StatusCode::BAD_REQUEST, format!("invalid sign-in options: {e}")),
+        },
+    };
+    match start_login_with(&app, provider, opts).await {
         Ok((state, l)) => Json(json!({
             "state": state, "url": l.url, "callback": l.callback, "kind": l.kind, "user_code": l.user_code,
         }))

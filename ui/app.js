@@ -106,7 +106,7 @@ applyTheme();
 
 const PROVIDER = {
   claude: 'Claude', codex: 'Codex', gemini: 'Gemini', vertex: 'Vertex AI', antigravity: 'Antigravity',
-  kimi: 'Kimi', xai: 'Grok', meta: 'Meta', devin: 'Devin', 'openai-compat': 'Compatible',
+  kimi: 'Kimi', xai: 'Grok', meta: 'Meta', devin: 'Devin', kiro: 'Kiro', 'openai-compat': 'Compatible',
 };
 // Accounts you can sign in to: [id, name, what it connects].
 const SIGNIN = [
@@ -117,6 +117,7 @@ const SIGNIN = [
   ['kimi', 'Kimi', 'Kimi Code membership'],
   ['meta', 'Meta', 'Muse Spark'],
   ['devin', 'Devin', 'Devin or Windsurf account'],
+  ['kiro', 'Kiro', 'AWS Builder ID or IAM Identity Center'],
   ['vertex', 'Vertex AI', 'Google Cloud service account key'],
 ];
 const LOGIN = {
@@ -127,6 +128,7 @@ const LOGIN = {
   kimi: { name: 'Kimi', intro: 'Connect a Kimi Code membership.' },
   xai: { name: 'Grok', intro: 'Connect a SuperGrok or X Premium subscription.' },
   meta: { name: 'Meta', intro: 'Connect a Meta account for Muse models.' },
+  kiro: { name: 'Kiro', intro: 'Connect a Kiro account: AWS Builder ID, or your organisation’s IAM Identity Center.', example: 'http://127.0.0.1:…/oauth/callback?code=…&state=…' },
 };
 const DEVICE_CODE = new Set(['kimi', 'xai', 'meta']);
 const CLIENT = { openai: 'OpenAI', responses: 'Responses', claude: 'Anthropic', gemini: 'Gemini' };
@@ -134,7 +136,7 @@ const ENDPOINT = { openai: '/v1/chat/completions', responses: '/v1/responses', c
 
 // Real provider logos live in the inline sprite (ui/logos.svg). OpenAI-compatible
 // groups get their vendor's logo when the name gives it away.
-const LOGOS = new Set(['claude', 'codex', 'gemini', 'vertex', 'antigravity', 'xai', 'kimi', 'meta', 'devin']);
+const LOGOS = new Set(['claude', 'codex', 'gemini', 'vertex', 'antigravity', 'xai', 'kimi', 'meta', 'devin', 'kiro']);
 const COMPAT_LOGOS = [
   ['openrouter', 'openrouter'], ['ollama', 'ollama'], ['lmstudio', 'lmstudio'], ['deepseek', 'deepseek'], ['groq', 'groq'],
   ['mistral', 'mistral'], ['qwen', 'qwen'], ['dashscope', 'qwen'], ['moonshot', 'kimi'], ['kimi', 'kimi'], ['grok', 'xai'],
@@ -943,14 +945,14 @@ function windowOf(a, short) {
     .sort((x, y) => y.used - x.used)[0];
 }
 
-const windowLabel = (w, short) => (short ? (w ? w.name.toUpperCase() : '5H') : w && w.name === 'day' ? 'DAY' : 'WK');
-const windowTitle = (w) => (/^\d+h$/.test(w.name) ? `${w.name.replace('h', '')}-hour` : w.name === 'day' ? 'Daily' : 'Weekly');
+const windowLabel = (w, short) => (short ? (w ? w.name.toUpperCase() : '5H') : w && w.name === 'day' ? 'DAY' : w && w.name === 'month' ? 'MO' : 'WK');
+const windowTitle = (w) => (/^\d+h$/.test(w.name) ? `${w.name.replace('h', '')}-hour` : w.name === 'day' ? 'Daily' : w.name === 'month' ? 'Monthly' : 'Weekly');
 
 // A window's length from its name ("5h", "day", "week"), in seconds.
 function windowSeconds(w) {
   const h = /^(\d+)h$/.exec(w?.name || '');
   if (h) return Number(h[1]) * 3600;
-  return { day: 86400, week: 7 * 86400 }[w?.name] || null;
+  return { day: 86400, week: 7 * 86400, month: 30 * 86400 }[w?.name] || null;
 }
 
 // How far through its window we are, 0 to 1, when the window says when it resets.
@@ -2337,6 +2339,7 @@ function panelHTML() {
   if (S.panel === 'connect') return connectPanelHTML();
   if (S.panel === 'vertex') return vertexPanelHTML();
   if (S.panel === 'vertex-done') return doneHTML('Vertex AI', S.login);
+  if (S.panel === 'kiro' && !S.login) return kiroPanelHTML();
   if (LOGIN[S.panel]) return S.login && S.login.kind === 'device' ? devicePanelHTML() : loginPanelHTML();
   return '';
 }
@@ -2427,6 +2430,20 @@ function vertexPanelHTML() {
     </div>
     <div class="actions"><button class="btn primary" type="submit">Add service account</button><button class="btn ghost" type="button" data-act="close-panel">Cancel</button></div>
     <p class="msg" id="vertex-msg" aria-live="polite"></p>
+  </form>`;
+}
+
+// Kiro signs in through AWS: Builder ID needs nothing, Identity Center its start URL.
+function kiroPanelHTML() {
+  return `<form class="panel" data-form="kiro" aria-label="Sign in with Kiro">
+    <h3>Sign in with Kiro</h3>
+    <p>${LOGIN.kiro.intro} Credentials stay on this machine.</p>
+    <div class="grid">
+      <label class="field wide"><span>Identity Center start URL</span><input type="url" name="start_url" placeholder="https://d-…….awsapps.com/start" autocomplete="off" spellcheck="false"><small>Leave empty to sign in with AWS Builder ID.</small></label>
+      <label class="field"><span>Region</span><input type="text" name="region" placeholder="us-east-1" autocomplete="off" spellcheck="false"><small>Where the Identity Center or Builder ID lives.</small></label>
+    </div>
+    <div class="actions"><button class="btn primary" type="submit">Sign in</button><button class="btn ghost" type="button" data-act="close-panel">Cancel</button></div>
+    <p class="msg" id="kiro-msg" aria-live="polite"></p>
   </form>`;
 }
 
@@ -3020,7 +3037,7 @@ document.addEventListener('keydown', (e) => {
 
 const MODEL_EXAMPLE = {
   claude: 'claude-opus-6', codex: 'gpt-7', gemini: 'gemini-4-pro', vertex: 'gemini-4-pro', antigravity: 'gemini-4-pro',
-  kimi: 'kimi-k4', xai: 'grok-5', meta: 'muse-spark-2', devin: 'swe-2',
+  kimi: 'kimi-k4', xai: 'grok-5', meta: 'muse-spark-2', devin: 'swe-2', kiro: 'claude-opus-5',
 };
 
 // Providers a model can be added for: the connected ones (compatible providers list their own).
@@ -3467,6 +3484,11 @@ async function submitPaste(form) {
   schedulePoll();
 }
 
+function submitKiro(form) {
+  const data = Object.fromEntries(new FormData(form).entries());
+  return startLogin('kiro', { start_url: (data.start_url || '').trim(), region: (data.region || '').trim() });
+}
+
 async function submitVertex(form) {
   const data = Object.fromEntries(new FormData(form).entries());
   const msg = $('#vertex-msg');
@@ -3818,6 +3840,7 @@ document.addEventListener('submit', async (e) => {
   if (kind === 'key') return submitKey(form);
   if (kind === 'add-model') return submitAddModel(form);
   if (kind === 'vertex') return submitVertex(form);
+  if (kind === 'kiro') return submitKiro(form);
   if (kind === 'unlock') {
     S.key = form.elements.key.value.trim();
     try {

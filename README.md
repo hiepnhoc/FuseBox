@@ -71,6 +71,7 @@ fusebox login xai           # SuperGrok / X Premium (shows a code to confirm)
 fusebox login kimi          # Kimi Code (shows a code to confirm)
 fusebox login meta          # Meta Muse (shows a code to confirm)
 fusebox login devin         # Devin / Windsurf
+fusebox login kiro          # Kiro with AWS Builder ID; --start-url … --region … for IAM Identity Center
 fusebox login vertex --file key.json --location global   # Vertex AI service account
 ```
 

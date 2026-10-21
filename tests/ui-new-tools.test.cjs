@@ -85,7 +85,7 @@ test('the pace says when a window runs out only when that is before it resets', 
   assert.equal(run(`runsOutAt(${JSON.stringify({ name: '5h', used: 30, resets_at: resetsIn(4.9) })}, ${now})`), null);
   assert.equal(run(`runsOutAt(${JSON.stringify({ ...fast, used: 100 })}, ${now})`), null);
   assert.equal(run(`windowElapsed(${JSON.stringify({ name: 'week', used: 10, resets_at: resetsIn(84) })}, ${now})`), 0.5);
-  assert.equal(run(`windowElapsed(${JSON.stringify({ name: 'month', used: 10, resets_at: resetsIn(1) })}, ${now})`), null);
+  assert.equal(run(`windowElapsed(${JSON.stringify({ name: 'year', used: 10, resets_at: resetsIn(1) })}, ${now})`), null);
   // 80% in two and a half hours is 32% an hour.
   assert.equal(run(`burnRate(${JSON.stringify(fast)}, ${now})`), 32);
 });
