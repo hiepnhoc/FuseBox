@@ -2355,7 +2355,7 @@ function connectPanelHTML() {
 }
 
 function loginStatus(L, port) {
-  if (!L || L.status === 'starting') return '<span class="wait"><span class="pulse"></span>Opening the sign-in page…</span>';
+  if (!L || L.status === 'starting') return `<span class="wait"><span class="pulse"></span>Preparing the sign-in link…</span>`;
   if (L.status === 'done') return `<span class="ok">Connected ${esc(who(L.message) || '')}</span>`;
   if (L.status === 'error') return `<span class="err">${esc(hideEmails(L.message) || 'Sign-in failed')}</span>`;
   if (L.kind === 'device') return '<span class="wait"><span class="pulse"></span>Waiting for you to approve…</span>';
@@ -2369,7 +2369,10 @@ function doneHTML(name, L) {
     <div class="actions"><button class="btn" type="button" data-act="close-panel">Done</button></div></div>`;
 }
 
-const reopen = (L, text) => (L && L.url ? ` <a class="link" href="${esc(L.url)}" target="_blank" rel="noopener">${text} ${ICON.external.replace('<svg', '<svg style="width:12px;height:12px;vertical-align:-1px"')}</a>` : '');
+const reopen = (L, text) => (L && L.url ? ` <a class="link" href="${esc(L.url)}" target="_blank" rel="noopener">${text} ${ICON.external.replace('<svg', '<svg style="width:12px;height:12px;vertical-align:-1px"')}</a> <button class="linkbtn" type="button" data-act="copy" data-text="${esc(L.url)}" data-toast="Sign-in link copied">Copy link</button>` : '');
+// Step one of a sign-in: nothing opens by itself, so the link can go into a private
+// window signed in to the account that should be added.
+const openStep = (L) => `<b>Open the sign-in link</b> in a private window, with the account you want.${reopen(L, 'Open it here')}`;
 
 function loginPanelHTML() {
   const L = S.login;
@@ -2379,7 +2382,7 @@ function loginPanelHTML() {
     <h3>Sign in with ${info.name}</h3>
     <p>${info.intro} Credentials stay on this machine.</p>
     <ol class="steps">
-      <li><span class="n">1</span><div class="t"><b>Approve access</b> in the tab that opened.${reopen(L, 'Open sign-in page again')}</div></li>
+      <li><span class="n">1</span><div class="t">${openStep(L)}</div></li>
       <li><span class="n">2</span><div class="t" aria-live="polite">${loginStatus(L, info.port)}</div></li>
     </ol>
     <div class="divider"></div>
@@ -2406,7 +2409,7 @@ function devicePanelHTML() {
     <h3>Sign in with ${info.name}</h3>
     <p>${info.intro} Credentials stay on this machine.</p>
     <ol class="steps">
-      <li><span class="n">1</span><div class="t"><b>Open ${esc(host || 'the sign-in page')}</b> in the tab that opened.${reopen(L, 'Open it again')}</div></li>
+      <li><span class="n">1</span><div class="t">${openStep(L)}</div></li>
       <li><span class="n">2</span><div class="t"><b>Check the code matches</b> <span class="code-chip">${esc(L.user_code || '')}</span> <button class="linkbtn" type="button" data-act="copy" data-text="${esc(L.user_code || '')}" data-toast="Code copied">Copy</button></div></li>
       <li><span class="n">3</span><div class="t" aria-live="polite">${loginStatus(L)}</div></li>
     </ol>
@@ -3400,26 +3403,23 @@ function bindLock() {
 
 // ---------------------------------------------------------------- actions
 
-async function startLogin(provider) {
+async function startLogin(provider, opts) {
   S.panel = provider;
-  if (provider === 'vertex') {
+  if (provider === 'vertex' || (provider === 'kiro' && !opts)) {
     S.login = null;
     if (S.route !== 'accounts' || S.sub) location.hash = '#/accounts';
     else { patch('acct-panel', panelHTML); patch('acct-head', accountHeadHTML); }
-    $('textarea[name="json"]')?.focus();
+    $(provider === 'vertex' ? 'textarea[name="json"]' : 'input[name="start_url"]')?.focus();
     return;
   }
   S.login = { provider, status: 'starting' };
   if (S.route !== 'accounts' || S.sub) location.hash = '#/accounts';
   else { patch('acct-panel', panelHTML); patch('acct-head', accountHeadHTML); }
-  // Open the tab synchronously so popup blockers allow it.
-  const tab = window.open('about:blank', '_blank');
+  // Nothing opens by itself: the panel shows the link, to copy into a private window.
   try {
-    const r = await api(`/login/${provider}`, { method: 'POST' });
+    const r = await api(`/login/${provider}`, { method: 'POST', body: opts ? JSON.stringify(opts) : undefined });
     S.login = { provider, state: r.state, url: r.url, callback: r.callback, kind: r.kind, user_code: r.user_code, status: 'pending' };
-    if (tab) { tab.opener = null; tab.location.href = r.url; }
   } catch (e) {
-    tab?.close();
     S.login = { provider, status: 'error', message: e.message };
   }
   patch('acct-panel', panelHTML);
