@@ -757,10 +757,12 @@ impl Account {
         let pauses = st.pauses(now);
         let cooldowns: BTreeMap<&str, String> = pauses.iter().map(|(k, (t, _))| (k.as_str(), t.to_rfc3339())).collect();
         let kinds: BTreeMap<&str, &str> = pauses.iter().map(|(k, (_, kind))| (k.as_str(), *kind)).collect();
-        let (kind, expires, email) = match &*self.cred.read() {
-            Credential::OAuth(o) if o.raw.contains_key("service_account") => ("service-account", None, o.email.clone()),
-            Credential::OAuth(o) => ("oauth", o.expires_at.map(|t| t.to_rfc3339()), o.email.clone()),
-            Credential::ApiKey { .. } => ("api-key", None, None),
+        let (kind, expires, email, base_url) = match &*self.cred.read() {
+            Credential::OAuth(o) if o.raw.contains_key("service_account") => {
+                ("service-account", None, o.email.clone(), None)
+            }
+            Credential::OAuth(o) => ("oauth", o.expires_at.map(|t| t.to_rfc3339()), o.email.clone(), None),
+            Credential::ApiKey { base_url, .. } => ("api-key", None, None, base_url.clone()),
         };
         serde_json::json!({
             "id": self.id,
@@ -781,6 +783,9 @@ impl Account {
             "quota": st.quota,
             "banked_resets": st.banked_resets,
             "models": self.public_models(),
+            // The configured upstream-name/alias pairs, for editing an API key's model list.
+            "model_map": self.models,
+            "base_url": base_url,
         })
     }
 }

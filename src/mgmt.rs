@@ -13,7 +13,7 @@ use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -381,6 +381,8 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/accounts/{id}/quota/refresh", post(refresh_quota))
         .route("/accounts/{id}/activity", get(account_activity))
         .route("/accounts/{id}/priority", post(set_priority))
+        .route("/accounts/{id}/models", put(set_account_models))
+        .route("/accounts/{id}/models/fetch", post(fetch_account_models))
         .route("/clients/usage", get(client_usage))
         .route("/playground", post(crate::server::playground))
         .route("/routes", get(routes))
@@ -1033,39 +1035,93 @@ struct KeyModelsBody {
     base_url: String,
 }
 
-/// Asks an OpenAI-compatible server which models it serves, for the "Add an API
-/// key" form: `GET {base_url}/models` with the key, answered as a sorted id list.
-async fn list_key_models(State(app): State<Arc<App>>, Json(b): Json<KeyModelsBody>) -> Response {
-    let base = b.base_url.trim().trim_end_matches('/');
+/// `GET {base_url}/models` with the key, as a sorted id list, or why not.
+async fn upstream_model_ids(app: &App, base_url: &str, api_key: &str) -> Result<Vec<String>, (StatusCode, String)> {
+    let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
-        return err(StatusCode::BAD_REQUEST, "base URL is required");
+        return Err((StatusCode::BAD_REQUEST, "base URL is required".into()));
     }
     if url::Url::parse(base).is_err() {
-        return err(StatusCode::BAD_REQUEST, "base URL is not a valid URL");
+        return Err((StatusCode::BAD_REQUEST, "base URL is not a valid URL".into()));
     }
     let mut req = app.http.control(None).get(format!("{base}/models")).timeout(Duration::from_secs(20));
-    let key = b.api_key.trim();
+    let key = api_key.trim();
     if !key.is_empty() {
         req = req.bearer_auth(key);
     }
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("could not reach {base}/models: {e}")),
-    };
+    let resp =
+        req.send().await.map_err(|e| (StatusCode::BAD_GATEWAY, format!("could not reach {base}/models: {e}")))?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         let snippet: String = text.chars().take(200).collect();
-        return err(StatusCode::BAD_GATEWAY, format!("{base}/models answered {status}: {}", snippet.trim()));
+        return Err((StatusCode::BAD_GATEWAY, format!("{base}/models answered {status}: {}", snippet.trim())));
     }
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return err(StatusCode::BAD_GATEWAY, format!("{base}/models did not answer with JSON"));
-    };
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, format!("{base}/models did not answer with JSON")))?;
     let models = crate::compat::model_ids(&v);
     if models.is_empty() {
-        return err(StatusCode::BAD_GATEWAY, format!("{base}/models listed no models"));
+        return Err((StatusCode::BAD_GATEWAY, format!("{base}/models listed no models")));
     }
-    Json(json!({ "models": models })).into_response()
+    Ok(models)
+}
+
+/// Asks an OpenAI-compatible server which models it serves, for the "Add an API
+/// key" form: `GET {base_url}/models` with the key, answered as a sorted id list.
+async fn list_key_models(State(app): State<Arc<App>>, Json(b): Json<KeyModelsBody>) -> Response {
+    match upstream_model_ids(&app, &b.base_url, &b.api_key).await {
+        Ok(models) => Json(json!({ "models": models })).into_response(),
+        Err((status, msg)) => err(status, msg),
+    }
+}
+
+/// The same question for an API key that is already configured, so its model
+/// list can be brought up to date from the account page.
+async fn fetch_account_models(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    if acct.provider != Provider::Compat {
+        return err(StatusCode::BAD_REQUEST, "only OpenAI-compatible keys list their models this way");
+    }
+    let (key, base) = match &*acct.cred.read() {
+        Credential::ApiKey { key, base_url } => (key.clone(), base_url.clone().unwrap_or_default()),
+        _ => (String::new(), String::new()),
+    };
+    match upstream_model_ids(&app, &base, &key).await {
+        Ok(models) => Json(json!({ "models": models })).into_response(),
+        Err((status, msg)) => err(status, msg),
+    }
+}
+
+#[derive(Deserialize)]
+struct AccountModelsBody {
+    models: Vec<ModelAlias>,
+}
+
+/// Replaces the model list of the openai-compatibility group an account belongs to.
+async fn set_account_models(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(b): Json<AccountModelsBody>,
+) -> Response {
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    let Some(group) = acct.group.clone().filter(|_| acct.provider == Provider::Compat) else {
+        return err(StatusCode::BAD_REQUEST, "only OpenAI-compatible keys have an editable model list");
+    };
+    let models: Vec<(String, Option<String>)> = b
+        .models
+        .into_iter()
+        .map(|m| (m.name.trim().to_string(), m.alias.map(|a| a.trim().to_string()).filter(|a| !a.is_empty())))
+        .filter(|(n, _)| !n.is_empty())
+        .collect();
+    if models.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "list at least one model");
+    }
+    let mut found = false;
+    let resp = edit_config(&app, |doc| found = crate::compat::set_models(doc, &group, &models));
+    if !found {
+        return err(StatusCode::NOT_FOUND, format!("config.yaml has no openai-compatibility group named {group}"));
+    }
+    resp
 }
 
 #[derive(Deserialize)]

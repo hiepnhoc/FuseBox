@@ -2276,11 +2276,85 @@ function detSigninHTML(a) {
   }
   const models = (a.models || []).slice(0, 24);
   const more = (a.models || []).length - models.length;
+  const compat = a.provider === 'openai-compat';
+  const editing = compat && S.modelEdit && S.modelEdit.id === a.id;
+  const fetchBtn = compat && !editing ? `<button class="linkbtn fetch-models" type="button" data-act="acct-fetch-models" data-id="${esc(a.id)}">Fetch models</button>` : '';
+  const serves = editing
+    ? `<div class="kv col" style="gap:6px"><span>Serves</span>${acctModelPickerHTML(S.modelEdit)}</div>`
+    : `<div class="kv col" style="gap:6px"><span>Serves ${fetchBtn}</span><span class="chipset">${models.map((m) => `<span class="idchip static">${esc(m)}</span>`).join('')}${more > 0 ? `<span class="idchip static">+${more} more</span>` : ''}${models.length ? '' : '<span class="dim">No models</span>'}</span></div>`;
   return `<section class="card" style="padding:${pad}" aria-label="Sign-in"><span class="label">Sign-in</span>
     <div style="margin-top:10px">${rows.map(([k, v]) => `<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`).join('')}
       <div class="kv col"><span>Stored in</span><span class="mono fg2" style="font-size:12px;word-break:break-all">${esc(storedIn(a))}</span></div>
-      <div class="kv col" style="gap:6px"><span>Serves</span><span class="chipset">${models.map((m) => `<span class="idchip static">${esc(m)}</span>`).join('')}${more > 0 ? `<span class="idchip static">+${more} more</span>` : ''}${models.length ? '' : '<span class="dim">No models</span>'}</span></div></div>
+      ${serves}</div>
     ${canSignIn(a) ? `<button class="btn" type="button" data-act="signin-again" data-id="${esc(a.id)}" style="margin:8px 0;${mob() ? 'width:100%;height:44px' : ''}">Sign in again</button>` : ''}</section>`;
+}
+
+// Editing an OpenAI-compatible key's model list on its account page: the server's
+// list as chips, the configured ones pressed (aliases kept), saved back to config.yaml.
+function acctModelPickerHTML(M) {
+  if (M.status === 'loading') return '<span class="wait"><span class="pulse"></span>Asking the server for its models…</span>';
+  if (M.status === 'error') return `<span class="msg err">${esc(M.message)}</span> <button class="linkbtn" type="button" data-act="acct-cancel-models">Close</button>`;
+  const all = acctModelUniverse(M);
+  return `<div class="model-pick">
+    <div class="model-pick-head"><span><span class="mono">${esc(M.host)}</span> · ${M.list.length} models · ${M.picked.length} picked</span>${all.length > 12 ? `<input type="search" name="acct-model-filter" placeholder="Filter" value="${esc(M.filter || '')}" autocomplete="off">` : ''}</div>
+    <div class="chips" id="acct-model-chips">${acctModelChipsHTML(M)}</div>
+    <div class="actions" style="margin:0"><button class="btn primary sm" type="button" data-act="acct-save-models" data-id="${esc(M.id)}" ${M.picked.length ? '' : 'disabled'}>Save models</button><button class="btn ghost sm" type="button" data-act="acct-cancel-models">Cancel</button></div>
+  </div>`;
+}
+
+// Every model worth a chip: what the server lists, plus configured ones it no longer lists.
+const acctModelUniverse = (M) => [...M.list, ...M.picked.filter((n) => !M.list.includes(n))];
+
+function acctModelChipsHTML(M) {
+  const q = (M.filter || '').trim().toLowerCase();
+  const shown = acctModelUniverse(M).filter((n) => !q || n.toLowerCase().includes(q) || (M.aliases[n] || '').toLowerCase().includes(q));
+  if (!shown.length) return '<span class="msg">No model matches.</span>';
+  return shown.map((n) => {
+    const alias = M.aliases[n];
+    const missing = !M.list.includes(n);
+    return `<button class="idchip" type="button" data-act="acct-pick-model" data-id="${esc(n)}" aria-pressed="${M.picked.includes(n)}" title="${missing ? 'Configured, but the server does not list it' : ''}">${alias ? `<span class="pfx">${esc(alias)}=</span>` : ''}${esc(n)}${missing ? '<span class="tag">not listed</span>' : ''}</button>`;
+  }).join('');
+}
+
+// The entries to save: picked models in order, each with the alias it had.
+const acctModelEntries = (M) => M.picked.map((name) => (M.aliases[name] ? { name, alias: M.aliases[name] } : { name }));
+
+async function fetchAccountModels(id) {
+  const a = accountById(id);
+  if (!a) return;
+  const current = a.model_map || [];
+  S.modelEdit = { id, status: 'loading' };
+  patch('det-root', detailBodyHTML);
+  try {
+    const r = await api(`/accounts/${encodeURIComponent(id)}/models/fetch`, { method: 'POST' });
+    let host = storedIn(a);
+    try { host = new URL(a.base_url || '').host || host; } catch {}
+    const aliases = Object.fromEntries(current.filter((m) => m.alias).map((m) => [m.name, m.alias]));
+    S.modelEdit = { id, status: 'done', list: r.models, picked: current.map((m) => m.name), aliases, host, filter: '' };
+  } catch (e) {
+    S.modelEdit = { id, status: 'error', message: e.message };
+  }
+  if (S.route === 'accounts' && S.sub === id) patch('det-root', detailBodyHTML);
+}
+
+function pickAccountModel(name) {
+  const M = S.modelEdit;
+  if (!M || M.status !== 'done') return;
+  M.picked = M.picked.includes(name) ? M.picked.filter((n) => n !== name) : [...M.picked, name];
+  patch('det-root', detailBodyHTML);
+}
+
+async function saveAccountModels(id) {
+  const M = S.modelEdit;
+  if (!M || M.id !== id || !M.picked.length) return;
+  try {
+    await api(`/accounts/${encodeURIComponent(id)}/models`, { method: 'PUT', body: JSON.stringify({ models: acctModelEntries(M) }) });
+    S.modelEdit = null;
+    toast(`Model list saved · ${M.picked.length} models`);
+    refreshAccounts();
+  } catch (e) {
+    toast(e.message);
+  }
 }
 
 function detSessionsHTML() {
@@ -3799,6 +3873,10 @@ document.addEventListener('click', (e) => {
       patch('acct-panel', panelHTML);
       return patch('acct-head', accountHeadHTML);
     case 'fetch-models': return fetchKeyModels(el);
+    case 'acct-fetch-models': return fetchAccountModels(id);
+    case 'acct-pick-model': return pickAccountModel(id);
+    case 'acct-save-models': return saveAccountModels(id);
+    case 'acct-cancel-models': S.modelEdit = null; return patch('det-root', detailBodyHTML);
     case 'pick-model': return pickKeyModel(id);
     case 'key-provider':
       S.keyProvider = id;
@@ -3851,6 +3929,9 @@ document.addEventListener('input', (e) => {
     store.set('snippet', S.snippet);
     refreshSetups();
     document.getElementById(select)?.focus();
+  } else if (e.target.name === 'acct-model-filter' && S.modelEdit) {
+    S.modelEdit.filter = e.target.value;
+    patch('acct-model-chips', acctModelChipsHTML, S.modelEdit);
   } else if (e.target.name === 'key-model-filter' && S.keyModels) {
     S.keyModels.filter = e.target.value;
     patch('key-model-chips', keyModelChipsHTML);

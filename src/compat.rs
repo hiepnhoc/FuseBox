@@ -303,6 +303,30 @@ pub fn add_key(doc: &mut Yaml, k: &NewKey) {
     }
 }
 
+/// Replaces the model list of one openai-compatibility group, in either layout.
+/// Returns false when no group has that name.
+pub fn set_models(doc: &mut Yaml, group: &str, models: &[(String, Option<String>)]) -> bool {
+    fn apply(list: Option<&mut Vec<Yaml>>, group: &str, models: &[(String, Option<String>)]) -> bool {
+        let Some(e) = list.and_then(|l| {
+            l.iter_mut().filter_map(Yaml::as_mapping_mut).find(|e| e.get("name").and_then(Yaml::as_str) == Some(group))
+        }) else {
+            return false;
+        };
+        e.insert(key("models"), models_yaml(models));
+        true
+    }
+    let Some(root) = doc.as_mapping_mut() else { return false };
+    if apply(root.get_mut("openai-compatibility").and_then(Yaml::as_sequence_mut), group, models) {
+        return true;
+    }
+    let v8 = root
+        .get_mut("api-keys")
+        .and_then(Yaml::as_mapping_mut)
+        .and_then(|m| m.get_mut("openai-compatibility"))
+        .and_then(Yaml::as_sequence_mut);
+    apply(v8, group, models)
+}
+
 /// Removes an upstream API key from every place it appears (both layouts).
 /// `group` limits compat removal to one openai-compatibility entry.
 pub fn remove_key(doc: &mut Yaml, api_key: &str, compat_group: Option<&str>) {
@@ -425,6 +449,25 @@ pub fn translate_args(args: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::{Config, Routing};
+
+    #[test]
+    fn set_models_replaces_one_groups_list_in_both_layouts() {
+        let mut flat: Yaml = serde_yaml::from_str(
+            "openai-compatibility:\n  - name: a\n    base-url: https://a/v1\n    models: [{name: old}]\n  - name: b\n    models: [{name: keep}]\n",
+        )
+        .unwrap();
+        assert!(set_models(&mut flat, "a", &[("x".into(), None), ("y".into(), Some("why".into()))]));
+        let a = &flat["openai-compatibility"][0]["models"];
+        assert_eq!(a[0]["name"].as_str(), Some("x"));
+        assert_eq!(a[1]["alias"].as_str(), Some("why"));
+        assert_eq!(flat["openai-compatibility"][1]["models"][0]["name"].as_str(), Some("keep"));
+        assert!(!set_models(&mut flat, "zzz", &[("x".into(), None)]));
+        let mut v8: Yaml =
+            serde_yaml::from_str("api-keys:\n  openai-compatibility:\n    - name: a\n      models: [{name: old}]\n")
+                .unwrap();
+        assert!(set_models(&mut v8, "a", &[("x".into(), None)]));
+        assert_eq!(v8["api-keys"]["openai-compatibility"][0]["models"][0]["name"].as_str(), Some("x"));
+    }
 
     #[test]
     fn model_ids_read_the_common_shapes() {

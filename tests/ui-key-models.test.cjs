@@ -70,3 +70,25 @@ test('the list header and loading state render', () => {
   run('S.keyModels = null');
   assert.equal(run('keyModelsHTML()'), '');
 });
+
+// The same picker on an account page, editing a configured key's list.
+function loadAcct(M) {
+  const context = { S: { modelEdit: M }, ICON: {} };
+  vm.createContext(context);
+  const code = [piece('const esc = (v) =>'), piece('const acctModelUniverse = (M) =>'), piece('function acctModelChipsHTML(M) {'),
+    piece('const acctModelEntries = (M) =>')].join('\n');
+  vm.runInContext(code, context);
+  return (s) => vm.runInContext(s, context);
+}
+
+test('the account picker shows configured models the server dropped, marked, and keeps aliases on save', () => {
+  const M = { id: 'x', status: 'done', list: ['mercury-2', 'mercury-3'], picked: ['test', 'mercury-2'], aliases: { 'mercury-2': 'fast' }, host: 'h', filter: '' };
+  const run = loadAcct(M);
+  const html = run('acctModelChipsHTML(S.modelEdit)');
+  assert.match(html, /data-id="test" aria-pressed="true"[^>]*>test<span class="tag">not listed<\/span>/);
+  assert.match(html, /data-id="mercury-2" aria-pressed="true"[^>]*><span class="pfx">fast=<\/span>mercury-2/);
+  assert.match(html, /data-id="mercury-3" aria-pressed="false"/);
+  assert.deepEqual(JSON.parse(JSON.stringify(run('acctModelEntries(S.modelEdit)'))), [{ name: 'test' }, { name: 'mercury-2', alias: 'fast' }]);
+  run('S.modelEdit.filter = "fast"');
+  assert.equal((run('acctModelChipsHTML(S.modelEdit)').match(/data-act="acct-pick-model"/g) || []).length, 1, 'the filter also matches aliases');
+});
