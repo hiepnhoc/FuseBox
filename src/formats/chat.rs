@@ -17,6 +17,8 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
         temperature: v["temperature"].as_f64(),
         top_p: v["top_p"].as_f64(),
         parallel_tool_calls: v["parallel_tool_calls"].as_bool(),
+        verbosity: v["verbosity"].as_str().map(String::from),
+        service_tier: v["service_tier"].as_str().map(String::from),
         ..Default::default()
     };
     match &v["stop"] {
@@ -45,7 +47,15 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
     for m in messages {
         match m["role"].as_str().unwrap_or("user") {
             "system" | "developer" => {
-                super::parse_openai_system(&m["content"], &mut req);
+                if req.messages.is_empty() {
+                    let role = if m["role"] == "developer" { Role::Developer } else { Role::System };
+                    super::parse_openai_system(&m["content"], role, &mut req);
+                } else {
+                    req.messages.push(Message {
+                        role: if m["role"] == "developer" { Role::Developer } else { Role::System },
+                        parts: content_parts(&m["content"]),
+                    });
+                }
             }
             "assistant" => {
                 let mut parts = Vec::new();
@@ -90,12 +100,6 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
             _ => req.messages.push(Message { role: Role::User, parts: content_parts(&m["content"]) }),
         }
     }
-    if !req.messages.iter().any(|m| super::has_openai_breakpoints(&m.parts)) {
-        req.messages = merge_adjacent(req.messages);
-    } else {
-        req.messages = super::merge_openai_tool_calls(req.messages);
-    }
-
     for t in v["tools"].as_array().into_iter().flatten() {
         let f = if t["type"] == "function" { &t["function"] } else { t };
         if let Some(name) = f["name"].as_str() {
@@ -139,7 +143,7 @@ fn content_parts(v: &Value) -> Vec<Part> {
                 };
                 let mut parts: Vec<Part> = part.into_iter().collect();
                 if !parts.is_empty() && it["prompt_cache_breakpoint"]["mode"] == "explicit" {
-                    parts.push(Part::CacheBreakpoint);
+                    parts.push(Part::CacheBreakpoint(it["prompt_cache_breakpoint"].clone()));
                 }
                 parts
             })
@@ -149,22 +153,93 @@ fn content_parts(v: &Value) -> Vec<Part> {
     }
 }
 
+/// Adapt translated requests for an explicitly configured strict local template.
+/// Native Chat bodies and the default OpenAI translation retain their boundaries.
+pub(crate) fn normalize_strict_template(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else { return };
+    let mut system: Option<Value> = None;
+    let mut turns: Vec<Value> = Vec::new();
+    for mut message in std::mem::take(messages) {
+        match message["role"].as_str() {
+            Some("system" | "developer") => {
+                if let Some(system) = &mut system {
+                    append_content(&mut system["content"], message["content"].take());
+                } else {
+                    message["role"] = "system".into();
+                    system = Some(message);
+                }
+            }
+            Some("user" | "assistant") if turns.last().is_some_and(|last| last["role"] == message["role"]) => {
+                let last = turns.last_mut().unwrap();
+                append_content(&mut last["content"], message["content"].take());
+                if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                    if !last["tool_calls"].is_array() {
+                        last["tool_calls"] = json!([]);
+                    }
+                    last["tool_calls"].as_array_mut().unwrap().append(calls);
+                }
+            }
+            _ => turns.push(message),
+        }
+    }
+    if let Some(system) = system {
+        turns.insert(0, system);
+    }
+    *messages = turns;
+}
+
+fn append_content(left: &mut Value, right: Value) {
+    if right.is_null() {
+        return;
+    }
+    if left.is_null() {
+        *left = right;
+        return;
+    }
+    if let (Value::String(left), Value::String(right)) = (&mut *left, &right) {
+        left.push_str("\n\n");
+        left.push_str(right);
+        return;
+    }
+    let blocks = |content| match content {
+        Value::String(text) => vec![json!({"type":"text","text":text})],
+        Value::Array(blocks) => blocks,
+        other => vec![other],
+    };
+    let mut combined = blocks(left.take());
+    let right = blocks(right);
+    if !combined.is_empty() && !right.is_empty() {
+        combined.push(json!({"type":"text","text":"\n\n"}));
+    }
+    combined.extend(right);
+    *left = Value::Array(combined);
+}
+
 // ----------------------------------------------------------------- request out
 
 pub fn build_request(req: &Request, model: &str) -> Value {
     let mut messages = Vec::new();
-    if !req.system.is_empty() {
-        if req.system_cache_blocks.is_empty() {
-            messages.push(json!({ "role": "system", "content": req.system.join("\n\n") }));
+    for index in 0..req.system.len() {
+        let role = if req.system_roles.get(&index) == Some(&Role::Developer) { "developer" } else { "system" };
+        let content = if req.system_cache_blocks.contains_key(&index) {
+            super::openai_system_blocks(req, index, "text")
         } else {
-            for index in 0..req.system.len() {
-                messages.push(json!({ "role": "system", "content": super::openai_system_blocks(req, index, "text") }));
-            }
-        }
+            Value::String(req.system[index].clone())
+        };
+        messages.push(json!({ "role": role, "content": content }));
     }
-    for m in &req.messages {
+    for m in super::openai_chat_messages(&req.messages).iter() {
         match m.role {
+            Role::System | Role::Developer => {
+                let role = if m.role == Role::System { "system" } else { "developer" };
+                messages.push(json!({"role":role,"content":cached_text_parts(&m.parts)}));
+            }
             Role::Assistant => {
+                // Responses reasoning items have no standalone Chat message.
+                // Dropping their empty shell keeps subsequent tool replies valid.
+                if !m.parts.iter().any(|part| matches!(part, Part::Text(_) | Part::ToolCall { .. })) {
+                    continue;
+                }
                 let text: String = m
                     .parts
                     .iter()
@@ -209,7 +284,7 @@ pub fn build_request(req: &Request, model: &str) -> Value {
                         Part::Image(i) => {
                             content.push(json!({ "type": "image_url", "image_url": { "url": i.to_url() } }))
                         }
-                        Part::CacheBreakpoint => super::mark_openai_breakpoint(&mut content),
+                        Part::CacheBreakpoint(metadata) => super::mark_openai_breakpoint(&mut content, metadata),
                         _ => {}
                     }
                 }
@@ -234,6 +309,12 @@ pub fn build_request(req: &Request, model: &str) -> Value {
         "stream_options": { "include_usage": true },
     });
     let o = out.as_object_mut().unwrap();
+    if let Some(verbosity) = &req.verbosity {
+        o.insert("verbosity".into(), verbosity.clone().into());
+    }
+    if let Some(tier) = &req.service_tier {
+        o.insert("service_tier".into(), tier.clone().into());
+    }
     if !req.tools.is_empty() {
         o.insert(
             "tools".into(),
@@ -290,7 +371,7 @@ fn cached_text_parts(parts: &[Part]) -> Vec<Value> {
     for part in parts {
         match part {
             Part::Text(text) => content.push(json!({"type": "text", "text": text})),
-            Part::CacheBreakpoint => super::mark_openai_breakpoint(&mut content),
+            Part::CacheBreakpoint(metadata) => super::mark_openai_breakpoint(&mut content, metadata),
             _ => {}
         }
     }
@@ -324,9 +405,9 @@ fn usage_of(u: &Value) -> Option<Usage> {
     let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
     let details = &u["prompt_tokens_details"];
     let cached = details["cached_tokens"].as_u64().unwrap_or(0);
-    let write = details["cache_creation_tokens"]
+    let write = details["cache_write_tokens"]
         .as_u64()
-        .or_else(|| details["cache_write_tokens"].as_u64())
+        .or_else(|| details["cache_creation_tokens"].as_u64())
         .or_else(|| u["cache_creation_input_tokens"].as_u64())
         .unwrap_or(0);
     Some(Usage {
@@ -335,6 +416,8 @@ fn usage_of(u: &Value) -> Option<Usage> {
         output: u["completion_tokens"].as_u64().unwrap_or(0),
         reasoning: u["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
         cache_write: write,
+        write_30m: details["cache_write_tokens_details"]["ttl_30m_tokens"].as_u64(),
+        write_12h: details["cache_write_tokens_details"]["ttl_12h_tokens"].as_u64(),
     })
 }
 
@@ -503,9 +586,11 @@ pub(crate) fn usage_json(u: &Usage) -> Value {
         "prompt_tokens_details": { "cached_tokens": u.cache_read },
         "completion_tokens_details": { "reasoning_tokens": u.reasoning },
     });
-    if u.cache_write > 0 {
+    if u.cache_write > 0 || u.write_30m.is_some() || u.write_12h.is_some() {
+        usage["prompt_tokens_details"]["cache_write_tokens"] = u.cache_write.into();
         usage["prompt_tokens_details"]["cache_creation_tokens"] = u.cache_write.into();
     }
+    super::write_openai_cache_lifetimes(&mut usage["prompt_tokens_details"], u);
     usage
 }
 

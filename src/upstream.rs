@@ -44,6 +44,10 @@ pub struct Target<'a> {
     pub count_tokens: bool,
     /// A stable per-session key for providers that route their prompt cache by one.
     pub cache_key: Option<&'a str>,
+    /// Separate session identity when a derived cache key is shared.
+    pub cache_session: Option<&'a str>,
+    /// Whether final Claude preparation may add default cache boundaries.
+    pub cache_defaults: bool,
 }
 
 /// Headers never copied from the client to an upstream.
@@ -93,6 +97,31 @@ fn header(h: &HeaderMap, name: &str) -> Option<String> {
 
 pub fn is_claude_code(h: &HeaderMap) -> bool {
     header(h, "user-agent").is_some_and(|ua| ua.to_ascii_lowercase().starts_with("claude-cli/"))
+}
+
+/// A request-local memoization stamp. Credentials themselves are never retained
+/// in a cache key or diagnostics, and token rotation invalidates prepared headers.
+pub fn credential_stamp(acct: &Account) -> String {
+    let (token, _, _, _) = creds(acct);
+    stamp([token, backend_stamp(acct), acct.state.lock().identity_epoch.to_string()])
+}
+
+/// The account's base URL, provider account id and configured custom headers.
+/// A header-only reload keeps the credential identity, so caches of prepared
+/// requests or upstream results must include this as well.
+pub fn backend_stamp(acct: &Account) -> String {
+    let (_, base, _, account) = creds(acct);
+    let headers = acct.headers.iter().flat_map(|(k, v)| [k.clone(), v.clone()]);
+    stamp([base.unwrap_or_default(), account.unwrap_or_default()].into_iter().chain(headers))
+}
+
+fn stamp(values: impl IntoIterator<Item = String>) -> String {
+    let mut hash = Sha256::new();
+    for value in values {
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    hex::encode(hash.finalize())
 }
 
 fn creds(acct: &Account) -> (String, Option<String>, bool, Option<String>) {
@@ -150,6 +179,10 @@ fn claude(t: &Target, mut body: Value) -> Prepared {
     strip_foreign_thinking(&mut body);
     crate::formats::claude::normalize_disabled_thinking(&mut body, t.model);
 
+    let uncloaked = !oauth || !t.cfg.claude_cloak;
+    if !t.passthrough && t.cache_defaults && uncloaked && !t.count_tokens && !crate::cache::has_markers(&body) {
+        body["cache_control"] = json!({"type":"ephemeral"});
+    }
     let native_cc = t.passthrough && is_claude_code(t.client_headers);
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut betas: Vec<String> = Vec::new();
@@ -185,7 +218,7 @@ fn claude(t: &Target, mut body: Value) -> Prepared {
         let caller = std::mem::take(&mut betas);
         betas = cc.into_iter().map(String::from).collect();
         betas.extend(caller);
-        cloak_body(&mut body, t.acct, account_uuid.as_deref(), t.count_tokens);
+        cloak_body(&mut body, t.acct, account_uuid.as_deref(), t.count_tokens, t.cache_defaults);
         // The newest Claude Code release known, with the runtime headers the user's
         // own installation sends (see `clients`).
         let profile = crate::clients::claude_profile();
@@ -276,8 +309,8 @@ fn first_user_text(body: &Value) -> (Option<usize>, String) {
 /// Makes a third-party request look like Claude Code: Claude Code system
 /// prompt on top, caller instructions moved into the first user turn, and a
 /// Claude-Code-shaped metadata.user_id.
-fn cloak_body(body: &mut Value, acct: &Account, account_uuid: Option<&str>, count_tokens: bool) {
-    let configured_cache = has_claude_cache_control(body);
+fn cloak_body(body: &mut Value, acct: &Account, account_uuid: Option<&str>, count_tokens: bool, cache_defaults: bool) {
+    let configured_cache = !cache_defaults || crate::cache::has_claude_controls(body);
     let original: Vec<Value> = match &body["system"] {
         Value::String(s) => vec![json!({"type": "text", "text": s})],
         Value::Array(blocks) => blocks.clone(),
@@ -413,18 +446,6 @@ fn cloaked_system_in_original_order(original: &[Value], identity: &Value, caller
     Value::Array(system)
 }
 
-/// Any cache marker, at any depth (tool results can carry them on their inner blocks):
-/// adding ours on top could exceed Anthropic's four breakpoints.
-fn has_claude_cache_control(body: &Value) -> bool {
-    match body {
-        Value::Object(object) => {
-            object.get("cache_control").is_some_and(|c| !c.is_null()) || object.values().any(has_claude_cache_control)
-        }
-        Value::Array(items) => items.iter().any(has_claude_cache_control),
-        _ => false,
-    }
-}
-
 // ----------------------------------------------------------------------- codex
 
 /// Fields the ChatGPT Codex backend rejects (`generate` is fine on websockets).
@@ -483,6 +504,12 @@ pub fn sanitize_codex_body(body: &mut Value, model: &str, websocket: bool) {
             });
             // Item ids reference server-side state that store=false never kept.
             for it in items.iter_mut() {
+                // ChatGPT plan usage accepts developer instructions, not system
+                // message items. Normalize here for HTTP and WebSocket callers,
+                // retaining message endings and per-block cache metadata.
+                if it["role"] == "system" && matches!(it["type"].as_str(), None | Some("message")) {
+                    it["role"] = "developer".into();
+                }
                 if let Some(io) = it.as_object_mut()
                     && io.get("type").and_then(Value::as_str) != Some("item_reference")
                 {
@@ -593,7 +620,8 @@ fn codex(t: &Target, mut body: Value) -> Prepared {
         order_codex_body(&mut body);
     }
     let mut headers = codex_headers(t.client_headers, &token, account_id.as_deref(), oauth);
-    if let Some(key) = body["prompt_cache_key"].as_str().filter(|_| oauth)
+    let separate_session = t.cache_session.map(crate::affinity::prompt_cache_key);
+    if let Some(key) = separate_session.as_deref().or(body["prompt_cache_key"].as_str()).filter(|_| oauth)
         && !headers.iter().any(|(k, _)| k == "session_id" || k == "session-id")
     {
         headers.push(("session_id".into(), key.to_string()));
@@ -835,6 +863,13 @@ fn compat(t: &Target, mut body: Value) -> Prepared {
     body["model"] = t.model.into();
     if !t.passthrough {
         body["stream"] = true.into();
+        if t.cfg
+            .openai_compatibility
+            .iter()
+            .any(|entry| t.acct.group.as_deref() == Some(entry.name.as_str()) && entry.strict_chat_template)
+        {
+            crate::formats::chat::normalize_strict_template(&mut body);
+        }
     }
     let mut headers = vec![
         ("content-type".into(), "application/json".into()),
@@ -887,6 +922,8 @@ mod tests {
                 stream: true,
                 count_tokens: false,
                 cache_key: None,
+                cache_session: None,
+                cache_defaults: true,
             },
             json!({"input":"Reply OK"}),
         );
@@ -932,6 +969,8 @@ mod tests {
                 stream: true,
                 count_tokens: false,
                 cache_key: Some("conversation"),
+                cache_session: None,
+                cache_defaults: true,
             },
             json!({"input":"Reply OK"}),
         );
@@ -987,6 +1026,8 @@ mod tests {
                 stream: true,
                 count_tokens: false,
                 cache_key: None,
+                cache_session: None,
+                cache_defaults: true,
             },
             json!({"messages":[{"role":"user","content":"Reply OK"}]}),
         );
@@ -1012,7 +1053,7 @@ mod tests {
             ],
             "messages":[{"role":"user","content":[{"type":"text","text":"question","cache_control":{"type":"ephemeral"}}]}]
         });
-        cloak_body(&mut body, &acct, None, false);
+        cloak_body(&mut body, &acct, None, false, true);
         assert!(body["system"][1]["cache_control"].is_null());
         let blocks = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 3);
@@ -1029,11 +1070,11 @@ mod tests {
         let request = json!({"system":"instructions","messages":[{"role":"user","content":"question"}]});
         let mut automatic = request.clone();
         automatic["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
-        cloak_body(&mut automatic, &acct, None, false);
+        cloak_body(&mut automatic, &acct, None, false, true);
         assert!(automatic["system"][1]["cache_control"].is_null());
         assert_eq!(automatic["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
         let mut default = request.clone();
-        cloak_body(&mut default, &acct, None, false);
+        cloak_body(&mut default, &acct, None, false, true);
         assert_eq!(default["system"][1]["cache_control"], json!({"type":"ephemeral"}));
         // The conversation, which now holds the caller's instructions, is cached too.
         assert_eq!(default["cache_control"], json!({"type":"ephemeral"}));
@@ -1041,7 +1082,7 @@ mod tests {
         assert!(default["messages"][0]["content"][0]["cache_control"].is_null());
         // Token counting has nothing to cache.
         let mut counted = request;
-        cloak_body(&mut counted, &acct, None, true);
+        cloak_body(&mut counted, &acct, None, true, true);
         assert!(counted["cache_control"].is_null());
     }
 
@@ -1052,7 +1093,7 @@ mod tests {
         let req = crate::formats::responses::parse_request(&original).unwrap();
         let mut body = crate::formats::claude::build_request(&req, "claude-sonnet-5-5");
         crate::formats::claude::apply_translated_cache_policy(&original, &mut body);
-        cloak_body(&mut body, &acct, None, false);
+        cloak_body(&mut body, &acct, None, false, true);
         assert_eq!(body["cache_control"], json!({"type":"ephemeral"}));
         assert!(body["system"][1]["cache_control"].is_null());
         assert_eq!(
@@ -1073,7 +1114,7 @@ mod tests {
             ]
         });
         let messages = body["messages"].clone();
-        cloak_body(&mut body, &acct, None, false);
+        cloak_body(&mut body, &acct, None, false, true);
         assert_eq!(body["messages"], messages);
         assert_eq!(body["system"][2]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
         assert_eq!(body["system"][2]["text"], "<system-reminder>\ninstructions\n</system-reminder>");
@@ -1090,7 +1131,7 @@ mod tests {
             ]
         });
         let messages = body["messages"].clone();
-        cloak_body(&mut body, &acct, None, false);
+        cloak_body(&mut body, &acct, None, false, true);
         assert_eq!(body["messages"], messages);
         assert_eq!(body["system"][2]["cache_control"]["ttl"], "1h");
 
@@ -1101,7 +1142,7 @@ mod tests {
             ],
             "messages":[{"role":"user","content":"question"}]
         });
-        cloak_body(&mut body, &acct, None, false);
+        cloak_body(&mut body, &acct, None, false, true);
         assert_eq!(body["system"][1]["cache_control"]["ttl"], "1h");
         assert_eq!(body["system"][2]["text"], CC_IDENTITY);
         assert_eq!(body["system"][2]["cache_control"], json!({"type":"ephemeral"}));
@@ -1141,6 +1182,8 @@ mod tests {
                 stream: false,
                 count_tokens: false,
                 cache_key: None,
+                cache_session: None,
+                cache_defaults: true,
             },
             body.clone(),
         );
@@ -1156,7 +1199,7 @@ mod tests {
                 {"type":"text","text":"result","cache_control":{"type":"ephemeral"}}
             ]}]}
         ]});
-        cloak_body(&mut body, &acct, None, false);
+        cloak_body(&mut body, &acct, None, false, true);
         assert!(body["cache_control"].is_null());
         assert!(body["system"][1]["cache_control"].is_null());
     }
@@ -1165,9 +1208,99 @@ mod tests {
     fn claude_cloak_keeps_instructions_without_a_user_turn() {
         let acct = claude_account();
         let mut body = json!({"system":[{"type":"text","text":"instructions","cache_control":{"type":"ephemeral","ttl":"1h"}}],"messages":[]});
-        cloak_body(&mut body, &acct, None, false);
+        cloak_body(&mut body, &acct, None, false, true);
         assert_eq!(body["system"][2]["text"], "<system-reminder>\ninstructions\n</system-reminder>");
         assert_eq!(body["system"][2]["cache_control"], json!({"type":"ephemeral","ttl":"1h"}));
+    }
+
+    #[test]
+    fn strict_chat_templates_are_opted_in_per_provider_for_translations() {
+        let source = json!({"instructions":"base", "input":[
+            {"role":"developer","content":"permissions"},
+            {"role":"user","content":"agents"},
+            {"role":"user","content":"prompt"}
+        ]});
+        let translated = crate::formats::chat::build_request(
+            &crate::formats::responses::parse_request(&source).unwrap(),
+            "local-model",
+        );
+        let headers = HeaderMap::new();
+        for strict in [false, true] {
+            let cfg = Config {
+                auth_dir: "/nonexistent".into(),
+                openai_compatibility: vec![crate::config::CompatEntry {
+                    name: "local".into(),
+                    base_url: "http://localhost:11434/v1".into(),
+                    strict_chat_template: strict,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let pool = crate::accounts::Pool::default();
+            pool.reload(&cfg);
+            let acct = pool.all().remove(0);
+            for passthrough in [false, true] {
+                let prepared = prepare(
+                    &Target {
+                        acct: &acct,
+                        cfg: &cfg,
+                        client_headers: &headers,
+                        model: "local-model",
+                        wire: Format::Chat,
+                        passthrough,
+                        stream: true,
+                        count_tokens: false,
+                        cache_key: None,
+                        cache_session: None,
+                        cache_defaults: true,
+                    },
+                    translated.clone(),
+                );
+                if strict && !passthrough {
+                    assert_eq!(
+                        prepared.body["messages"],
+                        json!([
+                            {"role":"system","content":"base\n\npermissions"},
+                            {"role":"user","content":"agents\n\nprompt"}
+                        ])
+                    );
+                } else {
+                    assert_eq!(prepared.body["messages"], translated["messages"]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn codex_system_roles_become_developer_without_moving_cache_boundaries() {
+        let original = json!({"messages":[
+            {"role":"system","content":"base"},
+            {"role":"developer","content":"permissions"},
+            {"role":"user","content":"question"},
+            {"role":"system","content":[{"type":"text","text":"late", "prompt_cache_breakpoint":{"mode":"explicit","ttl":"12h"}}]},
+            {"role":"user","content":"next"}
+        ]});
+        let translated = crate::formats::responses::build_request(
+            &crate::formats::chat::parse_request(&original).unwrap(),
+            "gpt-6.1-sol",
+            &crate::formats::responses::BuildOpts {
+                chatgpt_backend: true,
+                custom_tools: true,
+                default_reasoning: true,
+            },
+        );
+        assert_eq!(translated["input"][0]["role"], "system", "public Responses keeps original roles");
+        for websocket in [false, true] {
+            let mut body = translated.clone();
+            sanitize_codex_body(&mut body, "gpt-6.1-sol", websocket);
+            let mut expected = translated["input"].clone();
+            expected[0]["role"] = "developer".into();
+            expected[3]["role"] = "developer".into();
+            assert_eq!(body["input"], expected);
+            let mut native = json!({"input":[{"role":"system","content":"native"}]});
+            sanitize_codex_body(&mut native, "gpt-6.1-sol", websocket);
+            assert_eq!(native["input"][0]["role"], "developer");
+        }
     }
 
     #[test]

@@ -175,6 +175,8 @@ Clients authenticate with `Authorization: Bearer`, `x-api-key`, `x-goog-api-key`
 
 Embeddings accept `encoding_format: float` (default) or `base64`; base64 encodes little-endian float32 values. Google adapters preserve input order, split Vertex batches to one text for Gemini embedding models or five for older text embedding models, and disable automatic truncation. A failed later chunk returns an error without replaying completed chunks; their usage is still recorded. Gemini embedding token counts are labelled estimates in the usage database. Models without a known price remain unpriced and cannot be treated as free by monthly budgets.
 
+Google embedding chunks run sequentially by default. `embeddings.concurrency` enables 1–16 chunks at once; Requests shows account attempts separately from chunks. `embeddings.cache-seconds` enables exact in-memory result reuse (default `0`, off), isolated by client, account credential identity, resolved model and every request option. `embeddings.cache-bytes` caps serialized results (default 16 MiB, at most 1,000 entries); memory overhead is additional. Hits return `fusebox_cache_hit: true` and zero provider usage. Changing these settings clears the result cache. These controls are under Connections in Config.
+
 JSON API requests and multipart image edits support `Content-Encoding: gzip` or `zstd`, as well as uncompressed bodies. Authentication runs before decompression; both compressed and decoded bodies are limited to 256 MiB. Unsupported or stacked encodings return 415, malformed compressed bodies return 400, and oversized bodies return 413. Encoding and JSON validation failures appear in request statistics and logs without a provider attempt.
 
 ### Providers
@@ -271,7 +273,7 @@ The **Models** tab groups every model id by family, shows aliases and model grou
 
 **Who used the quota.** Under each meter, an account's page shows which of your named clients and shared keys used the current window and the last one, in points of the window, plus what was used outside Fusebox (claude.ai, the desktop app). Its coding sessions show their share of the current windows. The Usage page's **Top clients** ranks every client by name in the selected range, with its share of the estimated cost, its tokens and the models it used. Tokens and models are what Fusebox recorded; the points of a window are estimates: each rise in the provider's reported use is split over the attempts that finished since the previous rise, by their API list price ([how](docs/usage-costs.md#who-used-a-subscription-window)).
 
-Each quota meter has a thin mark where usage would be if spread evenly over the window. When the pace so far would use a window up before it resets, the meter says when (`out 1h 40m`). Claude subscriptions show their plan (Max 20x, Max 5x, Pro). Codex Pro subscriptions show **Pro 100**, **Pro 200** or **Pro 500** when ChatGPT's active subscription identifies the tier; these names refer to the USD list-price tiers, not the account's local-currency bill or a usage multiplier. Plan details are checked every six hours without using model tokens. If ChatGPT does not expose a recognized active subscription, the broad usage plan (such as Pro) is shown. The overview's **Combined weekly limits** puts each provider's subscriptions on one weekly meter with its own pace mark, counting Claude accounts by plan price (Pro 1, Max 5x 5, Max 20x 10) when every plan is known and equally otherwise. The Accounts page lines up every subscription's next weekly reset over seven days, and each account page sets whether it takes new sessions **First**, **Normal** or **Last**.
+Each quota meter has a thin mark where usage would be if spread evenly over the window. When the pace so far would use a window up before it resets, the meter says when (`out 1h 40m`). Claude subscriptions show their plan (Max 20x, Max 5x, Pro). Codex Pro subscriptions show **Pro 100**, **Pro 200** or **Pro 500** when ChatGPT's active subscription identifies the tier; these names refer to the USD list-price tiers, not the account's local-currency bill or a usage multiplier. Plan details are checked every six hours without using model tokens. If ChatGPT does not expose a recognized active subscription, the broad usage plan (such as Pro) is shown. The overview's **Combined weekly limits** puts each provider's subscriptions on one weekly meter with its own pace mark, counting Claude accounts by plan price (Pro 1, Max 5x 5, Max 20x 10) when every plan is known and equally otherwise. Since smart-quota routing runs down the account that renews first on purpose, a provider with several subscriptions gets no pace warning for any one of them: it says **Runs out early** when their combined quota, at their combined pace, runs out before renewals bring capacity back, and the faults menu lists it once for all of them. The Accounts page lines up every subscription's next weekly reset over seven days, and each account page sets whether it takes new sessions **First**, **Normal** or **Last**.
 
 Sharing a screenshot or your screen? The eye button in the top bar (or <kbd>.</kbd>) hides every email and API key on the page, and copy buttons still copy the real values.
 
@@ -372,6 +374,7 @@ openai-compatibility:
         alias: "kimi-k3"
   - name: ollama
     base-url: "http://127.0.0.1:11434/v1"
+    strict-chat-template: true   # translations: one system message and alternating turns
     models:
       - name: "qwen3-coder:30b"
 ```
@@ -419,19 +422,19 @@ In a v8 file both go under `routing` (`strategy: smart-quota`).
 
 Sessions are recognised from what clients already send: Claude Code's session metadata, Codex's `session_id` and `thread-id` headers, a Responses `conversation` id or `prompt_cache_key`. Writing your own client? Send one stable `x-fusebox-session-id` per task (the older `x-cliproxy-session-id` still works). Each client API key has its own sessions. A WebSocket without any of these keeps its account for the connection.
 
-An HTTP request without any of them is recognised by its conversation's first user message, which every turn repeats, so the conversation's turns still share one account and its prompt cache. Cache markers are ignored for this, since clients move them from turn to turn. Conversations that start with the same message share an account. These inferred assignments are written to disk in the background and forgotten after an hour without requests, when no provider cache would still be warm. The Requests page marks them as **Inferred session**. A request with no user message at all is routed on its own.
+An HTTP request without any of them is recognised by its conversation's first user message, which every turn repeats, so the conversation's turns still share one account and its prompt cache. Cache markers are ignored for this, since clients move them from turn to turn. Conversations that start with the same message share an account; send an explicit session id to distinguish them. These inferred assignments use the same configured idle timeout as explicit sessions (a day by default), allowing reuse across longer cache lifetimes. The Requests page marks them as **Inferred session**. A request with no user message at all is routed on its own.
 
 Assignments are saved to `.routing-sessions.state` in the auth directory (hashed ids, owner-only permissions), so they survive restarts, and forgotten after `session-affinity-idle-seconds` without requests (a day by default). Send `x-fusebox-session-end: true` (or `x-cliproxy-session-end: true`) with a task's last request to release it early. Responses history for `previous_response_id` is kept in memory only, up to 64 MiB. Run one proxy per auth directory.
 
 The Requests page shows each request's session fingerprint (click it to see the whole session), why its account was chosen, and its cached tokens.
 
-Cache hints carry across formats: OpenAI cache settings and breakpoints between Chat Completions and Responses, and Claude's cache markers, in their TTL order, when a request is made to look like Claude Code. A hint that can't be carried over is dropped rather than failing the request.
+Cache hints carry across formats: compatible OpenAI cache settings and content-block breakpoints, including each breakpoint's lifetime override, between Chat Completions and Responses; and Claude's native cache markers, in their TTL order, when a request is made to look like Claude Code. OpenAI translation preserves message endings so appending another message does not erase an earlier implicit cache boundary. A hint that can't be carried over follows `on-incompatible` below. Public OpenAI documentation establishes the newer controls for Responses; accepting a hint in another format does not establish support on every upstream backend.
 
 Requests translated to Anthropic use its automatic prompt caching when the caller has not supplied explicit cache controls. So do requests that are made to look like Claude Code on a subscription account, which also cache the shared tools and system prompt. This covers the growing conversation, including caller instructions moved by OAuth cloaking. Explicit controls take precedence; cache hits still depend on the provider's minimum prompt size and reuse within its cache lifetime.
 
-OpenAI routes its prompt cache by a `prompt_cache_key`, which Codex always sends. Requests to ChatGPT accounts or to OpenAI's own API that arrive without one, including Claude-format requests translated for a GPT model, get a key derived from their session. xAI receives the same key as its conversation id. A key the client sends is passed on unchanged, and API keys with a custom `base-url` never get one added.
+On models before GPT-5.6, a stable `prompt_cache_key` helps OpenAI route requests to a reusable cache. GPT-5.6 and later handle routing automatically; the optional key separates cache accounting for customers, workspaces or sessions. Fusebox keeps existing keys stable: requests to ChatGPT accounts or to OpenAI's own API that arrive without one, including Claude-format requests translated for a GPT model, get a key derived from their session. xAI receives the same key as its conversation id. A key the client sends is passed on unchanged, and API keys with a custom `base-url` never get one added. Cache-key scope and account affinity are separate choices.
 
-The Requests page and structured completion logs show the requested and applied cache controls, derived key scope, and any translation downgrade. These describe what Fusebox sent; provider usage determines whether a cache was actually used. Defaults preserve the behavior above. Optional controls are available under Routing in the dashboard or in YAML:
+The Requests page and structured completion logs show the requested and applied cache controls, derived key scope, and any translation downgrade. These describe what Fusebox sent; provider usage determines how much cache was actually reused. When an upstream returns `prompt_cache_diagnostics`, request details also show its comparison result, miss reason and reported token counts. Request a comparison with `prompt_cache_options.comparison_response_id` on a supported Responses backend; this does not load previous conversation state or enable caching. Missing or unavailable diagnostics do not imply a hit. Defaults preserve the behavior above. Optional controls are available under Routing in the dashboard or in YAML:
 
 ```yaml
 prompt-cache:
@@ -442,7 +445,13 @@ prompt-cache:
 
 `client` shares a derived key across sessions authenticated by the same client key. `workspace` also includes the `x-fusebox-cache-workspace` header (1–1024 bytes after trimming); absent or invalid headers fall back to session scope. Unauthenticated requests share one client scope. A nonempty namespace versions derived keys in any scope. Shared scopes do not alter account affinity, so cache reuse still depends on the selected account and provider. Caller-supplied keys always take precedence, and workspace names and raw cache keys are excluded from policy diagnostics. Native Codex WebSockets use the same derivation as HTTP.
 
-`drop` discards incompatible hints while preserving compatible fields and the caller's explicit caching intent. `automatic` opts into automatic caching on the Claude provider when translation loses explicit boundaries. Explicit mode without boundaries remains uncached; TTLs are not translated. `reject` returns `400` before sending a request with incompatible hints. Unsupported prewarming remains an error in every mode. See [context efficiency](docs/context-efficiency.md) for measuring cache reuse and latency with stable prefixes.
+Translated Responses usage reports cache writes as `input_tokens_details.cache_write_tokens`, with the earlier `cache_creation_tokens` name repeating the same count for existing clients. Reported OpenAI lifetime details remain under `cache_write_tokens_details` as `ttl_30m_tokens` and `ttl_12h_tokens`. These are parts of the total writes, not extra input tokens. Usage stores them separately from Anthropic's 5-minute and 1-hour writes. Do not add repeated aliases or lifetime subsets to the total.
+
+Shared derived cache keys keep a separate upstream Codex session identifier for each session. Caller-supplied session headers and cache keys retain their existing behavior. These scopes affect derived OpenAI/xAI keys; Claude caching uses its native boundaries and TTLs.
+
+`drop` discards incompatible hints while preserving compatible fields and the caller's explicit caching intent. `automatic` opts into automatic caching on the Claude provider when translation loses explicit boundaries. Explicit mode without boundaries remains uncached; OpenAI and Anthropic TTLs are not interchangeable. `reject` returns `400` before sending a request with incompatible hints. Unsupported prewarming remains an error in every mode. See [context efficiency](docs/context-efficiency.md) for choosing breakpoints and lifetimes and measuring cache reuse and latency with stable prefixes.
+
+Cache intent is checked outside tool schemas, tool-call arguments and structured-output schemas, so a data property named `cache_control` does not disable defaults or trigger a false downgrade. Final Claude OAuth preparation honors the same policy: `drop` and explicit mode without boundaries do not acquire automatic cache controls during cloaking.
 
 HTTP POST body limits apply to both encoded and decoded bytes. The defaults retain 256 MiB per request. Optional admission limits cover body collection, provider work and response streaming, returning `503` with `Retry-After: 1` when full:
 
@@ -456,7 +465,25 @@ request-limits:
 
 Body limits must be 1–268435456 bytes. `media-body-bytes` applies to `/v1/images/*` and `/v1/videos/*`; other API POST routes, including multimodal Gemini calls, use `text-body-bytes`. Zero disables each aggregate limit. The byte budget counts decoded request bodies through response completion and releases reservations on errors or cancellation. It bounds body bytes, not total RSS: parsed JSON, histories and responses need additional memory. Admission is fail-fast and process-wide; WebSockets and management routes are separate. These settings reload for new requests without a restart and are available under Connections in the dashboard.
 
+Upstream streams also have configurable bounds, under Connections:
+
+```yaml
+stream-limits:
+  event-bytes: 16777216
+  media-event-bytes: 67108864
+  bootstrap-bytes: 2097152
+  pre-output-timeout-seconds: 0
+```
+
+The decoder bounds SSE events and unfinished lines; native WebSocket events also have a size check. Models whose names contain `image`, `audio` or `video` use the larger media limit. Once the first event has arrived, reaching the bootstrap threshold releases buffered chunks for streaming; it does not repeat inference. Before the first event, the first-token deadline still applies and the event limit bounds buffering. An oversized event ends the stream with an error and retains usage already received. A nonzero pre-output timeout gives HTTP headers and the first event one absolute deadline, or bounds the first native WebSocket event including its send. Expiry is terminal `504`, with no automatic inference retry. Zero keeps the existing timeout behavior.
+
 Output limits are preserved during translation. Manual Claude thinking needs an output limit greater than 1,024 tokens; incompatible requests receive a `400` instead of silently increasing the limit. Gemini reasoning suffixes use the same mapping for native and translated requests.
+
+Chat↔Responses translation retains late system/developer messages in their original positions, with cache boundaries. ChatGPT subscription requests map system roles to developer roles at the OAuth boundary, on HTTP and WebSocket transports. Public OpenAI API requests keep their original roles. Routes to Claude, Gemini or Devin add late instructions to the system prompt in their original order, as before, rather than demoting them to user turns. Translated low-verbosity preferences are retained for supported GPT-5/6 models on the Codex provider. Translated OpenAI service tiers require `translation.allow-service-tier: true`; dropped controls appear in request diagnostics. Native requests keep caller controls. Codex subscription preparation still removes output caps that its backend does not accept, so those caps are not a subscription billing limit.
+
+For a local Chat backend whose template rejects developer roles, multiple system messages or repeated turns, set `strict-chat-template: true` on that `openai-compatibility` entry. Translated requests then collect instructions into one leading system message and merge adjacent user/assistant turns. Tool replies stay separate and explicit cache markers keep their metadata. This changes message endings and the position of late instructions, so enable it only for backends that require that layout. Native Chat requests remain under the caller's control.
+
+Optional `latency-routing: true` breaks exact Smart quota ties for new HTTP or WebSocket sessions using recent comparable first-response timings. It requires three successful single-attempt samples with explicitly zero cache reads per account, matches model, input-size bucket, reasoning effort, cache intent and transport, and leaves existing session assignments intact. It is off by default.
 
 Token-count responses include `x-fusebox-token-count-estimated: false` when Claude supplies a count, or `true` for the local fallback. The fallback estimates text and tool schemas and uses fixed allowances for media; it does not count base64 data as text. Media dimensions, document length and audio/video duration can change the real count, so use provider usage for accounting.
 
@@ -496,6 +523,8 @@ scrape_configs:
     authorization: { credentials: "<management-key>" }
     static_configs: [{ targets: ["127.0.0.1:8317"] }]
 ```
+
+Metrics also expose separate input, cache-read, cache-write, output and reasoning counters across attempts, reported/unknown usage fields, preparation/header/first-content/total latency histograms, retry counts, WebSocket fallback reasons and exact embedding-cache statistics. Model/provider/transport series are bounded; session identifiers and prompt hashes are excluded. Reasoning is an output subset and must not be added to output again. See the [optimization implementation and measurements](docs/efficiency-2026-10-20.md) and [context experiment guide](docs/context-efficiency.md).
 
 `log-format: json` (or `FUSEBOX_LOG_FORMAT=json`) writes one JSON object per line for log collectors. `fusebox usage backup ~/usage-backup.sqlite3` copies the usage database safely while Fusebox runs and checks the copy. `fusebox --version` names the commit it was built from.
 

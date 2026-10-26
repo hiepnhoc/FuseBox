@@ -10,14 +10,43 @@ pub mod gemini;
 pub mod responses;
 
 #[cfg(test)]
+mod cache_translation_tests;
+#[cfg(test)]
 mod efficiency_tests;
 
 use std::borrow::Cow;
 
 use serde_json::Value;
 
-use crate::ir::{Aggregate, CacheTextBlock, Event, Format, Message, Part, Request, Role};
+use crate::ir::{Aggregate, CacheTextBlock, Event, Format, Message, Part, Request, Role, Usage};
 use crate::sse::SseEvent;
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TranslationConfig {
+    /// Tiers may increase cost and subscription backends differ. Explicit opt-in.
+    pub allow_service_tier: bool,
+}
+
+/// Restrict translated OpenAI controls to a verified backend. Native requests
+/// remain under the caller's control. Never invent a tier or lower an effort.
+pub fn generation_controls(body: &mut Value, wire: Format, openai: bool, allow_tier: bool) -> Vec<&'static str> {
+    let mut dropped = Vec::new();
+    if !openai {
+        let removed = if wire == Format::Responses {
+            body.get_mut("text").and_then(Value::as_object_mut).and_then(|t| t.remove("verbosity"))
+        } else {
+            body.as_object_mut().and_then(|b| b.remove("verbosity"))
+        };
+        if removed.is_some() {
+            dropped.push("verbosity_unsupported");
+        }
+    }
+    if (!openai || !allow_tier) && body.as_object_mut().and_then(|b| b.remove("service_tier")).is_some() {
+        dropped.push("service_tier_not_enabled");
+    }
+    dropped
+}
 
 /// One outgoing stream frame. `event` is the SSE event name (also used as the
 /// websocket message type for the Responses API).
@@ -118,6 +147,11 @@ pub fn preserve_cache_hints(
                 .into(),
         ));
     }
+    if target == Format::Chat && !original["prompt_cache_options"]["comparison_response_id"].is_null() {
+        return Ok(Some(
+            "Prompt cache comparison diagnostics require the Responses API; comparison_response_id was dropped".into(),
+        ));
+    }
     Ok(None)
 }
 
@@ -158,7 +192,6 @@ fn carry_cache_hints(source: Format, target: Format, original: &Value, translate
     }
     if breakpoints > 0 {
         let field = if source == Format::Chat { "messages" } else { "input" };
-        let mut conversation_started = false;
         let mut assistant_tools_seen = false;
         for item in original[field].as_array().into_iter().flatten() {
             if source == Format::Responses && target == Format::Chat {
@@ -189,16 +222,6 @@ fn carry_cache_hints(source: Format, target: Format, original: &Value, translate
                     "Cache breakpoints with unsupported content require the upstream's native API format".into()
                 );
             }
-            if matches!(item["role"].as_str(), Some("system" | "developer")) {
-                if conversation_started {
-                    return Err(
-                        "Cache breakpoints with interleaved system messages require the upstream's native API format"
-                            .into(),
-                    );
-                }
-            } else {
-                conversation_started = true;
-            }
             // Chat tool messages support text only; moving an image into a
             // separate user message would move the cache boundary as well.
             if target == Format::Chat
@@ -224,15 +247,17 @@ fn carry_cache_hints(source: Format, target: Format, original: &Value, translate
     }
     if let Some(options) = original["prompt_cache_options"].as_object() {
         let mut compatible = serde_json::Map::new();
-        for field in ["mode", "ttl", "prewarm"] {
-            if field == "prewarm" && target == Format::Chat {
+        for field in ["mode", "ttl", "prewarm", "comparison_response_id"] {
+            if matches!(field, "prewarm" | "comparison_response_id") && target == Format::Chat {
                 continue;
             }
             if let Some(value) = options.get(field) {
                 compatible.insert(field.into(), value.clone());
             }
         }
-        translated["prompt_cache_options"] = Value::Object(compatible);
+        if !compatible.is_empty() {
+            translated["prompt_cache_options"] = Value::Object(compatible);
+        }
     }
     Ok(())
 }
@@ -259,7 +284,7 @@ fn openai_breakpoint_count(format: Format, body: &Value) -> usize {
         .sum()
 }
 
-pub(crate) fn parse_openai_system(content: &Value, req: &mut Request) {
+pub(crate) fn parse_openai_system(content: &Value, role: Role, req: &mut Request) {
     let text = text_of(content);
     if text.is_empty() {
         return;
@@ -272,13 +297,46 @@ pub(crate) fn parse_openai_system(content: &Value, req: &mut Request) {
             .filter_map(|block| {
                 Some(CacheTextBlock {
                     text: block["text"].as_str()?.to_string(),
-                    breakpoint: block["prompt_cache_breakpoint"]["mode"] == "explicit",
+                    breakpoint: (block["prompt_cache_breakpoint"]["mode"] == "explicit")
+                        .then(|| block["prompt_cache_breakpoint"].clone()),
                 })
             })
             .collect();
         req.system_cache_blocks.insert(req.system.len(), blocks);
     }
+    req.system_roles.insert(req.system.len(), role);
     req.system.push(text);
+}
+
+/// Targets without positional instructions (Claude, Gemini, Devin) receive late
+/// system/developer messages in their system prompt, as before positions were kept.
+/// Demoting them to user turns would lower their privilege. Returns `None` when
+/// the request has no late instructions.
+pub fn hoist_instructions(req: &Request) -> Option<Request> {
+    if !req.messages.iter().any(|m| matches!(m.role, Role::System | Role::Developer)) {
+        return None;
+    }
+    let mut out = req.clone();
+    let messages = std::mem::take(&mut out.messages);
+    for m in messages {
+        if !matches!(m.role, Role::System | Role::Developer) {
+            out.messages.push(m);
+            continue;
+        }
+        let text = m
+            .parts
+            .iter()
+            .filter_map(|p| match p {
+                Part::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            out.system.push(text);
+        }
+    }
+    Some(out)
 }
 
 pub(crate) fn openai_system_blocks(req: &Request, index: usize, kind: &str) -> Value {
@@ -289,8 +347,8 @@ pub(crate) fn openai_system_blocks(req: &Request, index: usize, kind: &str) -> V
                 .iter()
                 .map(|block| {
                     let mut value = json!({"type": kind, "text": block.text});
-                    if block.breakpoint {
-                        value["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+                    if let Some(metadata) = &block.breakpoint {
+                        value["prompt_cache_breakpoint"] = metadata.clone();
                     }
                     value
                 })
@@ -300,15 +358,15 @@ pub(crate) fn openai_system_blocks(req: &Request, index: usize, kind: &str) -> V
     }
 }
 
-pub(crate) fn mark_openai_breakpoint(content: &mut [Value]) {
+pub(crate) fn mark_openai_breakpoint(content: &mut [Value], metadata: &Value) {
     if let Some(last) = content.last_mut() {
-        last["prompt_cache_breakpoint"] = serde_json::json!({"mode": "explicit"});
+        last["prompt_cache_breakpoint"] = metadata.clone();
     }
 }
 
 pub(crate) fn has_openai_breakpoints(parts: &[Part]) -> bool {
     parts.iter().any(|part| match part {
-        Part::CacheBreakpoint => true,
+        Part::CacheBreakpoint(_) => true,
         Part::ToolResult { content, .. } => has_openai_breakpoints(content),
         _ => false,
     })
@@ -330,6 +388,39 @@ pub(crate) fn merge_openai_tool_calls(messages: Vec<Message>) -> Vec<Message> {
         }
     }
     out
+}
+
+/// Apply Chat's assistant tool grouping only at its destination. Other OpenAI
+/// message boundaries remain stable as a conversation grows.
+pub(crate) fn openai_chat_messages(messages: &[Message]) -> Cow<'_, [Message]> {
+    if messages.windows(2).any(|pair| {
+        pair.iter().all(|message| message.role == Role::Assistant)
+            && pair.iter().flat_map(|message| &message.parts).any(|part| matches!(part, Part::ToolCall { .. }))
+    }) {
+        Cow::Owned(merge_openai_tool_calls(messages.to_vec()))
+    } else {
+        Cow::Borrowed(messages)
+    }
+}
+
+/// Claude and Gemini require alternating turns; OpenAI accepts consecutive
+/// messages with the same role and uses their boundaries for cache reuse.
+pub(crate) fn alternating_messages(messages: &[Message]) -> Cow<'_, [Message]> {
+    if messages.iter().any(|message| message.parts.is_empty())
+        || messages.windows(2).any(|pair| pair[0].role == pair[1].role)
+    {
+        Cow::Owned(crate::ir::merge_adjacent(messages.to_vec()))
+    } else {
+        Cow::Borrowed(messages)
+    }
+}
+
+pub(crate) fn write_openai_cache_lifetimes(details: &mut Value, usage: &Usage) {
+    for (field, tokens) in [("ttl_30m_tokens", usage.write_30m), ("ttl_12h_tokens", usage.write_12h)] {
+        if let Some(tokens) = tokens {
+            details["cache_write_tokens_details"][field] = tokens.into();
+        }
+    }
 }
 
 pub fn parser(format: Format) -> Box<dyn StreamParser> {
@@ -598,13 +689,6 @@ mod tests {
     fn cache_translation_drops_breakpoints_that_reordering_would_move() {
         // Why each request can't keep its breakpoints, and that it still goes out without them.
         let cases = [
-            (
-                json!({"input":[
-                    {"role":"user","content":"question"},
-                    {"role":"developer","content":[{"type":"input_text","text":"late instructions","prompt_cache_breakpoint":{"mode":"explicit"}}]}
-                ]}),
-                "interleaved",
-            ),
             (
                 json!({"input":[{"type":"function_call_output","call_id":"call_1","output":[
                     {"type":"input_image","image_url":"https://example.com/image.png"},

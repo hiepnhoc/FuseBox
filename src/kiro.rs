@@ -319,7 +319,7 @@ fn turns(req: &Request) -> Vec<Turn> {
     let mut out: Vec<Turn> = Vec::new();
     for m in &req.messages {
         match m.role {
-            Role::User => {
+            Role::User | Role::System | Role::Developer => {
                 let mut t = UserTurn::default();
                 for p in &m.parts {
                     match p {

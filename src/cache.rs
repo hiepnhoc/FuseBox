@@ -1,4 +1,4 @@
-//! Cache intent and effective policy, without prompt content or raw cache keys.
+//! Cache intent, effective policy and provider diagnostics without prompt content or raw identifiers.
 
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,81 @@ pub struct Policy {
     pub downgrade_reason: Option<String>,
 }
 
+/// The provider's explanation of cache reuse, independent of requested controls.
+/// Keep only known classifications and bounded counts: diagnostic responses can
+/// also contain identifiers or future free-text fields that must not reach logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Diagnostics {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison_reusable_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_missed_tokens: Option<u64>,
+}
+
+impl Diagnostics {
+    fn from_wire(value: &Value) -> Option<Self> {
+        // Both full Responses objects and response.* SSE/WebSocket events.
+        // Never search recursively through arbitrary model or tool output.
+        let diagnostic =
+            value["response"].get("prompt_cache_diagnostics").or_else(|| value.get("prompt_cache_diagnostics"))?;
+        let diagnostic = diagnostic.as_object()?;
+        let kind = match diagnostic.get("type").and_then(Value::as_str) {
+            Some("cache_hit") => "cache_hit",
+            Some("cache_miss") => "cache_miss",
+            Some("comparison_response_not_found") => "comparison_response_not_found",
+            _ => "unavailable",
+        };
+        let reason = (kind == "cache_miss").then(|| match diagnostic.get("reason").and_then(Value::as_str) {
+            Some("model_changed") => "model_changed",
+            Some("prompt_cache_key_changed") => "prompt_cache_key_changed",
+            Some("service_tier_changed") => "service_tier_changed",
+            Some("tools_changed") => "tools_changed",
+            Some("text_format_changed") => "text_format_changed",
+            Some("reasoning_effort_changed") => "reasoning_effort_changed",
+            Some("verbosity_changed") => "verbosity_changed",
+            Some("context_compacted") => "context_compacted",
+            Some("input_changed") => "input_changed",
+            _ => "unknown",
+        });
+        // JSON dashboard numbers must be exact; reject negatives, strings,
+        // fractional values and numbers outside JavaScript's safe integer range.
+        let tokens = |name: &str| {
+            (kind == "cache_miss")
+                .then(|| diagnostic.get(name).and_then(Value::as_u64).filter(|n| *n <= 9_007_199_254_740_991))
+                .flatten()
+        };
+        Some(Self {
+            kind,
+            reason,
+            comparison_reusable_tokens: tokens("comparison_reusable_tokens"),
+            cache_missed_tokens: tokens("cache_missed_tokens"),
+        })
+    }
+}
+
+/// Shared with translated stream decoders, which outlive request preparation.
+/// Only a sanitized diagnostic survives beyond the original wire event.
+#[derive(Clone, Default)]
+pub(crate) struct DiagnosticObserver(std::sync::Arc<parking_lot::Mutex<Option<Diagnostics>>>);
+
+impl DiagnosticObserver {
+    pub(crate) fn observe(&self, value: &Value) {
+        if let Some(diagnostic) = Diagnostics::from_wire(value) {
+            *self.0.lock() = Some(diagnostic);
+        }
+    }
+    pub(crate) fn snapshot(&self) -> Option<Diagnostics> {
+        self.0.lock().clone()
+    }
+    pub(crate) fn reset(&self) {
+        *self.0.lock() = None;
+    }
+}
+
 /// What the caller's own body asks of the cache, read once per request: each
 /// question walks the whole body, and retries ask again for every attempt.
 pub struct Requested {
@@ -165,21 +240,65 @@ impl Policy {
 }
 
 pub fn has_markers(value: &Value) -> bool {
-    has_fields(value, &["cache_control", "prompt_cache_breakpoint"])
+    has_fields(value, &["cache_control", "prompt_cache_breakpoint"], &mut Vec::new())
 }
 
 pub fn has_claude_controls(value: &Value) -> bool {
-    has_fields(value, &["cache_control"])
+    has_fields(value, &["cache_control"], &mut Vec::new())
 }
 
-fn has_fields(value: &Value, fields: &[&str]) -> bool {
+/// Schemas and tool arguments are caller data. Everywhere else the scan stays
+/// conservative, including unknown block types and nested tool-result content:
+/// missing a real marker could add a fifth Anthropic breakpoint.
+fn has_fields<'a>(value: &'a Value, fields: &[&str], path: &mut Vec<&'a str>) -> bool {
     match value {
         Value::Object(object) => {
             fields.iter().any(|field| object.get(*field).is_some_and(|v| !v.is_null()))
-                || object.values().any(|value| has_fields(value, fields))
+                || object.iter().any(|(key, value)| {
+                    let tool_schema = matches!(key.as_str(), "input_schema" | "parameters")
+                        && (path.as_slice() == ["tools"] || path.as_slice() == ["tools", "function"])
+                        || matches!(key.as_str(), "parameters" | "parametersJsonSchema" | "parameters_json_schema")
+                            && matches!(path.as_slice(), ["tools", "functionDeclarations" | "function_declarations"]);
+                    let arguments = (key == "input"
+                        && matches!(object.get("type").and_then(Value::as_str), Some("tool_use" | "server_tool_use")))
+                        || (key == "arguments"
+                            && (matches!(object.get("type").and_then(Value::as_str), Some("function_call"))
+                                || path.ends_with(&["tool_calls", "function"])))
+                        || key == "args" && matches!(path.last(), Some(&"functionCall" | &"function_call"));
+                    let output_schema = key == "schema"
+                        && matches!(
+                            path.as_slice(),
+                            ["output_config", "format"] | ["response_format", "json_schema"] | ["text", "format"]
+                        )
+                        || matches!(
+                            key.as_str(),
+                            "responseSchema" | "responseJsonSchema" | "response_schema" | "response_json_schema"
+                        ) && matches!(path.as_slice(), ["generationConfig" | "generation_config"]);
+                    if tool_schema || arguments || output_schema {
+                        return false;
+                    }
+                    path.push(key);
+                    let found = has_fields(value, fields, path);
+                    path.pop();
+                    found
+                })
         }
-        Value::Array(values) => values.iter().any(|value| has_fields(value, fields)),
+        Value::Array(values) => values.iter().any(|value| has_fields(value, fields, path)),
         _ => false,
+    }
+}
+
+/// Stable compact codes for the allowlisted persistent numeric metadata.
+pub fn intent_code(intent: &str) -> u64 {
+    match intent {
+        "provider_default" => 1,
+        "none" => 2,
+        "automatic" => 3,
+        "explicit" => 4,
+        "explicit_no_breakpoints" => 5,
+        "prewarm" => 6,
+        "rejected" => 7,
+        _ => 0,
     }
 }
 

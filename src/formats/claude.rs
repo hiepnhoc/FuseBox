@@ -86,8 +86,6 @@ pub fn parse_request(v: &Value) -> Result<Request, String> {
         };
         req.messages.push(Message { role, parts: blocks_to_parts(&m["content"]) });
     }
-    req.messages = merge_adjacent(req.messages);
-
     for t in v["tools"].as_array().into_iter().flatten() {
         // Anthropic-defined server/client tools (web_search_*, bash_*, ...) have no schema.
         let Some(name) = t["name"].as_str() else { continue };
@@ -223,12 +221,24 @@ pub fn thinking_budget(max_tokens: u64, requested: u64) -> Result<u64, String> {
 }
 
 fn manual_thinking_allowed(req: &Request) -> bool {
-    let Some(last) = req.messages.iter().rev().find(|m| m.role == Role::Assistant) else { return true };
-    !last.parts.iter().any(|p| matches!(p, Part::ToolCall { .. }))
-        || last
-            .parts
-            .iter()
-            .any(|p| matches!(p, Part::Reasoning { sig: Some(Sig::Claude(_)), .. } | Part::RedactedReasoning(_)))
+    // Responses encodes reasoning and calls as separate items. They form one
+    // assistant turn on Claude even while the IR keeps OpenAI message endings.
+    let parts = req
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| !message.parts.is_empty())
+        .skip_while(|message| message.role != Role::Assistant)
+        .take_while(|message| message.role == Role::Assistant)
+        .flat_map(|message| &message.parts);
+    let mut tools = false;
+    let mut signed_thinking = false;
+    for part in parts {
+        tools |= matches!(part, Part::ToolCall { .. });
+        signed_thinking |=
+            matches!(part, Part::Reasoning { sig: Some(Sig::Claude(_)), .. } | Part::RedactedReasoning(_));
+    }
+    !tools || signed_thinking
 }
 
 pub fn validate_thinking_budget(req: &Request, model: &str) -> Result<(), String> {
@@ -254,18 +264,6 @@ pub fn validate_native_thinking_budget(body: &Value, model: &str) -> Result<(), 
     Ok(())
 }
 
-fn has_cache_control(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => {
-            object.get("cache_control").is_some_and(|control| !control.is_null())
-                || object.get("prompt_cache_breakpoint").is_some_and(|control| !control.is_null())
-                || object.values().any(has_cache_control)
-        }
-        Value::Array(values) => values.iter().any(has_cache_control),
-        _ => false,
-    }
-}
-
 /// Enable Anthropic's moving cache boundary for translated conversations.
 /// Call only for an actual Claude provider, not every provider using its wire format.
 /// Explicit controls, including OpenAI's intentional explicit-with-no-markers mode,
@@ -273,12 +271,13 @@ fn has_cache_control(value: &Value) -> bool {
 #[cfg(test)]
 pub fn apply_translated_cache_policy(original: &Value, body: &mut Value) {
     let explicit = original["prompt_cache_options"]["mode"] == "explicit";
-    apply_translated_cache_policy_with(explicit, !explicit && has_cache_control(original), body);
+    apply_translated_cache_policy_with(explicit, !explicit && crate::cache::has_markers(original), body);
 }
 
 /// The same, with the caller's mode and markers already known for this request.
+#[cfg(test)]
 pub fn apply_translated_cache_policy_with(explicit_mode: bool, original_markers: bool, body: &mut Value) {
-    if !explicit_mode && !original_markers && !has_cache_control(body) {
+    if !explicit_mode && !original_markers && !crate::cache::has_markers(body) {
         body["cache_control"] = json!({ "type": "ephemeral" });
     }
 }
@@ -375,7 +374,7 @@ pub fn build_request(req: &Request, model: &str) -> Value {
     }
 
     let mut messages = Vec::new();
-    for m in &req.messages {
+    for m in super::alternating_messages(&req.messages).iter() {
         let mut blocks = Vec::new();
         let mut results = Vec::new();
         for p in &m.parts {
@@ -486,6 +485,7 @@ pub fn usage_of(u: &Value) -> Usage {
             .as_u64()
             .or_else(|| u["output_tokens_details"]["reasoning_tokens"].as_u64())
             .unwrap_or(0),
+        ..Default::default()
     }
 }
 

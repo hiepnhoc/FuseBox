@@ -190,7 +190,7 @@ pub fn record(
                 provider = log.provider, model = model_label(&log.model),
                 account = ?account, session = ?session,
                 upstream_request = ?upstream_request, upstream_response = ?response,
-                attempts = log.attempts, latency_ms = log.latency_ms, ttft_ms = ?log.ttft_ms,
+                attempts = log.attempts, chunks = log.chunks, control_downgrades = ?log.control_downgrades, latency_ms = log.latency_ms, ttft_ms = ?log.ttft_ms,
                 input_tokens = log.input_tokens, output_tokens = log.output_tokens, cached_tokens = log.cache_tokens,
                 usage_completeness = log.usage_completeness,
                 reported_input_tokens = ?capture.and_then(|o| o.tokens.input),
@@ -204,6 +204,10 @@ pub fn record(
                 cache_applied = log.cache_policy.as_ref().map(|p| p.applied).unwrap_or("unknown"),
                 cache_key_scope = log.cache_policy.as_ref().map(|p| p.key_scope).unwrap_or("not_sent"),
                 cache_hint_downgrade = ?log.cache_policy.as_ref().and_then(|p| p.downgrade_reason.as_deref()),
+                provider_cache_result = log.cache_diagnostics.as_ref().map(|d| d.kind).unwrap_or("not_reported"),
+                provider_cache_miss_reason = ?log.cache_diagnostics.as_ref().and_then(|d| d.reason),
+                provider_cache_comparison_reusable_tokens = ?log.cache_diagnostics.as_ref().and_then(|d| d.comparison_reusable_tokens),
+                provider_cache_missed_tokens = ?log.cache_diagnostics.as_ref().and_then(|d| d.cache_missed_tokens),
                 "request completed");
         };
     }

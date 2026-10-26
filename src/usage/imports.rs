@@ -48,6 +48,14 @@ pub enum UsageCommand {
         #[arg(long)]
         database: Option<PathBuf>,
     },
+    /// Create a rollback copy for schema-4 releases, omitting OpenAI cache
+    /// lifetime details only in the copy. Keeps the original. Stop Fusebox first.
+    RollbackCopy {
+        /// A new file for the older release (must not exist).
+        to: PathBuf,
+        #[arg(long)]
+        database: Option<PathBuf>,
+    },
     /// Report candidate homes; do not read history without enabled roots.
     Status {
         #[arg(long)]
@@ -135,6 +143,7 @@ pub async fn run_command(command: UsageCommand) -> Result<()> {
         | UsageCommand::EstimateKeeperCache { .. }
         | UsageCommand::Backup { .. }
         | UsageCommand::Compact { .. }
+        | UsageCommand::RollbackCopy { .. }
         | UsageCommand::Downgrade { .. } => {
             unreachable!()
         }
@@ -156,6 +165,7 @@ pub async fn run_command(command: UsageCommand) -> Result<()> {
         | UsageCommand::EstimateKeeperCache { .. }
         | UsageCommand::Backup { .. }
         | UsageCommand::Compact { .. }
+        | UsageCommand::RollbackCopy { .. }
         | UsageCommand::Downgrade { .. } => {
             unreachable!()
         }
@@ -537,6 +547,7 @@ fn parse_record_inner(source: &str, v: &Value, context: &mut Context) -> Result<
             output: number(usage.get("output_tokens")),
             reasoning: number(usage.pointer("/output_tokens_details/thinking_tokens"))
                 .or_else(|| number(usage.pointer("/output_tokens_details/reasoning_tokens"))),
+            ..Tokens::default()
         };
         o.completeness = if o.tokens.total().is_some() { "complete" } else { "partial" }.into();
         o.validate().map_err(|_| anyhow!("invalid usage metadata"))?;

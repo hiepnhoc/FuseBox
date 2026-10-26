@@ -116,6 +116,8 @@ pub(crate) fn openai_base(
         stream: false,
         count_tokens: false,
         cache_key: None,
+        cache_session: None,
+        cache_defaults: true,
     };
     let p = upstream::prepare(&t, json!({}));
     let base = p.url.trim_end_matches("/chat/completions").trim_end_matches("/responses").to_string();
@@ -217,7 +219,8 @@ async fn codex_image(app: &App, acct: &Account, headers: &HeaderMap, body: &Valu
         return read_json(resp).await;
     }
     let mut stream = resp.bytes_stream();
-    let mut dec = SseDecoder::default();
+    // Generated images arrive base64-encoded inside a single event.
+    let mut dec = SseDecoder::with_limit(app.cfg().stream_limits.media_event_bytes);
     let mut images: Vec<(String, String)> = Vec::new();
     let mut meta = json!({});
     let mut usage = Value::Null;
@@ -256,11 +259,17 @@ async fn codex_image(app: &App, acct: &Account, headers: &HeaderMap, body: &Valu
                 return Err(err);
             }
         }
+        if dec.failed() {
+            return Err(fail(502, crate::sse::LIMIT_ERROR));
+        }
     }
     for ev in dec.finish() {
         if let Some(err) = handle(&ev.data, &mut images) {
             return Err(err);
         }
+    }
+    if dec.failed() {
+        return Err(fail(502, crate::sse::LIMIT_ERROR));
     }
     if images.is_empty() {
         return Err(fail(502, "the upstream did not return an image"));
@@ -290,6 +299,8 @@ async fn imagen(app: &App, acct: &Account, headers: &HeaderMap, model: &str, bod
         stream: false,
         count_tokens: false,
         cache_key: None,
+        cache_session: None,
+        cache_defaults: true,
     };
     let p = upstream::prepare(&t, json!({}));
     let url = p.url.replace(":generateContent", ":predict");
@@ -343,6 +354,8 @@ async fn gemini_image(app: &App, acct: &Account, headers: &HeaderMap, model: &st
         stream: false,
         count_tokens: false,
         cache_key: None,
+        cache_session: None,
+        cache_defaults: true,
     };
     let n = body["n"].as_u64().unwrap_or(1).clamp(1, 4);
     let mut images = Vec::new();
