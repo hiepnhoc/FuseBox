@@ -231,7 +231,13 @@ h1, h2, h3, p { margin: 0; }
 .idchip .tag { color: var(--brand); font-size: 11px; }
 .idchip.add { border-style: dashed; color: var(--fg-3); }
 .idchip.add:hover { color: var(--fg); }
+.idchip[aria-pressed="true"] { border-color: var(--brand); color: var(--brand); }
 .idchip-pair { display: inline-flex; }
+.field .fetch-models { margin-left: auto; font-size: 12.5px; }
+.model-pick { display: grid; gap: 8px; }
+.model-pick-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12.5px; color: var(--fg-3); }
+.model-pick-head input { width: 180px; padding: 4px 8px; font-size: 12.5px; }
+.model-pick .chips { gap: 6px; max-height: 180px; overflow: auto; }
 .idchip-pair > .idchip { border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .idchip-x { padding: 0 7px; background: transparent; color: var(--fg-3); font: 400 12px/1.5 var(--mono); border: 1px solid var(--line-strong); border-left: 0; border-radius: 0 4px 4px 0; }
 .idchip-x:hover { color: var(--err); border-color: var(--fg-3); }

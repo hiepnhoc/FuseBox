@@ -2454,15 +2454,86 @@ function keyPanelHTML() {
       <label class="field wide"><span>API key${compat ? ' (optional for local servers)' : ''}</span><input type="password" name="api_key" autocomplete="off" spellcheck="false" ${compat ? '' : 'required'}></label>
       <label class="field ${compat ? '' : 'wide'}"><span>Base URL${compat ? '' : ' (optional)'}</span><input type="url" name="base_url" placeholder="${esc(base)}" ${compat ? 'required' : ''}></label>
       ${compat ? `<label class="field"><span>Name</span><input type="text" name="name" placeholder="openrouter"></label>
-      <label class="field wide"><span>Models</span><input type="text" name="models" placeholder="moonshotai/kimi-k3, kimi=moonshotai/kimi-k3" required><small>Comma separated. Write alias=upstream-name to expose a model under a shorter name.</small></label>` : ''}
+      <label class="field wide"><span>Models <button class="linkbtn fetch-models" type="button" data-act="fetch-models">Fetch models</button></span><input type="text" name="models" placeholder="moonshotai/kimi-k3, kimi=moonshotai/kimi-k3" required><small>Comma separated. Write alias=upstream-name to expose a model under a shorter name. Fetch models asks the server what it serves, then click to pick.</small></label>
+      <div class="field wide" id="key-models">${keyModelsHTML()}</div>` : ''}
     </div>
     <div class="actions"><button class="btn primary" type="submit">Add key</button><button class="btn ghost" type="button" data-act="close-panel">Cancel</button></div>
     <p class="msg" id="key-msg" aria-live="polite"></p>
   </form>`;
 }
 
+// The models an OpenAI-compatible server listed for the "Add an API key" form.
+function keyModelsHTML() {
+  const M = S.keyModels;
+  if (!M) return '';
+  if (M.status === 'loading') return '<span class="wait"><span class="pulse"></span>Asking the server for its models…</span>';
+  return `<div class="model-pick">
+    <div class="model-pick-head"><span><span class="mono">${esc(M.host)}</span> · ${M.list.length} models</span>${M.list.length > 12 ? `<input type="search" name="key-model-filter" placeholder="Filter" value="${esc(M.filter || '')}" autocomplete="off">` : ''}</div>
+    <div class="chips" id="key-model-chips">${keyModelChipsHTML()}</div>
+  </div>`;
+}
+
+function keyModelChipsHTML() {
+  const M = S.keyModels;
+  const q = (M.filter || '').trim().toLowerCase();
+  const shown = M.list.filter((id) => !q || id.toLowerCase().includes(q));
+  if (!shown.length) return '<span class="msg">No model matches.</span>';
+  const picked = pickedKeyModels();
+  return shown.map((id) => `<button class="idchip" type="button" data-act="pick-model" data-id="${esc(id)}" aria-pressed="${picked.has(id)}">${esc(id)}</button>`).join('');
+}
+
+// Entries of the Models field as "alias=upstream" or "upstream".
+const keyModelEntries = () => ($('#acct-panel input[name="models"]')?.value || '').split(/[,\n]/).map((s) => s.trim()).filter(Boolean);
+const upstreamOf = (entry) => (entry.includes('=') ? entry.slice(entry.indexOf('=') + 1).trim() : entry);
+const pickedKeyModels = () => new Set(keyModelEntries().map(upstreamOf));
+
+function pickKeyModel(id) {
+  const input = $('#acct-panel input[name="models"]');
+  if (!input) return;
+  const entries = keyModelEntries();
+  const has = entries.some((e) => upstreamOf(e) === id);
+  input.value = (has ? entries.filter((e) => upstreamOf(e) !== id) : [...entries, id]).join(', ');
+  syncKeyModelChips();
+}
+
+function syncKeyModelChips() {
+  const picked = pickedKeyModels();
+  for (const b of $$('#key-model-chips [data-act="pick-model"]')) b.setAttribute('aria-pressed', String(picked.has(b.dataset.id)));
+}
+
+async function fetchKeyModels(btn) {
+  const form = btn.closest('form');
+  const base_url = form.elements.base_url.value.trim();
+  const api_key = form.elements.api_key.value.trim();
+  const msg = $('#key-msg');
+  if (!base_url) {
+    msg.className = 'msg err';
+    msg.textContent = 'Enter the base URL first.';
+    form.elements.base_url.focus();
+    return;
+  }
+  btn.disabled = true;
+  S.keyModels = { status: 'loading' };
+  patch('key-models', keyModelsHTML);
+  try {
+    const r = await api('/keys/models', { method: 'POST', body: JSON.stringify({ base_url, api_key }) });
+    let host = base_url;
+    try { host = new URL(base_url).host; } catch {}
+    S.keyModels = { status: 'done', list: r.models, host, filter: '' };
+    msg.className = 'msg';
+    msg.textContent = '';
+  } catch (e) {
+    S.keyModels = null;
+    msg.className = 'msg err';
+    msg.textContent = e.message;
+  }
+  btn.disabled = false;
+  patch('key-models', keyModelsHTML);
+}
+
 function openPanel(panel) {
   S.panel = panel;
+  if (panel === 'key') S.keyModels = null;
   if (panel !== 'vertex-done' && !LOGIN[panel]) S.login = null;
   if (S.route !== 'accounts' || S.sub) { location.hash = '#/accounts'; return; }
   patch('acct-panel', panelHTML);
@@ -3727,8 +3798,11 @@ document.addEventListener('click', (e) => {
       clearTimeout(pollTimer);
       patch('acct-panel', panelHTML);
       return patch('acct-head', accountHeadHTML);
+    case 'fetch-models': return fetchKeyModels(el);
+    case 'pick-model': return pickKeyModel(id);
     case 'key-provider':
       S.keyProvider = id;
+      S.keyModels = null;
       return patch('acct-panel', panelHTML);
     case 'confirm-delete':
       S.confirm = id;
@@ -3777,6 +3851,11 @@ document.addEventListener('input', (e) => {
     store.set('snippet', S.snippet);
     refreshSetups();
     document.getElementById(select)?.focus();
+  } else if (e.target.name === 'key-model-filter' && S.keyModels) {
+    S.keyModels.filter = e.target.value;
+    patch('key-model-chips', keyModelChipsHTML);
+  } else if (e.target.name === 'models' && e.target.closest('form[data-form="key"]')) {
+    syncKeyModelChips();
   } else if (e.target.id === 'model-filter') {
     S.modelFilter = e.target.value;
     patch('models-root', modelsBodyHTML);

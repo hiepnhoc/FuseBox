@@ -385,6 +385,7 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/playground", post(crate::server::playground))
         .route("/routes", get(routes))
         .route("/keys", post(add_key))
+        .route("/keys/models", post(list_key_models))
         .route("/vertex", post(import_vertex))
         .route("/requests", get(requests))
         .route("/faults", get(faults))
@@ -1022,6 +1023,49 @@ async fn delete_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> 
     };
     let group = if acct.provider == Provider::Compat { acct.group.clone() } else { None };
     edit_config(&app, |doc| crate::compat::remove_key(doc, &key, group.as_deref()))
+}
+
+#[derive(Deserialize)]
+struct KeyModelsBody {
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    base_url: String,
+}
+
+/// Asks an OpenAI-compatible server which models it serves, for the "Add an API
+/// key" form: `GET {base_url}/models` with the key, answered as a sorted id list.
+async fn list_key_models(State(app): State<Arc<App>>, Json(b): Json<KeyModelsBody>) -> Response {
+    let base = b.base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "base URL is required");
+    }
+    if url::Url::parse(base).is_err() {
+        return err(StatusCode::BAD_REQUEST, "base URL is not a valid URL");
+    }
+    let mut req = app.http.control(None).get(format!("{base}/models")).timeout(Duration::from_secs(20));
+    let key = b.api_key.trim();
+    if !key.is_empty() {
+        req = req.bearer_auth(key);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return err(StatusCode::BAD_GATEWAY, format!("could not reach {base}/models: {e}")),
+    };
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let snippet: String = text.chars().take(200).collect();
+        return err(StatusCode::BAD_GATEWAY, format!("{base}/models answered {status}: {}", snippet.trim()));
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return err(StatusCode::BAD_GATEWAY, format!("{base}/models did not answer with JSON"));
+    };
+    let models = crate::compat::model_ids(&v);
+    if models.is_empty() {
+        return err(StatusCode::BAD_GATEWAY, format!("{base}/models listed no models"));
+    }
+    Json(json!({ "models": models })).into_response()
 }
 
 #[derive(Deserialize)]

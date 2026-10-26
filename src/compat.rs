@@ -4,6 +4,26 @@
 
 use serde_yaml::{Mapping, Value as Yaml};
 
+/// Model ids from a provider's model list: OpenAI's `{data:[{id}]}`, or the
+/// `{models:[{id|name}]}` and bare `[{id}]` shapes some servers answer with.
+/// Sorted, without duplicates, so the list reads the same however it came.
+pub fn model_ids(v: &serde_json::Value) -> Vec<String> {
+    let items =
+        v.get("data").or_else(|| v.get("models")).or(Some(v)).and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let mut ids: Vec<String> = items
+        .iter()
+        .filter_map(|m| match m {
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => m.get("id").or_else(|| m.get("name")).and_then(|x| x.as_str()).map(String::from),
+        })
+        .map(|s| s.trim().trim_start_matches("models/").to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn key(s: &str) -> Yaml {
     Yaml::String(s.into())
 }
@@ -405,6 +425,16 @@ pub fn translate_args(args: Vec<String>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::{Config, Routing};
+
+    #[test]
+    fn model_ids_read_the_common_shapes() {
+        let openai = serde_json::json!({ "object": "list", "data": [{ "id": "gpt-5" }, { "id": "b-model" }, { "id": "gpt-5" }] });
+        assert_eq!(model_ids(&openai), ["b-model", "gpt-5"]);
+        let ollama = serde_json::json!({ "models": [{ "name": "llama3:8b" }, { "id": "models/gemma" }] });
+        assert_eq!(model_ids(&ollama), ["gemma", "llama3:8b"]);
+        assert_eq!(model_ids(&serde_json::json!(["a", " ", "c"])), ["a", "c"]);
+        assert!(model_ids(&serde_json::json!({ "error": "nope" })).is_empty());
+    }
 
     const V8: &str = r#"
 config-version: 8
