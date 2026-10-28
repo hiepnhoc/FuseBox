@@ -1200,8 +1200,27 @@ impl Pool {
                 }
                 let identity = s.cred.identity(s.provider);
                 let identity_changed = prev.state.lock().credential_identity != identity;
+                // Fusebox's own refreshes land in memory before they reach disk, so a
+                // different refresh token on disk means a sign-in replaced the credential.
+                let signed_in = guard.is_ok()
+                    && pending.is_none()
+                    && match (&*prev.cred.read(), &s.cred) {
+                        (Credential::OAuth(before), Credential::OAuth(after)) => {
+                            before.refresh_token != after.refresh_token
+                        }
+                        _ => false,
+                    };
                 if guard.is_ok() && pending.is_none() {
                     *prev.cred.write() = s.cred.clone();
+                }
+                if signed_in {
+                    // The failure, strikes and rate-limit pauses described the old token.
+                    let mut st = prev.state.lock();
+                    st.strikes = 0;
+                    st.cooldowns.clear();
+                    if st.last_error.as_ref().is_some_and(|e| e.pause.is_none()) {
+                        st.last_error = None;
+                    }
                 }
                 if identity_changed {
                     let mut st = prev.state.lock();
@@ -2110,6 +2129,49 @@ mod tests {
         assert_eq!(new.state.lock().active_requests.load(Ordering::Relaxed), 1);
         drop(request);
         assert_eq!(new.state.lock().active_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_new_sign_in_clears_the_old_tokens_failure() {
+        let dir = std::env::temp_dir().join(format!("fusebox-signin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("codex-user@example.com-plus.json");
+        let oauth = |rt: &str| OAuth {
+            access_token: "at".into(),
+            refresh_token: rt.into(),
+            email: Some("user@example.com".into()),
+            ..Default::default()
+        };
+        write_oauth_file(&path, Provider::Codex, &oauth("rt-old"), &[]).unwrap();
+        let cfg = Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let acct = pool.all()[0].clone();
+        {
+            let mut st = acct.state.lock();
+            st.set_error("401: Encountered invalidated oauth token for user, failing request");
+            st.strikes = 3;
+            st.cooldowns.insert("*".into(), Utc::now() + chrono::Duration::hours(1));
+        }
+        // A reload that finds the same token keeps the failure: nothing changed.
+        pool.reload(&cfg);
+        let same = pool.all()[0].clone();
+        assert!(Arc::ptr_eq(&acct, &same));
+        assert_eq!(
+            same.state.lock().last_error(Utc::now()),
+            Some("401: Encountered invalidated oauth token for user, failing request")
+        );
+        // Signing in again rewrites the file with a new refresh token.
+        write_oauth_file(&path, Provider::Codex, &oauth("rt-new"), &[]).unwrap();
+        pool.reload(&cfg);
+        let after = pool.all()[0].clone();
+        assert!(Arc::ptr_eq(&acct, &after), "same shape, same account");
+        let st = after.state.lock();
+        assert_eq!(st.last_error(Utc::now()), None);
+        assert_eq!(st.strikes, 0);
+        assert!(st.cooldowns.is_empty());
+        drop(st);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
