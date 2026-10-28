@@ -23,7 +23,7 @@ const CHAT_PATH: &str = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 const APP_BASE: &str = "https://app.devin.ai";
 const API_BASE: &str = "https://api.devin.ai";
 const CLIENT_NAME: &str = "chisel";
-pub(crate) const CLIENT_VERSION: &str = "3000.11.92";
+pub(crate) const CLIENT_VERSION: &str = "3000.11.205";
 const FINGERPRINT_LEN: usize = 732;
 const DEFAULT_MAX_TOKENS: u64 = 64_000;
 const TOKEN_PREFIX: &str = "devin-session-token$";
@@ -32,12 +32,15 @@ const TOKEN_PREFIX: &str = "devin-session-token$";
 const LEVELS: &[(&str, &[&str])] = &[
     ("claude-opus-5-5", &["low", "medium", "high", "xhigh", "max"]),
     ("claude-fable-5-1", &["low", "medium", "high", "xhigh", "max"]),
+    ("claude-sonnet-5-5", &["low", "medium", "high", "xhigh", "max"]),
+    ("claude-haiku-5-5", &["low", "medium", "high", "xhigh", "max"]),
     ("claude-sonnet-5", &["low", "medium", "high", "xhigh", "max"]),
     ("claude-opus-5", &["low", "medium", "high", "xhigh", "max"]),
     ("claude-5-fable", &["low", "medium", "high", "xhigh", "max"]),
     ("claude-opus-4-8", &["low", "medium", "high", "xhigh", "max"]),
     ("claude-opus-4-7", &["low", "medium", "high", "xhigh", "max"]),
     ("gpt-6-astra", &["low", "medium", "high", "xhigh", "max"]),
+    ("gpt-6-1-sol", &["low", "medium", "high", "xhigh", "max"]),
     ("gpt-6-sol", &["none", "low", "medium", "high", "xhigh", "max"]),
     ("gpt-6-luna", &["none", "low", "medium", "high", "xhigh", "max"]),
     ("gpt-5-6-sol", &["none", "low", "medium", "high", "xhigh", "max"]),
@@ -776,17 +779,17 @@ mod tests {
     }
 
     #[test]
-    fn request_metadata_matches_devin_cli_3000_11_92() {
+    fn request_metadata_matches_devin_cli_3000_11_205() {
         let body = encode(&json!({}), "tok", "seed");
         let metadata = bytes_field(&body, 1).unwrap();
-        // Captured from the checksum-verified official Linux release.
+        // Existing protobuf layout, with the checksum-verified release's identity.
         for (number, expected) in [
             (1, "devin-cli"),
-            (2, "3000.11.92"),
+            (2, "3000.11.205"),
             (3, "tok"),
             (4, "en"),
             (5, os_name()),
-            (7, "3000.11.92"),
+            (7, "3000.11.205"),
             (12, "chisel"),
             (28, "chisel"),
         ] {
@@ -843,6 +846,10 @@ mod tests {
         assert_eq!(model_uid("claude-sonnet-4-6", Some("high")), "claude-sonnet-4-6-thinking");
         assert_eq!(model_uid("swe-2", None), "swe-2-high");
         assert_eq!(model_uid("swe-2-max", None), "swe-2-max");
+        assert_eq!(model_uid("gpt-6.1-sol", None), "gpt-6-1-sol-medium");
+        assert_eq!(model_uid("gpt-6-1-sol", Some("none")), "gpt-6-1-sol-medium");
+        assert_eq!(model_uid("claude-haiku-5-5", Some("max")), "claude-haiku-5-5-max");
+        assert_eq!(model_uid("claude-sonnet-5-5", Some("xhigh")), "claude-sonnet-5-5-xhigh");
     }
 
     #[test]

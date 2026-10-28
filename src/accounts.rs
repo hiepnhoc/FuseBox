@@ -46,8 +46,19 @@ pub const PROVIDERS: [Provider; 11] = [
 ];
 
 const ANTIGRAVITY_MODELS: &[&str] = &[
+    "claude-opus-5-5-max",
+    "claude-opus-5-5-high",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-low",
+    "claude-sonnet-5-5-max",
+    "claude-sonnet-5-5-high",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-low",
     "claude-opus-4-6-thinking",
     "claude-sonnet-4-6",
+    "gemini-4-argon-high",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-low",
     "gemini-3.8-flash-high",
     "gemini-3.7-flash-high",
     "gemini-3.6-flash-high",
@@ -63,12 +74,15 @@ const ANTIGRAVITY_MODELS: &[&str] = &[
 const DEVIN_MODELS: &[&str] = &[
     "claude-opus-5-5",
     "claude-fable-5-1",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
     "claude-sonnet-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-sonnet-4-6",
     "gpt-6-astra",
+    "gpt-6-1-sol",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-5-6-sol",
@@ -201,6 +215,7 @@ impl Provider {
                 "claude-fable-5-1",
                 "claude-opus-5-5",
                 "claude-sonnet-5-5",
+                "claude-haiku-5-5",
                 "claude-opus-5",
                 "claude-sonnet-5",
                 "claude-opus-4-8",
@@ -212,6 +227,7 @@ impl Provider {
             Provider::Codex => &[
                 "gpt-6-astra",
                 "gpt-6.1-sol",
+                "gpt-6.1-terra",
                 "gpt-6-sol",
                 "gpt-6-luna",
                 "gpt-5.6-sol",
@@ -219,18 +235,25 @@ impl Provider {
                 "gpt-5.6-luna",
                 "gpt-5.5",
                 "gpt-image-2",
+                "gpt-image-2.5-flare",
+                "gpt-image-2.5-sunburst",
             ],
             Provider::Gemini => &[
+                "gemini-4-argon",
                 "gemini-3.8-flash",
                 "gemini-3.7-flash",
                 "gemini-3.6-flash",
                 "gemini-3.1-pro-preview",
                 "gemini-3.5-flash-lite",
                 "gemini-3.1-flash-image-preview",
+                "gemini-3.1-flash-image",
+                "gemini-3.1-flash-lite-image",
+                "gemini-nano-banana-2.1",
                 "gemini-2.5-pro",
                 "gemini-2.5-flash",
             ],
             Provider::Vertex => &[
+                "gemini-4-argon",
                 "gemini-3.8-flash",
                 "gemini-3.7-flash",
                 "gemini-3.1-pro",
@@ -244,6 +267,8 @@ impl Provider {
             ],
             Provider::Antigravity => ANTIGRAVITY_MODELS,
             Provider::Kimi => &[
+                "kimi-k3.1-pro",
+                "kimi-k3.1-pro-highspeed",
                 "kimi-k3",
                 "kimi-k3-256k",
                 "kimi-k2.8",
@@ -265,9 +290,13 @@ impl Provider {
                 "grok-4.20-0309-non-reasoning",
                 "grok-3-mini",
                 "grok-imagine-image-2.0",
+                "grok-imagine-image-quality",
                 "grok-imagine-video-1.5",
+                "grok-imagine-video-1.5-lite",
             ],
-            Provider::Meta => &["muse-spark-1.3", "muse-spark-1.2", "muse-spark-1.1"],
+            Provider::Meta => {
+                &["muse-wonder-1.0", "muse-wonder-full-1.0", "muse-spark-1.3", "muse-spark-1.2", "muse-spark-1.1"]
+            }
             Provider::Devin => DEVIN_MODELS,
             Provider::Kiro => KIRO_MODELS,
             Provider::Compat => &[],
@@ -284,7 +313,7 @@ pub enum Credential {
 impl Credential {
     /// A stable fingerprint for subscription state; access and refresh tokens
     /// change routinely and must not reset attribution.
-    fn identity(&self, provider: Provider) -> String {
+    pub(crate) fn identity(&self, provider: Provider) -> String {
         use sha2::{Digest, Sha256};
         let (kind, owner, base_url) = match self {
             Self::OAuth(o) => ("oauth", o.account_id.as_deref().or(o.email.as_deref()), o.base_url.as_deref()),
@@ -320,6 +349,8 @@ impl OAuth {
 #[derive(Clone)]
 pub struct PendingOAuthSave {
     pub credential: OAuth,
+    /// Owner on disk before this rotation; a replacement must never be overwritten.
+    pub expected_identity: String,
     pub extra: Vec<(String, Value)>,
     pub retry_at: std::time::Instant,
 }
@@ -355,7 +386,10 @@ impl Counters {
 /// An account's latest problem, as the dashboard and notifications show it.
 #[derive(Debug, Clone)]
 struct AccountError {
+    id: String,
     message: String,
+    /// Temporary upstream failures and pauses stop being current at this deadline.
+    until: Option<DateTime<Utc>>,
     /// Set when the problem is only a pause (spent quota or a rate limit): it ends
     /// with that pause instead of waiting for a request to succeed.
     pause: Option<ErrorPause>,
@@ -366,7 +400,6 @@ struct ErrorPause {
     quota: bool,
     /// The paused model, as the cooldown is keyed ("*" = every model).
     model: String,
-    until: DateTime<Utc>,
 }
 
 #[derive(Debug, Default)]
@@ -390,6 +423,9 @@ pub struct AccountState {
     pub identity_epoch: u64,
     pub quota_refreshing: bool,
     pub banked_resets: Option<crate::banked_resets::View>,
+    pub window_starter: Option<crate::window_starter::View>,
+    /// Foreground attempts cancel an idle-window preflight or pending send.
+    pub window_starter_cancel: Option<Arc<tokio_util::sync::CancellationToken>>,
     pub strikes: u32,
     last_error: Option<AccountError>,
     pub last_used: Option<DateTime<Utc>>,
@@ -401,30 +437,96 @@ pub struct AccountState {
 }
 
 impl AccountState {
+    /// Invalidate subscription-specific observations while keeping lifetime
+    /// counters and in-flight accounting attached to this configured slot.
+    pub(crate) fn update_identity(&mut self, identity: String) -> bool {
+        if self.credential_identity == identity {
+            return false;
+        }
+        self.quota_epoch += 1;
+        self.identity_epoch += 1;
+        self.credential_identity = identity;
+        self.quota_refreshing = false;
+        self.quota = Default::default();
+        self.latency.clear();
+        self.cooldowns.clear();
+        self.quota_cooldowns.clear();
+        self.models_etag = None;
+        self.banked_resets = None;
+        self.window_starter = None;
+        if let Some(cancel) = self.window_starter_cancel.take() {
+            cancel.cancel();
+        }
+        self.attribution = Default::default();
+        self.attribution.dirty = true;
+        self.strikes = 0;
+        self.clear_error();
+        true
+    }
+
     /// A quota reading: the windows, and the attribution of whatever rose since the last one.
     pub fn set_quota(&mut self, windows: Vec<crate::quota::Window>, plan: Option<String>) {
+        if plan.as_ref().zip(self.quota.plan.as_ref()).is_some_and(|(new, old)| new != old) {
+            self.attribution.history.clear();
+            self.attribution.dirty = true;
+        }
         self.attribution.reading(&windows, Utc::now());
         self.quota.set(windows, plan);
     }
 
-    /// The latest problem, unless it was a pause that has ended since.
+    /// The latest problem, unless its temporary-error or pause deadline has passed.
     pub fn last_error(&self, now: DateTime<Utc>) -> Option<&str> {
         let error = self.last_error.as_ref()?;
-        error.pause.as_ref().is_none_or(|p| p.until > now).then_some(error.message.as_str())
+        error.until.is_none_or(|until| until > now).then_some(error.message.as_str())
+    }
+
+    pub fn last_error_id(&self, now: DateTime<Utc>) -> Option<&str> {
+        self.last_error(now)?;
+        self.last_error.as_ref().map(|error| error.id.as_str())
     }
 
     /// Records a problem that stays until a request succeeds or the account is reset.
     pub fn set_error(&mut self, message: impl Into<String>) {
-        self.last_error = Some(AccountError { message: message.into(), pause: None });
+        self.last_error = Some(AccountError {
+            id: uuid::Uuid::new_v4().to_string(),
+            message: message.into(),
+            until: None,
+            pause: None,
+        });
+    }
+
+    /// A recent upstream failure, without requiring another inference to clear it.
+    pub fn set_temporary_error(&mut self, message: impl Into<String>, until: DateTime<Utc>) {
+        self.last_error = Some(AccountError {
+            id: uuid::Uuid::new_v4().to_string(),
+            message: message.into(),
+            until: Some(until),
+            pause: None,
+        });
     }
 
     pub fn clear_error(&mut self) {
         self.last_error = None;
     }
 
+    /// Dismiss the displayed occurrence without losing a newer failure, including
+    /// a repeated failure with the same message. An already-cleared error is OK.
+    pub fn clear_error_if(&mut self, id: &str) -> bool {
+        if self.last_error.as_ref().is_some_and(|error| error.id != id) {
+            return false;
+        }
+        self.clear_error();
+        true
+    }
+
     fn pause_error(&mut self, message: &str, quota: bool, model: &str, until: DateTime<Utc>) {
-        let pause = Some(ErrorPause { quota, model: model.to_string(), until });
-        self.last_error = Some(AccountError { message: message.to_string(), pause });
+        let pause = Some(ErrorPause { quota, model: model.to_string() });
+        self.last_error = Some(AccountError {
+            id: uuid::Uuid::new_v4().to_string(),
+            message: message.to_string(),
+            until: Some(until),
+            pause,
+        });
     }
 
     /// Ends a spent-quota error early once nothing keeps that model paused for quota,
@@ -432,7 +534,7 @@ impl AccountState {
     pub fn settle_quota_error(&mut self, now: DateTime<Utc>) {
         let Some(p) = self.last_error.as_ref().and_then(|e| e.pause.as_ref()).filter(|p| p.quota) else { return };
         let paused = [p.model.as_str(), "*"].iter().any(|m| self.quota_cooldowns.get(*m).is_some_and(|t| *t > now));
-        let spent = self.quota.exhausted_until(if p.model == "*" { "" } else { &p.model }).is_some();
+        let spent = self.quota.exhausted(if p.model == "*" { "" } else { &p.model });
         if !paused && !spent {
             self.last_error = None;
         }
@@ -452,7 +554,10 @@ impl AccountState {
             pauses.insert("*".into(), (now + chrono::Duration::seconds(30), "checking"));
         }
         // A used-up usage window blocks every model until it resets.
-        if let Some(t) = self.quota.exhausted_until("")
+        if let Some(t) = self
+            .quota
+            .exhausted_until("")
+            .or_else(|| self.quota.exhausted("").then(|| now + chrono::Duration::minutes(5)))
             && !pauses.contains_key("*")
         {
             pauses.insert("*".into(), (t, "quota"));
@@ -466,7 +571,11 @@ pub struct RequestLoad(Arc<AtomicUsize>);
 
 impl RequestLoad {
     pub fn new(account: &Account) -> Self {
-        let active = account.state.lock().active_requests.clone();
+        let state = account.state.lock();
+        if let Some(cancel) = &state.window_starter_cancel {
+            cancel.cancel();
+        }
+        let active = state.active_requests.clone();
         active.fetch_add(1, Ordering::Relaxed);
         Self(active)
     }
@@ -490,7 +599,9 @@ pub struct Account {
     pub headers: BTreeMap<String, String>,
     pub proxy_url: Option<String>,
     pub cred: Arc<RwLock<Credential>>,
-    pub state: Mutex<AccountState>,
+    /// Shared by config-only replacements so an in-flight refresh publishes its
+    /// identity epoch to the currently selected Account allocation as well.
+    pub state: Arc<Mutex<AccountState>>,
     pub refresh_lock: Arc<tokio::sync::Mutex<()>>,
     /// Rotated credentials that still need saving. Shared with in-flight users
     /// across account/config reloads, as are the credentials and refresh lock.
@@ -564,6 +675,14 @@ impl Account {
         matches!(*self.cred.read(), Credential::OAuth(_))
     }
 
+    /// Wonder Full is a Muse Code subscription offering, not a pay-as-you-go
+    /// Model API model. Explicit model mappings can describe other entitlements.
+    fn default_model_allowed(&self, model: &str) -> bool {
+        self.provider != Provider::Meta
+            || !model.to_ascii_lowercase().starts_with("muse-wonder-full")
+            || self.is_oauth()
+    }
+
     /// Upstream model name if this account can serve `model`.
     pub fn resolve(&self, model: &str) -> Option<String> {
         self.resolve_with(model, false)
@@ -587,6 +706,9 @@ impl Account {
         }
         // Renamed without `fork`: the original name is gone.
         if self.aliases.iter().any(|a| a.name.eq_ignore_ascii_case(model) && !a.fork) {
+            return None;
+        }
+        if !self.default_model_allowed(model) {
             return None;
         }
         let aggregator = self.provider.is_aggregator();
@@ -640,8 +762,11 @@ impl Account {
         if !self.models.is_empty() {
             return self.models.iter().any(|m| same(m.public()) && !self.excludes(&m.name));
         }
-        let shown =
-            |m: &str| !self.excludes(m) && !self.aliases.iter().any(|a| a.name.eq_ignore_ascii_case(m) && !a.fork);
+        let shown = |m: &str| {
+            self.default_model_allowed(m)
+                && !self.excludes(m)
+                && !self.aliases.iter().any(|a| a.name.eq_ignore_ascii_case(m) && !a.fork)
+        };
         let first = match self.builtin().iter().find(|m| same(m)) {
             Some(m) => Some(shown(m)),
             None => match self.discovered.read().iter().find(|m| same(m)) {
@@ -662,7 +787,11 @@ impl Account {
                 out.push(m.clone());
             }
         }
-        out.retain(|m| !self.excludes(m) && !self.aliases.iter().any(|a| a.name.eq_ignore_ascii_case(m) && !a.fork));
+        out.retain(|m| {
+            self.default_model_allowed(m)
+                && !self.excludes(m)
+                && !self.aliases.iter().any(|a| a.name.eq_ignore_ascii_case(m) && !a.fork)
+        });
         for a in &self.aliases {
             if !self.excludes(&a.name) && !out.iter().any(|o| o.eq_ignore_ascii_case(&a.alias)) {
                 out.push(a.alias.clone());
@@ -775,13 +904,17 @@ impl Account {
             "disabled": st.disabled,
             "cooldowns": cooldowns,
             "cooldown_kinds": kinds,
+            "quota_reset_unknown": st.quota.reset_unknown(""),
             "last_error": st.last_error(now),
+            "last_error_id": st.last_error_id(now),
+            "last_error_until": st.last_error.as_ref().and_then(|e| e.until).filter(|t| *t > now),
             "last_used": st.last_used.map(|t| t.to_rfc3339()),
             "expires_at": expires,
             "counters": st.counters,
             "priority": self.priority,
             "quota": st.quota,
             "banked_resets": st.banked_resets,
+            "window_starter": st.window_starter,
             "models": self.public_models(),
             // The configured upstream-name/alias pairs, for editing an API key's model list.
             "model_map": self.models,
@@ -1183,34 +1316,42 @@ impl Pool {
             self.accounts.read().iter().map(|a| (a.id.clone(), a.clone())).collect();
         let mut next = Vec::with_capacity(specs.len());
         for mut s in specs {
+            let mut identity_changed = false;
             if let Some(prev) = old.get(&s.id) {
                 // Never replace a successfully rotated token with its older disk
                 // copy. A shared refresh lock also prevents a changed config from
                 // starting a second refresh while the old Account is in flight.
                 let guard = prev.refresh_lock.try_lock();
                 let pending = prev.pending_oauth_save.lock();
-                if guard.is_err() || pending.is_some() {
-                    s.cred = prev.cred.read().clone();
-                } else if let Some(path) = &s.path {
+                if let Some(path) = &s.path {
                     // Collection happened before taking the refresh lock; reread
                     // here in case a refresh completed while files were scanned.
                     if let Some((_, oauth, _, _)) = read_oauth_file(path) {
                         s.cred = Credential::OAuth(oauth);
                     }
                 }
+                let current = prev.cred.read().clone();
+                let current_identity = current.identity(prev.provider);
+                let disk_identity = s.cred.identity(s.provider);
+                let older_copy = disk_identity == current_identity
+                    || pending.as_ref().is_some_and(|save| save.expected_identity == disk_identity);
+                if (guard.is_err() || pending.is_some()) && older_copy {
+                    s.cred = current.clone();
+                }
                 let identity = s.cred.identity(s.provider);
-                let identity_changed = prev.state.lock().credential_identity != identity;
+                identity_changed = current_identity != identity || prev.state.lock().credential_identity != identity;
                 // Fusebox's own refreshes land in memory before they reach disk, so a
                 // different refresh token on disk means a sign-in replaced the credential.
-                let signed_in = guard.is_ok()
+                let signed_in = !identity_changed
+                    && guard.is_ok()
                     && pending.is_none()
-                    && match (&*prev.cred.read(), &s.cred) {
+                    && match (&current, &s.cred) {
                         (Credential::OAuth(before), Credential::OAuth(after)) => {
                             before.refresh_token != after.refresh_token
                         }
                         _ => false,
                     };
-                if guard.is_ok() && pending.is_none() {
+                if !identity_changed && guard.is_ok() && pending.is_none() {
                     *prev.cred.write() = s.cred.clone();
                 }
                 if signed_in {
@@ -1223,21 +1364,15 @@ impl Pool {
                     }
                 }
                 if identity_changed {
-                    let mut st = prev.state.lock();
-                    st.quota_epoch += 1;
-                    st.identity_epoch += 1;
-                    st.credential_identity = identity;
-                    st.quota_refreshing = false;
-                    st.quota = Default::default();
-                    st.latency.clear();
-                    st.quota_cooldowns.clear();
-                    st.banked_resets = None;
-                    st.attribution = Default::default();
-                    st.attribution.dirty = true;
+                    prev.state.lock().update_identity(identity);
                 }
                 // Keep counters and cooldowns; refresh credentials from disk/config.
-                let same_shape = prev.provider == s.provider
-                    && prev.models.len() == s.models.len()
+                let same_shape = !identity_changed
+                    && prev.provider == s.provider
+                    && prev.label == s.label
+                    && prev.path == s.path
+                    && prev.group == s.group
+                    && prev.models.iter().map(|m| (&m.name, &m.alias)).eq(s.models.iter().map(|m| (&m.name, &m.alias)))
                     && prev.headers == s.headers
                     && prev.proxy_url == s.proxy_url
                     && prev.prefix == s.prefix
@@ -1256,7 +1391,8 @@ impl Pool {
                     continue;
                 }
             }
-            let discovered = old.get(&s.id).map(|p| p.discovered.read().clone()).unwrap_or_default();
+            let previous_identity = old.get(&s.id).filter(|_| !identity_changed);
+            let discovered = previous_identity.map(|p| p.discovered.read().clone()).unwrap_or_default();
             let mut state = old
                 .get(&s.id)
                 .map(|p| {
@@ -1267,12 +1403,17 @@ impl Pool {
                         quota_cooldowns: st.quota_cooldowns.clone(),
                         quota_epoch: st.quota_epoch,
                         identity_epoch: st.identity_epoch,
+                        models_etag: st.models_etag.clone(),
+                        quota_refreshing: st.quota_refreshing,
+                        banked_resets: st.banked_resets.clone(),
                         strikes: st.strikes,
                         last_error: st.last_error.clone(),
                         last_used: st.last_used,
                         counters: st.counters.clone(),
                         latency: st.latency.clone(),
                         quota: st.quota.clone(),
+                        window_starter: st.window_starter.clone(),
+                        window_starter_cancel: st.window_starter_cancel.clone(),
                         attribution: st.attribution.clone(),
                         ..Default::default()
                     }
@@ -1283,9 +1424,41 @@ impl Pool {
             if let Some(problem) = &s.problem {
                 state.set_error(problem.clone());
             }
-            let cred = old.get(&s.id).map(|prev| prev.cred.clone()).unwrap_or_else(|| Arc::new(RwLock::new(s.cred)));
-            let refresh_lock = old.get(&s.id).map(|prev| prev.refresh_lock.clone()).unwrap_or_default();
-            let pending_oauth_save = old.get(&s.id).map(|prev| prev.pending_oauth_save.clone()).unwrap_or_default();
+            // Config changes keep one coherent state for both current and
+            // in-flight users. A real replacement gets a separate state below.
+            if let Some(prev) = previous_identity {
+                let mut shared = prev.state.lock();
+                shared.disabled = state.disabled;
+                if let Some(problem) = &s.problem {
+                    shared.set_error(problem.clone());
+                }
+            }
+            let cred = previous_identity.map(|prev| prev.cred.clone()).unwrap_or_else(|| Arc::new(RwLock::new(s.cred)));
+            let refresh_lock = previous_identity.map(|prev| prev.refresh_lock.clone()).unwrap_or_default();
+            let pending_oauth_save = previous_identity.map(|prev| prev.pending_oauth_save.clone()).unwrap_or_default();
+            let device_id = previous_identity.map(|prev| prev.device_id.clone()).unwrap_or_else(|| {
+                // A copied credential file can carry the previous owner's device
+                // id. Accept an explicitly different device, otherwise rotate it.
+                s.device_id
+                    .filter(|device| old.get(&s.id).is_none_or(|prev| *device != prev.device_id))
+                    .unwrap_or_else(|| random_hex(32))
+            });
+            if identity_changed && s.provider == Provider::Claude {
+                let devices = serde_json::json!([device_id]);
+                if let Credential::OAuth(oauth) = &mut *cred.write() {
+                    oauth.raw.insert("claude_device_ids".into(), devices.clone());
+                }
+                // Keep a regenerated device after restart too: a copied auth
+                // file must not restore the previous identity's imported id.
+                if let Some(path) = &s.path
+                    && set_file_field(path, "claude_device_ids", Some(devices)).is_err()
+                {
+                    state.set_error("saving replacement account device failed");
+                }
+            }
+            let session_id = previous_identity
+                .map(|prev| prev.session_id.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             next.push(Arc::new(Account {
                 id: s.id,
                 provider: s.provider,
@@ -1296,11 +1469,11 @@ impl Pool {
                 headers: s.headers,
                 proxy_url: s.proxy_url,
                 cred,
-                state: Mutex::new(state),
+                state: previous_identity.map(|prev| prev.state.clone()).unwrap_or_else(|| Arc::new(Mutex::new(state))),
                 refresh_lock,
                 pending_oauth_save,
-                device_id: s.device_id.unwrap_or_else(|| random_hex(32)),
-                session_id: uuid::Uuid::new_v4().to_string(),
+                device_id,
+                session_id,
                 discovered: RwLock::new(discovered),
                 extra: s.extra,
                 prefix: s.prefix,
@@ -1809,6 +1982,7 @@ fn smart_score(a: &Account, upstream: &str, cfg: &Config, session_load: &HashMap
     // Use known weekly/model-specific headroom when no 5-hour window is
     // reported. The reserve still applies only to real 5-hour data.
     let headroom = remaining.or_else(|| st.quota.remaining(upstream)).unwrap_or(crate::quota::UNKNOWN);
+    let headroom = st.quota.limit_remaining(upstream).map_or(headroom, |limit| headroom.min(limit));
     let weekly_remaining = st.quota.weekly_remaining(upstream);
     let weekly = weekly_remaining.map_or(1.0, |left| (left / SMART_WEEKLY_RESERVE).min(1.0));
     SmartQuotaScore {
@@ -1830,6 +2004,100 @@ fn least_used_score(a: &Account, model: &str) -> f64 {
 mod tests {
     use super::*;
 
+    struct AuthDirectory(PathBuf);
+
+    impl AuthDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("fusebox-account-identity-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, owner: &str, token: &str, device: Option<&str>) {
+            let mut value = serde_json::json!({
+                "type": "claude", "account_uuid": owner, "email": "fake@example.test",
+                "access_token": token, "refresh_token": "FAKE_REFRESH",
+            });
+            if let Some(device) = device {
+                value["claude_device_ids"] = serde_json::json!([device]);
+            }
+            std::fs::write(self.0.join("same-filename.json"), value.to_string()).unwrap();
+        }
+    }
+
+    impl Drop for AuthDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn same_filename_identity_replacement_rotates_devices_and_sessions_but_keeps_accounting() {
+        let directory = AuthDirectory::new();
+        let imported_device = "a".repeat(64);
+        directory.write("fake-owner-a", "FAKE_ACCESS_A", Some(&imported_device));
+        let cfg = Config { auth_dir: directory.0.to_string_lossy().into(), ..Default::default() };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let original = pool.all().pop().unwrap();
+        let identity = original.state.lock().credential_identity.clone();
+        original.state.lock().counters.requests = 17;
+        original.discovered.write().push("claude-fake-model".into());
+        let load = RequestLoad::new(&original);
+        let epoch = original.state.lock().identity_epoch;
+        directory.write("fake-owner-b", "FAKE_ACCESS_B", Some(&imported_device));
+        pool.reload(&cfg);
+        let replacement = pool.all().pop().unwrap();
+        assert_eq!(replacement.id, original.id);
+        assert!(!Arc::ptr_eq(&original, &replacement));
+        assert!(!Arc::ptr_eq(&original.cred, &replacement.cred));
+        assert!(!Arc::ptr_eq(&original.refresh_lock, &replacement.refresh_lock));
+        assert_ne!(replacement.device_id, original.device_id);
+        assert_ne!(replacement.session_id, original.session_id);
+        assert_eq!(replacement.device_id.len(), 64);
+        assert_eq!(replacement.state.lock().identity_epoch, epoch + 1);
+        assert_eq!(original.state.lock().identity_epoch, epoch + 1, "old sessions are invalidated");
+        assert_ne!(replacement.state.lock().credential_identity, identity);
+        assert_eq!(replacement.state.lock().counters.requests, 17);
+        assert_eq!(replacement.state.lock().active_requests.load(Ordering::Relaxed), 1);
+        assert!(replacement.discovered.read().is_empty());
+        let Credential::OAuth(new) = replacement.cred.read().clone() else { unreachable!() };
+        assert_eq!(new.access_token, "FAKE_ACCESS_B");
+        let Credential::OAuth(old) = original.cred.read().clone() else { unreachable!() };
+        assert_eq!(old.access_token, "FAKE_ACCESS_A", "old work cannot refresh the replacement's credentials");
+        drop(load);
+        assert_eq!(replacement.state.lock().active_requests.load(Ordering::Relaxed), 0);
+        pool.reload(&cfg);
+        assert!(Arc::ptr_eq(&replacement, &pool.all()[0]));
+        let fresh_pool = Pool::default();
+        fresh_pool.reload(&cfg);
+        assert_eq!(fresh_pool.all()[0].device_id, replacement.device_id, "restart retains the replacement's device");
+    }
+
+    #[test]
+    fn token_and_configuration_reload_preserve_account_device_session_and_epoch() {
+        let directory = AuthDirectory::new();
+        directory.write("fake-owner", "FAKE_ACCESS_OLD", None);
+        let mut cfg = Config { auth_dir: directory.0.to_string_lossy().into(), ..Default::default() };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let original = pool.all().pop().unwrap();
+        let epoch = original.state.lock().identity_epoch;
+        directory.write("fake-owner", "FAKE_ACCESS_NEW", None);
+        pool.reload(&cfg);
+        assert!(Arc::ptr_eq(&original, &pool.all()[0]));
+        cfg.oauth_excluded_models.insert("claude".into(), vec!["claude-excluded".into()]);
+        pool.reload(&cfg);
+        let updated = pool.all().pop().unwrap();
+        assert!(!Arc::ptr_eq(&original, &updated));
+        assert!(Arc::ptr_eq(&original.cred, &updated.cred));
+        assert_eq!(updated.device_id, original.device_id);
+        assert_eq!(updated.session_id, original.session_id);
+        assert_eq!(updated.state.lock().identity_epoch, epoch);
+        let Credential::OAuth(credential) = updated.cred.read().clone() else { unreachable!() };
+        assert_eq!(credential.access_token, "FAKE_ACCESS_NEW");
+    }
+
     #[test]
     fn errors_that_explain_a_pause_end_with_it() {
         let cfg = Config {
@@ -1849,6 +2117,16 @@ mod tests {
         acct.rate_limit(model, now + chrono::Duration::seconds(15), "429: slow down");
         assert_eq!(at(now).as_deref(), Some("429: slow down"));
         assert_eq!(at(now + chrono::Duration::seconds(15)), None);
+        let until = now + chrono::Duration::seconds(30);
+        let cooldowns = acct.snapshot()["cooldowns"].clone();
+        acct.state.lock().set_temporary_error("529: Overloaded", until);
+        assert_eq!(at(now).as_deref(), Some("529: Overloaded"));
+        assert_eq!(acct.snapshot()["last_error_until"], serde_json::json!(until));
+        assert_eq!(at(until), None, "an idle account does not need another inference to clear an overload");
+        assert_eq!(acct.snapshot()["cooldowns"], cooldowns, "the error deadline does not change routing pauses");
+        acct.state.lock().set_temporary_error("529: Overloaded", now - chrono::Duration::seconds(1));
+        assert_eq!(acct.snapshot()["last_error"], Value::Null);
+        assert_eq!(acct.snapshot()["last_error_until"], Value::Null);
         // Problems that may need attention stay until a request succeeds.
         acct.cool(None, now + chrono::Duration::minutes(10), "403: forbidden");
         assert_eq!(at(later).as_deref(), Some("403: forbidden"));
@@ -2291,8 +2569,68 @@ oauth-model-alias:
         let pool = Pool::default();
         pool.reload(&cfg);
         assert_eq!(pool.canonical("gpt-6-1-sol", None), "gpt-6.1-sol");
+        assert_eq!(pool.canonical("gpt-6-1-terra", None), "gpt-6.1-terra");
         assert_eq!(pool.canonical("openai/gpt-6-astra", None), "gpt-6-astra");
         assert_eq!(pool.canonical("nothing-like-it", None), "nothing-like-it");
+    }
+
+    #[test]
+    fn wonder_full_defaults_to_subscription_accounts_and_respects_explicit_models() {
+        let mut cfg = Config::parse("auth-dir: /nonexistent\nmeta-api-key:\n  - api-key: synthetic-meta\n").unwrap();
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let acct = pool.all().remove(0);
+        assert!(acct.lists("muse-wonder-1.0"));
+        assert!(acct.resolve("muse-wonder-1.0").is_some());
+        assert!(!acct.lists("muse-wonder-full-1.0"));
+        assert!(!acct.public_models().iter().any(|m| m == "muse-wonder-full-1.0"));
+        assert!(acct.resolve_with("muse-wonder-full-1.0", true).is_none());
+        // Canonicalization probes effort suffixes for aggregator models. Those
+        // probes must not turn a denied Full request into a synthetic model ID.
+        assert_eq!(pool.canonical("muse-wonder-full-1.0", None), "muse-wonder-full-1.0");
+        assert!(acct.resolve("muse-wonder-full-1.0-high").is_none());
+        assert!(matches!(pool.pick("muse-wonder-full-1.0", &[], &cfg, None, None, &HashMap::new()), Pick::None));
+
+        *acct.cred.write() =
+            Credential::OAuth(OAuth { access_token: "synthetic-subscription".into(), ..Default::default() });
+        assert!(acct.lists("MUSE-WONDER-FULL-1.0"));
+        assert!(acct.public_models().iter().any(|m| m == "muse-wonder-full-1.0"));
+        assert!(matches!(pool.pick("muse-wonder-full-1.0", &[], &cfg, None, None, &HashMap::new()), Pick::Ok(..)));
+
+        cfg.meta_api_key[0].models.push(ModelAlias { name: "muse-wonder-full-1.0".into(), alias: None });
+        pool.reload(&cfg);
+        let acct = pool.all().remove(0);
+        assert!(!acct.is_oauth());
+        assert!(acct.lists("muse-wonder-full-1.0"));
+        assert!(acct.resolve("muse-wonder-full-1.0").is_some());
+    }
+
+    #[test]
+    fn new_provider_models_keep_aggregator_variants_on_their_provider() {
+        for (provider, model) in [
+            (Provider::Codex, "gpt-6.1-terra"),
+            (Provider::Codex, "gpt-image-2.5-sunburst"),
+            (Provider::Codex, "gpt-image-2.5-flare"),
+            (Provider::Claude, "claude-haiku-5-5"),
+            (Provider::Gemini, "gemini-4-argon"),
+            (Provider::Vertex, "gemini-4-argon"),
+            (Provider::Kimi, "kimi-k3.1-pro"),
+            (Provider::Kimi, "kimi-k3.1-pro-highspeed"),
+            (Provider::Xai, "grok-imagine-video-1.5-lite"),
+            (Provider::Devin, "gpt-6-1-sol"),
+            (Provider::Devin, "claude-haiku-5-5"),
+            (Provider::Antigravity, "gemini-4-argon-high"),
+            (Provider::Antigravity, "claude-sonnet-5-5-max"),
+        ] {
+            assert!(provider.serves(model), "{} serves {model}", provider.as_str());
+        }
+        assert!(!Provider::Codex.serves("gpt-6-1-sol"));
+        assert!(!Provider::Codex.serves("gemini-4-argon-high"));
+        assert!(!Provider::Gemini.serves("gemini-4-argon-high"));
+        assert!(!Provider::Claude.serves("claude-sonnet-5-5-max"));
+        assert!(!Provider::Antigravity.family("gpt-6.1-terra"));
+        assert!(!Provider::Devin.family("gpt-6.1-terra"));
+        assert!(!Provider::Devin.first_party("claude-haiku-5-5"));
     }
 
     #[test]
@@ -2342,7 +2680,7 @@ claude-api-key:
             headers: BTreeMap::new(),
             proxy_url: None,
             cred: Arc::new(RwLock::new(Credential::ApiKey { key: "k".into(), base_url: None })),
-            state: Mutex::new(AccountState::default()),
+            state: Arc::new(Mutex::new(AccountState::default())),
             refresh_lock: Arc::default(),
             pending_oauth_save: Arc::default(),
             device_id: String::new(),

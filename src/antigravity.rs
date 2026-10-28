@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -28,7 +28,7 @@ pub const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https:/
 pub const BASE_DAILY: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const BASE_PROD: &str = "https://cloudcode-pa.googleapis.com";
 
-pub(crate) const FALLBACK_VERSION: &str = "2.24.0";
+pub(crate) const FALLBACK_VERSION: &str = "2.25.0";
 const MANIFEST_URL: &str =
     "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml";
 const NODE_CLIENT: &str = "google-api-nodejs-client/10.3.0";
@@ -148,13 +148,9 @@ pub async fn fetch_project(app: &App, http: &reqwest::Client, base: &str, token:
         .header("accept", "*/*")
         .json(&json!({ "metadata": { "ideType": "ANTIGRAVITY" } }))
         .send()
-        .await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("loadCodeAssist returned {status}: {}", text.chars().take(300).collect::<String>());
-    }
-    let load: Value = serde_json::from_str(&text).context("invalid loadCodeAssist response")?;
+        .await
+        .map_err(crate::oauth::transport_error)?;
+    let load = crate::oauth::read_json(resp).await?;
     if let Some(p) = project_of(&load) {
         return Ok(p);
     }
@@ -173,13 +169,9 @@ pub async fn fetch_project(app: &App, http: &reqwest::Client, base: &str, token:
             .json(&body)
             .timeout(Duration::from_secs(30))
             .send()
-            .await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!("onboardUser returned {status}: {}", text.chars().take(200).collect::<String>());
-        }
-        let v: Value = serde_json::from_str(&text).unwrap_or_default();
+            .await
+            .map_err(crate::oauth::transport_error)?;
+        let v = crate::oauth::read_json(resp).await?;
         if v["done"] == true {
             return project_of(&v["response"]).ok_or_else(|| anyhow!("onboarding finished without a project id"));
         }
@@ -203,7 +195,9 @@ pub async fn ensure_ready(app: &App, acct: &Arc<Account>) -> Result<()> {
                 o.clone()
             };
             app.suppress_reload();
-            crate::oauth::publish_refreshed(acct, snapshot, vec![]);
+            if !crate::oauth::publish_refreshed(acct, snapshot, vec![]) {
+                bail!("account identity changed; project update discarded");
+            }
         }
     }
     if acct.discovered.read().is_empty() {
@@ -345,7 +339,7 @@ mod tests {
 
     #[test]
     fn fallback_user_agent_matches_the_current_release() {
-        assert_eq!(user_agent(), "antigravity/hub/2.24.0 darwin/arm64");
+        assert_eq!(user_agent(), "antigravity/hub/2.25.0 darwin/arm64");
     }
 
     #[test]

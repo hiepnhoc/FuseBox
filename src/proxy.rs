@@ -576,8 +576,8 @@ fn reset_after(headers: &reqwest::header::HeaderMap, body: &str) -> Option<chron
 }
 
 /// A failure worth retrying on the same account, and how long to wait first:
-/// capacity errors (Google's "No capacity available") and rate limits that
-/// reset within seconds. Real quota exhaustion is not one of them.
+/// capacity errors (Google's "No capacity available", Codex "at capacity") and
+/// rate limits that reset within seconds. Real quota exhaustion is not one of them.
 fn soft_failure(
     provider: Provider,
     status: u16,
@@ -594,6 +594,9 @@ fn soft_failure(
         429 => {
             if body.contains("QUOTA_EXHAUSTED") {
                 return None;
+            }
+            if at_capacity(status, body) {
+                return Some(reset_after(headers, body).and_then(short).unwrap_or_default());
             }
             match reset_after(headers, body) {
                 Some(until) => short(until),
@@ -635,6 +638,14 @@ pub fn quota_exhausted(acct: &Account, model: &str, status: u16, body: &str) -> 
     ]
     .iter()
     .any(|s| b.contains(s))
+}
+
+/// Codex answers "Codex is at capacity, please try again later" with a 429 when OpenAI
+/// is short of servers. Like a 529 it says nothing about the subscription, so it is
+/// retried and shown but pauses no model: a pause would turn away working sessions.
+pub fn at_capacity(status: u16, body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    status == 429 && ["at capacity", "overloaded"].iter().any(|s| b.contains(s))
 }
 
 pub fn mark_quota_exhausted(acct: &Account, model: &str, headers: &reqwest::header::HeaderMap, body: &str) {
@@ -753,10 +764,13 @@ fn shorten_tool_names(req: &mut Request) -> HashMap<String, String> {
 }
 
 pub async fn execute(app: Arc<App>, mut call: Call) -> Reply {
-    if crate::clients::observe(&call.headers) {
+    let cfg = app.cfg();
+    if let Err(message) = upstream::residency_requirement(&call.headers) {
+        return error_reply(call.format, 400, &message);
+    }
+    if crate::clients::observe_trusted(&call.headers, crate::policy::trusted_identity_source(&cfg, &call.headers)) {
         app.models.save_clients();
     }
-    let cfg = app.cfg();
     let raw = call.path_model.clone().or_else(|| call.body["model"].as_str().map(String::from)).unwrap_or_default();
     let (base, _) = ir::split_model_suffix(&raw);
     if let Err(d) = crate::policy::check_model(&app, &call.headers, &base) {
@@ -1064,6 +1078,7 @@ async fn execute_models(app: Arc<App>, mut call: Call) -> Reply {
 
 async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> Reply {
     let cfg = app.cfg();
+    let residency = upstream::residency_requirement(&call.headers).ok().flatten();
     let raw_model =
         call.path_model.clone().or_else(|| call.body["model"].as_str().map(String::from)).unwrap_or_default();
     if raw_model.is_empty() {
@@ -1082,6 +1097,16 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
     let mut parsed: Option<Request> = None;
     let mut shortened: Option<(Request, HashMap<String, String>)> = None;
     let mut tried: Vec<String> = Vec::new();
+    let residency_excluded: Vec<_> = if residency.is_some() {
+        app.pool
+            .all()
+            .into_iter()
+            .filter(|a| a.provider != Provider::Codex || !a.is_oauth())
+            .map(|a| a.id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut refreshed: Vec<String> = Vec::new();
     let mut last_error: Option<(u16, Value)> = None;
     let mut retry_same: Option<String> = None;
@@ -1097,6 +1122,7 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
         crate::cache::key(&call.headers, &call.body, call.session.as_deref(), call.session_source, &cfg.prompt_cache);
 
     while tried.len() < attempts {
+        let excluded: Vec<_> = tried.iter().chain(&residency_excluded).cloned().collect();
         // Past the budget, the error so far is the answer rather than another wait.
         if !budget.available() {
             break;
@@ -1127,12 +1153,12 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
                 &model,
                 call.session.as_deref(),
                 inferred,
-                &tried,
+                &excluded,
                 only.as_ref(),
                 tracker.latency_context.as_ref(),
             )
         } else {
-            match app.sessions.pick_unbound(&app.pool, &cfg, &model, &tried, pin.as_deref(), only.as_ref()) {
+            match app.sessions.pick_unbound(&app.pool, &cfg, &model, &excluded, pin.as_deref(), only.as_ref()) {
                 Pick::Ok(a, m) => Ok(crate::affinity::Selected {
                     reason: if pin.as_deref() == Some(a.id.as_str()) {
                         "retry_same"
@@ -1158,7 +1184,11 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
         };
         let mut selected = match picked {
             Ok(pair) => pair,
-            Err((status, msg)) => {
+            Err((mut status, mut msg)) => {
+                if residency.is_some() && status == 404 {
+                    status = 400;
+                    msg = "Requested Codex residency requires an available Codex subscription route".into();
+                }
                 if let Some((s, b)) = last_error {
                     tracker.finish(s, &Usage::default(), Some(error_message(&b.to_string())));
                     return Reply::Error(s, b);
@@ -1205,6 +1235,11 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
 
         let quota_epoch = acct.quota_epoch();
         let provider = acct.provider;
+        if residency.is_some() && (provider != Provider::Codex || !acct.is_oauth()) {
+            let message = "Requested Codex residency requires a Codex subscription route; this route cannot honor it";
+            tracker.finish(400, &Usage::default(), Some(message.into()));
+            return error_reply(call.format, 400, message);
+        }
         if call.body["previous_response_id"].is_string()
             && ((provider == Provider::Codex && acct.is_oauth()) || !provider.wires().contains(&Format::Responses))
         {
@@ -1227,7 +1262,14 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
         let native = if passthrough { call.format } else { provider.wires().first().copied().unwrap_or(Format::Chat) };
         // Upstream streaming: always when translating (we re-render), and for Codex OAuth.
         let upstream_stream = !passthrough || call.stream || (provider == Provider::Codex && acct.is_oauth());
-        let preparation_key = (acct.id.clone(), upstream_model.clone(), native, upstream::credential_stamp(&acct));
+        let provider_session =
+            app.sessions.provider_session(call.session.as_deref(), &acct, cfg.provider_session_idle_seconds);
+        let preparation_key = (
+            acct.id.clone(),
+            upstream_model.clone(),
+            native,
+            format!("{}:{provider_session}", upstream::credential_stamp(&acct)),
+        );
         // Antigravity and Devin stamp each prepared request with fresh request and
         // session ids, so a retry must prepare again rather than resend them.
         let memoizable = !matches!(provider, Provider::Antigravity | Provider::Devin);
@@ -1389,8 +1431,8 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
                     stream: upstream_stream,
                     count_tokens: false,
                     cache_key: cache_key.as_deref(),
-                    cache_session: call.session.as_deref().filter(|_| matches!(cache_scope, "client" | "workspace")),
                     cache_defaults,
+                    provider_session: Some(&provider_session),
                 },
                 body,
             );
@@ -1468,7 +1510,8 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
                 tracker.diagnostic_failure(failure.clone());
                 tracing::warn!(request_id = tracker.log.id, account = ?crate::diagnostics::fingerprint(Some(&acct.id)),
                     failure_kind = failure.kind, error_causes = ?failure.causes, "upstream connection failed");
-                acct.state.lock().set_error(msg.clone());
+                acct.state.lock().set_temporary_error(msg.clone(), Utc::now() + Duration::seconds(30));
+                app.broadcast("accounts", Value::Null);
                 // A connection that never opened is a blip worth one more try on the same
                 // account. Once the request went out, the provider may have run it, so it
                 // moves on rather than running it twice on one account.
@@ -1535,11 +1578,14 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
                     retry_same = Some(acct.id.clone());
                     continue;
                 }
-                // Still busy: step aside briefly, without the escalating backoff.
-                if status == 429 {
+                // Still busy: step aside briefly, without the escalating backoff. A capacity
+                // shortage only fails this request; the account's other sessions carry on.
+                if status == 429 && !at_capacity(status, &text) {
                     acct.rate_limit(&model, Utc::now() + Duration::seconds(15), &format!("429: {msg}"));
                 } else {
-                    acct.state.lock().set_error(format!("{status}: {msg}"));
+                    acct.state
+                        .lock()
+                        .set_temporary_error(format!("{status}: {msg}"), Utc::now() + Duration::seconds(30));
                 }
                 app.broadcast("accounts", Value::Null);
                 tried.push(acct.id.clone());
@@ -1611,8 +1657,12 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
                     }
                     if status == 429 && quota_exhausted(&acct, &model, status, &message) {
                         mark_quota_exhausted(&acct, &model, &reqwest::header::HeaderMap::new(), &message);
-                    } else if status == 429 {
+                    } else if status == 429 && !at_capacity(status, &message) {
                         acct.rate_limit(&model, Utc::now() + Duration::seconds(30), &format!("429: {message}"));
+                    } else if matches!(status, 429 | 500 | 502 | 503 | 529) {
+                        acct.state
+                            .lock()
+                            .set_temporary_error(format!("{status}: {message}"), Utc::now() + Duration::seconds(30));
                     } else {
                         acct.state.lock().set_error(format!("{status}: {message}"));
                     }
@@ -2249,12 +2299,12 @@ pub async fn count_tokens(app: Arc<App>, headers: HeaderMap, body: Value) -> (Va
                 stream: false,
                 count_tokens: true,
                 cache_key: None,
-                cache_session: None,
+                provider_session: None,
                 cache_defaults: true,
             },
             body.clone(),
         );
-        let mut rb = app.http.control(acct.proxy_url.as_deref()).post(&p.url);
+        let mut rb = app.http.control_for_account(&acct).post(&p.url);
         for (k, v) in &p.headers {
             rb = rb.header(k.as_str(), v.as_str());
         }
@@ -2359,6 +2409,14 @@ mod tests {
         soon.insert("retry-after", "2".parse().unwrap());
         assert!(soft_failure(Provider::Codex, 429, &soon, "{}").is_some());
         assert!(soft_failure(Provider::Codex, 400, &h, "{}").is_none());
+        // OpenAI's capacity shortage is retried even when it names a long wait.
+        let capacity = r#"{"error":{"message":"Codex is at capacity, please try again later"}}"#;
+        assert_eq!(soft_failure(Provider::Codex, 429, &h, capacity), Some(std::time::Duration::ZERO));
+        assert_eq!(soft_failure(Provider::Codex, 429, &later, capacity), Some(std::time::Duration::ZERO));
+        assert_eq!(soft_failure(Provider::Codex, 429, &soon, capacity).map(|d| d.as_secs() <= 2), Some(true));
+        assert!(at_capacity(429, r#"{"error":{"code":"server_is_overloaded"}}"#));
+        assert!(!at_capacity(503, capacity), "only 429s need telling apart from rate limits");
+        assert!(!at_capacity(429, r#"{"error":{"code":"rate_limit_exceeded"}}"#));
     }
 
     #[test]

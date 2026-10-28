@@ -27,9 +27,12 @@ mod latency;
 mod media;
 mod metrics;
 mod mgmt;
+mod model_catalog;
 mod oauth;
+mod outlook;
 mod policy;
 mod pools;
+mod provider_sessions;
 mod proxy;
 mod push;
 mod quota;
@@ -46,6 +49,7 @@ mod token_count;
 mod upstream;
 mod usage;
 mod vertex;
+mod window_starter;
 mod ws;
 
 use std::net::SocketAddr;
@@ -311,6 +315,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
         tokio::spawn(oauth::refresher(app.clone())),
         tokio::spawn(antigravity::version_updater(app.clone())),
         tokio::spawn(quota::poller(app.clone())),
+        tokio::spawn(window_starter::poller(app.clone())),
         tokio::spawn(push::watcher(app.clone())),
         tokio::spawn(policy::refresher(app.clone())),
         tokio::spawn(watch(app.clone())),

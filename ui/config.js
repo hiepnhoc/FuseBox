@@ -20,11 +20,11 @@ const CONFIG_DESCRIPTIONS = {
 const CONFIG_KEY_SECTION = {
   host: 'server', port: 'server', 'auth-dir': 'server', tls: 'server',
   'api-keys': 'clients', 'management-key': 'access', 'management-allow-remote': 'access',
-  routing: 'routing', 'five-hour-reserve-percent': 'routing', 'banked-reset-policy': 'routing', 'request-retry': 'routing', 'session-affinity': 'routing',
-  'session-affinity-idle-seconds': 'routing', 'force-model-prefix': 'routing', 'first-token-timeout-seconds': 'routing',
+  routing: 'routing', 'five-hour-reserve-percent': 'routing', 'banked-reset-policy': 'routing', 'window-starter': 'routing', 'request-retry': 'routing', 'session-affinity': 'routing',
+  'session-affinity-idle-seconds': 'routing', 'provider-session-idle-seconds': 'routing', 'force-model-prefix': 'routing', 'first-token-timeout-seconds': 'routing',
   'model-groups': 'routing', 'background-model': 'routing', 'prompt-cache': 'routing', 'latency-routing': 'routing', 'translation': 'routing', 'embeddings': 'connections', 'stream-limits': 'connections', 'request-limits': 'connections', 'log-format': 'diagnostics',
   'proxy-url': 'connections', 'codex-websockets': 'connections', 'claude-cloak': 'connections', 'banked-resets': 'connections',
-  'oauth-model-alias': 'models', 'oauth-excluded-models': 'models', 'extra-models': 'models', notifications: 'notifications', debug: 'diagnostics',
+  'oauth-model-alias': 'models', 'oauth-excluded-models': 'models', 'extra-models': 'models', 'model-capabilities': 'models', notifications: 'notifications', debug: 'diagnostics',
 };
 const CONFIG_OAUTH = [['claude', 'Claude'], ['codex', 'Codex'], ['antigravity', 'Antigravity'], ['kimi', 'Kimi'], ['xai', 'Grok'], ['meta', 'Meta'], ['devin', 'Devin'], ['kiro', 'Kiro'], ['vertex', 'Vertex AI']];
 const CONFIG_PROVIDERS = [
@@ -227,7 +227,7 @@ function namedClientsHTML() {
     return `<div class="named-row"><span class="cell2"><span>${name}</span>${sub ? `<span class="meta named-sub">${sub}</span>` : ''}${limits ? `<span class="meta named-limits">${esc(limits)}</span>` : ''}</span>
       <span class="named-key"><span class="mono">${esc(key)}</span>${copyBtn(client.key, `Copy the key for ${name}`, 'Key copied')}</span>
       ${asking ? '<span></span>' : `<span class="named-btns">${btn('named-setup', 'Set up', `Set up a tool with the key for ${name}`, '', ` aria-expanded="${n.setup === client.id}"`)}${btn('limits-edit', 'Limits', `Limits for ${name}`)}${btn('named-more', 'More', `More for ${name}`, ' ghost', ` aria-expanded="${n.open === client.id}"`)}</span>`}</div>
-      ${n.open === client.id && !asking ? `<div class="named-more" role="group" aria-label="More for ${name}">${S.private ? '' : btn('named-reveal', shown ? 'Hide key' : 'Show key', `${shown ? 'Hide' : 'Show'} the key for ${name}`, ' ghost')}${btn('named-addresses', 'Addresses', `Where the key for ${name} was used from`, ' ghost', ` aria-expanded="${n.addresses === client.id}"`)}${btn('named-rename', 'Rename', `Rename ${name}`, ' ghost')}${btn('named-replace', 'Replace key', `Replace the key for ${name}`, ' ghost')}${btn('named-remove', 'Remove', `Remove ${name}`, ' danger')}</div>` : ''}
+      ${n.open === client.id && !asking ? `<div class="named-more" role="group" aria-label="More for ${name}">${S.private ? '' : btn('named-reveal', shown ? 'Hide key' : 'Show key', `${shown ? 'Hide' : 'Show'} the key for ${name}`, ' ghost')}${btn('named-addresses', 'Addresses', `Where the key for ${name} was used from`, ' ghost', ` aria-expanded="${n.addresses === client.id}"`)}${btn('named-trust-identity', client['trust-client-identity'] ? 'Stop identity learning' : 'Allow identity learning', `${client['trust-client-identity'] ? 'Stop' : 'Allow'} identity learning for ${name}`, ' ghost')}${btn('named-rename', 'Rename', `Rename ${name}`, ' ghost')}${btn('named-replace', 'Replace key', `Replace the key for ${name}`, ' ghost')}${btn('named-remove', 'Remove', `Remove ${name}`, ' danger')}</div>` : ''}
       ${n.setup === client.id ? `<div class="setup named-setup" data-setup="${id}" data-setup-uid="-row">${setupHTML(client.key, '-row')}</div>` : ''}
       ${n.addresses === client.id ? namedAddressesHTML(client, seen[client.id] || []) : ''}
       ${n.rename === client.id ? namedRenameForm(client) : ''}
@@ -374,7 +374,7 @@ async function saveLimits(form) {
   const list = configGet(['named-clients']) || [];
   const client = list.find((x) => x.id === form.dataset.id);
   if (!client || S.config.busy || namedBlocked()) return;
-  const updated = { id: client.id, label: client.label, key: client.key };
+  const updated = { id: client.id, label: client.label, key: client.key, ...(client['trust-client-identity'] ? { 'trust-client-identity': true } : {}) };
   for (const [key, label, , kind] of LIMITS) {
     const raw = form.elements[key].value.trim();
     if (!raw) continue;
@@ -418,7 +418,7 @@ function namedBlocked() {
   return true;
 }
 
-async function saveClients(changes, text, onSaved) {
+async function saveClients(changes, text, onSaved = () => {}) {
   const c = S.config;
   c.busy = true; c.msg = null; render();
   try {
@@ -506,6 +506,13 @@ function namedAction(act, id) {
   if (act === 'named-keep') return row({ open: id }, byId('named-remove'));
   if (act === 'named-replace-confirm') return replaceNamedKey(id);
   if (act === 'named-confirm') return removeNamedClient(id);
+  if (act === 'named-trust-identity') {
+    const list = configGet(['named-clients']) || [];
+    const client = list.find((x) => x.id === id);
+    if (!client || namedBlocked()) return;
+    return saveClients(namedEdit(list, client, { 'trust-client-identity': !client['trust-client-identity'] }),
+      client['trust-client-identity'] ? 'This client can no longer update learned identities.' : 'This client can now update learned identities.');
+  }
   if (namedBlocked()) return;
   if (act === 'named-rename') {
     const client = (configGet(['named-clients']) || []).find((x) => x.id === id);
@@ -623,6 +630,7 @@ function configRoutingHTML() {
     <div class="cfg-divider wide"></div>
     ${configSwitch(['session-affinity'], 'Keep sessions on one account', 'A coding session stays on the account it started on, so its prompt cache keeps working. It moves when that subscription runs out or the account is disabled; while an account is busy, its requests briefly use another.')}
     ${configField(['session-affinity-idle-seconds'], 'Forget idle sessions after (seconds)', { type: 'number', min: 60, required: true, disabled: !affinity, help: '86400 is one day.' })}
+    ${configField(['provider-session-idle-seconds'], 'Rotate provider sessions after inactivity (seconds)', { type: 'number', min: 1, max: 86400, required: true, help: 'Default 1800 (30 minutes). Switching subscriptions always creates a fresh provider session; chat history stays intact.' })}
     ${configChoice(['prompt-cache', 'scope'], 'Prompt cache key scope', [['session', 'Session'], ['client', 'Client'], ['workspace', 'Workspace']],
       'Session keeps the existing cache key. Client shares a key across that client’s sessions. Workspace uses the x-fusebox-cache-workspace header, falling back to session when absent. Account selection still follows the session; caller cache keys always win.')}
     ${configField(['prompt-cache', 'namespace'], 'Prompt version', { help: 'Optional cache namespace for a shared prompt or tool schema version. Changing it starts a new derived cache key.' })}
@@ -630,6 +638,8 @@ function configRoutingHTML() {
       'Drop keeps the current behavior. Provider defaults enables automatic Claude caching after explicit boundaries are lost in translation. Explicit mode without boundaries remains uncached. Reject returns an error before contacting the provider.')}
     <div class="cfg-divider wide"></div>
     ${configSwitch(['latency-routing'], 'Prefer a faster account when quota scores tie', 'For new sessions under Smart quota balancing. Uses recent comparable first-response timings after at least three cold samples per account. Existing sessions keep their account.')}
+    <div class="cfg-divider wide"></div>
+    ${configWindowStarterHTML()}
     ${configSwitch(['translation', 'allow-service-tier'], 'Preserve a caller’s OpenAI service tier during translation', 'Off by default. A requested fast or priority tier can cost more. Supported OpenAI targets only; native requests already preserve the caller’s settings.')}
     ${configSwitch(['force-model-prefix'], 'Require model prefixes', 'Unprefixed requests only use accounts without a prefix. Use prefix/model to select a prefixed account.')}
     <div class="cfg-divider wide"></div>
@@ -637,6 +647,26 @@ function configRoutingHTML() {
     ${configField(['background-model'], 'Background model', { nullable: true, wide: true, placeholder: 'What Claude Code asks for',
       help: 'Claude Code asks its Haiku model for titles, summaries and quick checks. Name another model or group to send those calls there.' })}
   </div>`;
+}
+
+function configWindowStarterHTML() {
+  const path = ['window-starter'];
+  const p = configGet(path) || { mode: 'off', accounts: [] };
+  const accounts = (S.accounts || []).filter((a) => a.window_starter_supported);
+  const missing = (p.accounts || []).filter((id) => !accounts.some((a) => a.id === id));
+  const select = (id, name) => `<label class="cfg-starter-account"><input type="checkbox" data-config-act="window-account" data-id="${esc(id)}" ${(p.accounts || []).includes(id) ? 'checked' : ''}><span>${esc(name)}</span></label>`;
+  const days = [[1, 'Mon'], [2, 'Tue'], [3, 'Wed'], [4, 'Thu'], [5, 'Fri'], [6, 'Sat'], [7, 'Sun']];
+  return `${configChoice([...path, 'mode'], 'Start idle usage windows', [['off', 'Off'], ['always', 'Always'], ['working-hours', 'During working hours']],
+    'Sends a small Claude request to start an inactive five-hour window, even without a job. Uses a little subscription quota, brings its next reset forward and does not increase weekly allowance. Manual starting is available on each supported account.')}
+    ${p.mode !== 'off' ? `<div class="cfg-list wide"><span class="label">Starter accounts</span>
+      ${accounts.length ? accounts.map((a) => select(a.id, `${acctLabel(a)}${a.disabled ? ' · disabled' : ''}`)).join('') : '<p class="cfg-description">Connect a Claude subscription with a verified account ID to select it here.</p>'}
+      ${missing.map((id) => select(id, `Unavailable account · ${id}`)).join('')}
+      <p class="cfg-description">Only selected accounts start automatically. No selection means no automatic requests. Disabled accounts, real work, active windows and exhausted limits are skipped.</p></div>
+      ${configField([...path, 'model'], 'Starter model', { required: true, help: 'A native Claude model available on the selected accounts. Default: claude-haiku-4-5-20251001. No model groups, fallback or premium options.' })}
+      ${p.mode === 'working-hours' ? `${configField([...path, 'timezone'], 'Working hours timezone', { required: true, help: 'IANA timezone, such as Europe/Amsterdam. Daylight saving changes are applied automatically.' })}
+        <div class="cfg-choice wide" id="${configId([...path, 'weekdays'])}"><span id="starter-days-label">Working days</span><div class="seg" role="group" aria-labelledby="starter-days-label">${days.map(([n, name]) => `<button type="button" data-config-act="window-day" data-day="${n}" aria-pressed="${(p.weekdays || []).includes(n)}">${name}</button>`).join('')}</div><small class="cfg-error" id="${configId([...path, 'weekdays'])}-error" data-error-for="${configId([...path, 'weekdays'])}">${esc(S.config.errors[configId([...path, 'weekdays'])] || '')}</small></div>
+        ${configField([...path, 'start'], 'Start time', { type: 'time', required: true })}
+        ${configField([...path, 'end'], 'End time', { type: 'time', required: true, help: 'The end is exclusive. Overnight hours belong to the day on which they start.' })}` : ''}` : ''}`;
 }
 
 // Model groups: one name for several models. A group is a list (tried in order) or,
@@ -708,12 +738,42 @@ document.addEventListener('input', (e) => {
   S.config.msg = null; configUpdateFoot();
 });
 
+function clientIdentitiesHTML() {
+  const c = S.config;
+  const details = c.identities ? (S.private ? 'Profiles hidden in privacy mode.' : JSON.stringify(c.identities, null, 2)) : 'Load the effective client versions, runtime profile and source.';
+  return `<div class="cfg-list wide"><h3 class="h-sec">Client identities</h3>
+    <p class="meta">Only clients explicitly allowed under Clients can update learned identities. Reset clears learned versions and profiles while retaining configured versions.</p>
+    <div class="named-actions"><button type="button" class="btn sm" data-config-act="identity-reload"${c.identitiesBusy ? ' disabled' : ''}>Refresh profiles</button>
+    <button type="button" class="btn sm" data-config-act="identity-reset"${c.identitiesBusy ? ' disabled' : ''}>Reset learned profiles</button></div>
+    ${c.identitiesError ? `<p class="cfg-error" role="alert">${esc(c.identitiesError)}</p>` : ''}
+    <details><summary>Versions and profile sources</summary><pre>${esc(details)}</pre></details></div>`;
+}
+
+async function loadClientIdentities() {
+  const c = S.config;
+  if (c.identitiesBusy) return;
+  c.identitiesBusy = true; c.identitiesError = '';
+  try { c.identities = await api('/client-identities'); }
+  catch (e) { c.identitiesError = e.message; }
+  finally { c.identitiesBusy = false; if (S.route === 'config' && c.section === 'connections') render(); }
+}
+
+async function resetClientIdentities() {
+  const c = S.config;
+  if (c.identitiesBusy) return;
+  c.identitiesBusy = true; c.identitiesError = '';
+  try { c.identities = await api('/client-identities/reset', { method: 'POST' }); }
+  catch (e) { c.identitiesError = e.message; }
+  finally { c.identitiesBusy = false; if (S.route === 'config') render(); }
+}
+
 function configConnectionsHTML() {
   return `<div class="cfg-grid">${configField(['proxy-url'], 'Upstream proxy', { wide: true,
     placeholder: 'socks5://127.0.0.1:1080', help: 'Default proxy for upstream requests. Supports HTTP, HTTPS and SOCKS5; individual providers can override it.' })}
     <div class="cfg-divider wide"></div>
     ${configSwitch(['codex-websockets'], 'Native Codex websockets', 'Keep a native upstream websocket connection for clients using Codex over websockets.')}
     ${configSwitch(['claude-cloak'], 'Claude Code compatibility', 'Make requests through Claude OAuth accounts resemble Claude Code requests for other clients.')}
+    ${clientIdentitiesHTML()}
     ${configSwitch(['banked-resets'], 'Banked resets', 'Show saved Claude and ChatGPT limit resets beside each subscription and let you spend them. Checks every 30 minutes through unofficial provider endpoints.')}
     <div class="cfg-divider wide"></div>
     ${configField(['embeddings', 'concurrency'], 'Concurrent embedding chunks', { type: 'number', min: 1, max: 16, required: true, help: 'Google embedding batches can send up to this many chunks at once. Default: 1. Higher values use more provider capacity.' })}
@@ -864,7 +924,23 @@ function configModelsHTML() {
     <div class="cfg-divider"></div>
     ${configStrings(['oauth-excluded-models', provider], 'Excluded models', 'Model names or patterns these accounts must not serve. Use * as a wildcard.')}
     <div class="cfg-divider"></div>
-    ${configStrings(['extra-models', provider], 'Added models', 'Models released after this version of Fusebox, served by every account of this provider. Each is removed once Fusebox or the provider’s model list knows it.', false, 'No models added.', { add: 'Add model', item: 'Model', one: 'model', placeholder: 'claude-opus-6' })}`;
+    ${configStrings(['extra-models', provider], 'Added models', 'Models released after this version of Fusebox, served by every account of this provider. Each is removed once Fusebox or the provider’s model list knows it.', false, 'No models added.', { add: 'Add model', item: 'Model', one: 'model', placeholder: 'claude-opus-6' })}
+    <div class="cfg-divider"></div>${configModelMetadataHTML()}`;
+}
+
+function configModelMetadataHTML() {
+  const entries = configGet(['model-capabilities']) || {};
+  const models = S.models || [];
+  const choices = models.filter((m) => !Object.hasOwn(entries, m.id));
+  return `<div class="cfg-list wide">${configListHead('Model metadata overrides', 'Provider discovery supplies model limits where available. Use documented values for custom models here. Empty fields inherit discovery; overrides apply to the exact public model ID, including its prefix or alias.')}
+    <div class="setup-model"><label for="metadata-model">Model</label><select id="metadata-model">${choices.map((m) => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('')}</select><button type="button" class="btn sm" data-config-act="metadata-add"${choices.length ? '' : ' disabled'}>Add override</button></div>
+    ${Object.keys(entries).map((id) => {
+      const path = ['model-capabilities', id];
+      return `<section class="cfg-entry"><div class="cfg-list-head"><span class="mono">${esc(id)}</span><button type="button" class="btn danger" data-config-act="metadata-remove" data-name="${esc(id)}">Remove override</button></div>
+        <div class="cfg-grid">${configField([...path, 'context_window'], 'Context tokens', { type: 'number', min: 1, nullable: true })}${configField([...path, 'max_output_tokens'], 'Output tokens', { type: 'number', min: 1, nullable: true })}
+        ${configChoice([...path, 'input_modalities'], 'Image input', [[null, 'From provider'], [['text', 'image'], 'Supported'], [['text'], 'Text only']], 'Other input modalities can be set in config.yaml.')}
+        ${configChoice([...path, 'tool_calling'], 'Tool calls', [[null, 'From provider'], [true, 'Supported'], [false, 'Unsupported']])}</div></section>`;
+    }).join('')}</div>`;
 }
 
 function configDiagnosticsHTML() {
@@ -1102,7 +1178,7 @@ async function loadConfig() {
   if (c.loading || c.busy) return;
   c.loading = true;
   c.msg = null;
-  try { acceptConfig(await api('/config/settings')); }
+  try { acceptConfig(await api('/config/settings')); if (c.section === 'connections') await loadClientIdentities(); }
   catch (e) { c.msg = { kind: 'err', text: e.message }; }
   c.loading = false;
   if (S.route === 'config') render();
@@ -1145,7 +1221,16 @@ function configValidate() {
   }
   if ('auth-dir' in changed && !v['auth-dir']?.trim()) invalid(['auth-dir'], 'Enter a credentials directory.');
   if ('request-retry' in changed && (!Number.isInteger(v['request-retry']) || v['request-retry'] < 0 || v['request-retry'] > 4294967295)) invalid(['request-retry'], 'Enter a nonnegative whole number.');
+  if ('provider-session-idle-seconds' in changed && (!Number.isInteger(v['provider-session-idle-seconds']) || v['provider-session-idle-seconds'] < 1 || v['provider-session-idle-seconds'] > 86400)) invalid(['provider-session-idle-seconds'], 'Enter 1 to 86400 seconds.');
   if ('five-hour-reserve-percent' in changed && (!Number.isInteger(v['five-hour-reserve-percent']) || v['five-hour-reserve-percent'] < 0 || v['five-hour-reserve-percent'] > 100)) invalid(['five-hour-reserve-percent'], 'Enter a whole percentage between 0 and 100.');
+  if ('window-starter' in changed) {
+    const p = v['window-starter'];
+    if (!/^claude-[a-zA-Z0-9._-]+$/.test(p.model || '')) invalid(['window-starter', 'model'], 'Enter a native Claude model name without options or a prefix.');
+    try { new Intl.DateTimeFormat('en', { timeZone: p.timezone }).format(); } catch { invalid(['window-starter', 'timezone'], 'Enter a valid IANA timezone.'); }
+    if (!p.weekdays?.length) invalid(['window-starter', 'weekdays'], 'Choose at least one working day.');
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(p.start || '') || p.start === p.end) invalid(['window-starter', 'start'], 'Enter a start time different from the end time.');
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(p.end || '')) invalid(['window-starter', 'end'], 'Enter a valid end time.');
+  }
   if ('session-affinity-idle-seconds' in changed && (!Number.isInteger(v['session-affinity-idle-seconds']) || v['session-affinity-idle-seconds'] < 60)) invalid(['session-affinity-idle-seconds'], 'Enter at least 60 seconds.');
   if ('first-token-timeout-seconds' in changed && (!Number.isInteger(v['first-token-timeout-seconds']) || v['first-token-timeout-seconds'] < 0 || v['first-token-timeout-seconds'] > 3600)) invalid(['first-token-timeout-seconds'], 'Enter 0 to 3600 seconds.');
   if ('model-groups' in changed) {
@@ -1200,7 +1285,7 @@ function configValidate() {
       const provider = CONFIG_PROVIDERS.find(([, , field]) => path[0] === field);
       if (provider) { c.section = 'providers'; c.provider = provider[0];
         for (let i = 0; i < v[provider[2]].length; i++) { c.opens[`${provider[2]}:${i}`] = true; c.opens[`${provider[2]}:${i}:advanced`] = true; }
-      } else if (['request-retry', 'session-affinity-idle-seconds', 'five-hour-reserve-percent', 'first-token-timeout-seconds', 'model-groups', 'background-model'].includes(path[0])) c.section = 'routing';
+      } else if (['request-retry', 'session-affinity-idle-seconds', 'five-hour-reserve-percent', 'first-token-timeout-seconds', 'model-groups', 'background-model', 'window-starter'].includes(path[0])) c.section = 'routing';
       else if (path[0] === 'proxy-url') c.section = 'connections';
       else c.section = 'server';
     }
@@ -1341,11 +1426,24 @@ document.addEventListener('click', (e) => {
   const c = S.config;
   const act = button.dataset.configAct;
   const path = button.dataset.path ? JSON.parse(button.dataset.path) : null;
+  if (act === 'identity-reload') return loadClientIdentities();
+  if (act === 'identity-reset') return resetClientIdentities();
   if (act === 'save') return saveConfig();
   if (act === 'discard') return discardConfig();
   if (act.startsWith('named-')) return namedAction(act, button.dataset.id);
   if (act.startsWith('shared-')) return sharedAction(act, Number(button.dataset.index));
   if (act.startsWith('group-')) return groupAction(act, button.dataset.name);
+  if (act === 'metadata-add' || act === 'metadata-remove') {
+    const entries = { ...(configGet(['model-capabilities']) || {}) };
+    if (act === 'metadata-add') {
+      const id = $('#metadata-model')?.value;
+      if (!id) return;
+      Object.defineProperty(entries, id, { value: {}, enumerable: true, configurable: true, writable: true });
+    } else delete entries[button.dataset.name];
+    configSet(['model-capabilities'], entries);
+    S.config.msg = null;
+    return render();
+  }
   if (act.startsWith('hook-')) return webhookAction(act, button.dataset.index);
   if (act.startsWith('limits-')) return limitsAction(act, button.dataset.id);
   if (act === 'review-save') return confirmReview();
@@ -1361,6 +1459,7 @@ document.addEventListener('click', (e) => {
       c.msg = { kind: 'err', text: 'Save or revert the file first.' }; configUpdateFoot(); return;
     }
     c.section = button.dataset.section; c.msg = null;
+    if (c.section === 'connections') loadClientIdentities();
     history.replaceState(null, '', `#/config/${c.section}`);
     render();
     $(`.cfg-nav [data-section="${c.section}"], .cfg-chips [data-section="${c.section}"]`)?.focus({ preventScroll: true });
@@ -1376,6 +1475,16 @@ document.addEventListener('click', (e) => {
   }
   if (act === 'switch') {
     configSet(path, !configGet(path)); c.msg = null; render(); document.getElementById(configId(path))?.focus(); return;
+  }
+  if (act === 'window-account' || act === 'window-day') {
+    const key = act === 'window-account' ? 'accounts' : 'weekdays';
+    const value = act === 'window-account' ? button.dataset.id : Number(button.dataset.day);
+    const selected = configGet(['window-starter', key]) || [];
+    configSet(['window-starter', key], selected.includes(value) ? selected.filter((v) => v !== value) : [...selected, value]);
+    c.msg = null; render();
+    const attr = act === 'window-account' ? 'data-id' : 'data-day';
+    $(`[data-config-act="${act}"][${attr}="${CSS.escape(String(value))}"]`)?.focus();
+    return;
   }
   if (act === 'reveal') {
     const input = document.getElementById(configId(path));

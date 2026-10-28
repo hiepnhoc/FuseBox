@@ -1,6 +1,6 @@
 //! Structured edits to the original config, retaining compatibility fields and comments.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, ensure};
@@ -103,6 +103,7 @@ pub fn values(text: &str) -> Result<Value> {
     notifications["webhooks"] = json!(cfg.notifications.webhooks);
     obj.insert("notifications".into(), notifications);
     obj.insert("model-groups".into(), json!(cfg.model_groups));
+    obj.insert("model-capabilities".into(), json!(cfg.model_capabilities));
     obj.insert("background-model".into(), json!(cfg.background_model));
     obj.insert("management-allow-remote".into(), json!(cfg.management_allow_remote));
     obj.insert("force-model-prefix".into(), json!(cfg.force_model_prefix));
@@ -160,6 +161,7 @@ fn setting_path(doc: &Yaml, field: &str) -> (Vec<Value>, bool) {
         "force-model-prefix" => &["routing", "force-model-prefix"],
         "session-affinity" => &["routing", "session-affinity"],
         "banked-reset-policy" => &["routing", "banked-reset-policy"],
+        "window-starter" => &["routing", "window-starter"],
         "five-hour-reserve-percent" => &["routing", "five-hour-reserve-percent"],
         "proxy-url" => &["requests", "proxy-url"],
         "oauth-model-alias" => &["oauth", "model-alias"],
@@ -447,7 +449,7 @@ fn check_url(value: &str, label: &str) -> Result<()> {
 
 /// Settings left out of `values` while unset, so the settings a dashboard reads don't
 /// change for those who never use them, but that can still be set.
-const OPTIONAL: &[&str] = &["trusted-proxies", "proxy-protocol-port"];
+const OPTIONAL: &[&str] = &["trusted-proxies", "proxy-protocol-port", "upstream-header-allowlist"];
 
 fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
     for (field, value) in changes {
@@ -492,6 +494,12 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
             "session-affinity-idle-seconds" => {
                 ensure!(value.as_u64().is_some_and(|n| n >= 60), "Forget idle sessions after at least 60 seconds")
             }
+            "provider-session-idle-seconds" => {
+                ensure!(
+                    value.as_u64().is_some_and(|n| (1..=86400).contains(&n)),
+                    "Provider session inactivity must be between 1 and 86400 seconds"
+                )
+            }
             "prompt-cache" => {
                 let config: crate::cache::Config = serde_json::from_value(value.clone())
                     .context("Prompt cache: choose valid scope and incompatible-hint handling")?;
@@ -521,6 +529,11 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
                     serde_json::from_value(value.clone()).context("Invalid banked-reset-policy")?;
                 policy.validate().map_err(anyhow::Error::msg)?;
             }
+            "window-starter" => {
+                let policy: crate::window_starter::Config =
+                    serde_json::from_value(value.clone()).context("Invalid window-starter")?;
+                policy.validate()?;
+            }
             "codex-websockets" | "claude-cloak" | "banked-resets" | "session-affinity" | "force-model-prefix"
             | "debug" | "latency-routing" => {
                 ensure!(value.is_boolean(), "{field}: use a boolean")
@@ -545,6 +558,12 @@ fn validate(values: &Value, changes: &Map<String, Value>) -> Result<()> {
                 "Background model: name a model, or leave it empty"
             ),
             "model-groups" => ensure!(value.is_object(), "Model groups: a name for each list of models"),
+            "model-capabilities" => {
+                let caps: BTreeMap<String, crate::model_catalog::Capabilities> = serde_json::from_value(value.clone())?;
+                for cap in caps.values() {
+                    cap.validate()?;
+                }
+            }
             _ => {}
         }
     }
@@ -1149,6 +1168,28 @@ mod tests {
             [json!({"nope": ["x"]}), json!({"openai-compatibility": ["x"]}), json!({"claude": ["team/claude-x"]})]
         {
             assert!(apply(source, json!({"extra-models": bad}).as_object().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn model_metadata_overrides_round_trip_in_both_config_layouts() {
+        for source in ["# preserve\nport: 8317\n", "config-version: 8\nserver:\n  port: 8317\n"] {
+            let (out, cfg) = edit(
+                source,
+                json!({"model-capabilities":{"team/coding":{"context_window":128000,"max_output_tokens":16000,"input_modalities":["text","image"],"tool_calling":true}}}),
+            );
+            assert_eq!(cfg.model_capabilities["team/coding"].context_window, Some(128000));
+            assert_eq!(values(&out).unwrap()["model-capabilities"]["team/coding"]["tool_calling"], true);
+            let (_, cfg) = edit(&out, json!({"model-capabilities":{}}));
+            assert!(cfg.model_capabilities.is_empty());
+        }
+        for bad in [
+            json!({"context_window":0}),
+            json!({"context_window":1.5}),
+            json!({"input_modalities":[""]}),
+            json!({"made_up":true}),
+        ] {
+            assert!(apply("", json!({"model-capabilities":{"test":bad}}).as_object().unwrap()).is_err());
         }
     }
 

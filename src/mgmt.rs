@@ -377,13 +377,17 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/accounts/{id}/toggle", post(toggle_account))
         .route("/accounts/{id}/refresh", post(refresh_account))
         .route("/accounts/{id}/reset", post(reset_account))
+        .route("/accounts/{id}/error/clear", post(clear_account_error))
         .route("/accounts/{id}/banked-resets", get(banked_resets).post(apply_banked_reset))
         .route("/accounts/{id}/quota/refresh", post(refresh_quota))
+        .route("/accounts/{id}/window-starter", post(start_window))
         .route("/accounts/{id}/activity", get(account_activity))
         .route("/accounts/{id}/priority", post(set_priority))
         .route("/accounts/{id}/models", put(set_account_models))
         .route("/accounts/{id}/models/fetch", post(fetch_account_models))
         .route("/clients/usage", get(client_usage))
+        .route("/client-identities", get(client_identities))
+        .route("/client-identities/reset", post(reset_client_identities))
         .route("/playground", post(crate::server::playground))
         .route("/routes", get(routes))
         .route("/keys", post(add_key))
@@ -400,6 +404,17 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/login/{target}/code", post(login_code))
         .route("/live", get(live))
         .layer(middleware::from_fn_with_state(app, auth))
+}
+
+async fn client_identities() -> Json<Value> {
+    Json(crate::clients::snapshot())
+}
+
+async fn reset_client_identities(State(app): State<Arc<App>>) -> Json<Value> {
+    crate::clients::reset();
+    app.models.save_clients();
+    app.broadcast("client-identities", Value::Null);
+    Json(crate::clients::snapshot())
 }
 
 pub(crate) async fn auth(
@@ -620,6 +635,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "routing": cfg.routing,
         "banked_resets": cfg.banked_resets,
         "banked_reset_policy": cfg.banked_reset_policy,
+        "window_starter": cfg.window_starter,
         "session_affinity": cfg.session_affinity,
         "request_retry": cfg.request_retry.max(1),
         "management_key": !cfg.management_key.is_empty(),
@@ -646,6 +662,8 @@ async fn accounts(State(app): State<Arc<App>>) -> Json<Value> {
                 snapshot["banked_reset_plan"] =
                     serde_json::to_value(crate::banked_resets::plan(a, &cfg)).unwrap_or_default();
                 snapshot["quota_attribution"] = attribution_json(&a.state.lock().attribution, &cfg);
+                snapshot["window_starter_supported"] = json!(crate::window_starter::supported(a));
+                snapshot["window_starter_selected"] = json!(cfg.window_starter.selected(a));
                 snapshot
             })
             .collect(),
@@ -654,6 +672,9 @@ async fn accounts(State(app): State<Arc<App>>) -> Json<Value> {
 
 /// A client key as people know it: the named client's label, the program, or neither.
 pub fn client_label(cfg: &Config, key: &str) -> String {
+    if key == "system:window-starter" {
+        return "Window starter".into();
+    }
     let name = |c: &crate::config::NamedClient| if c.label.trim().is_empty() { c.id.clone() } else { c.label.clone() };
     // A shared key's usage id is a hash of the key. One that has since been named keeps
     // its value, so its earlier use goes by the client's name too.
@@ -843,7 +864,8 @@ async fn models(State(app): State<Arc<App>>) -> Json<Value> {
 /// What `/api/models` returns; its fingerprint decides when dashboards refetch it.
 pub fn model_list(app: &App) -> Value {
     let models = app.pool.models().into_iter().map(|(m, p)| {
-        let mut v = json!({ "id": m, "provider": p });
+        let mut v = json!({ "id": m, "provider": p, "capabilities": crate::model_catalog::capabilities(app, &m),
+            "codex_catalog": crate::model_catalog::codex_template(app, &m).is_some() });
         match app.pool.route(&m) {
             (Some(Only::Prefix(prefix)), _) => v["prefix"] = prefix.into(),
             (_, base) if crate::discovery::added(app, p, &base) => v["added"] = true.into(),
@@ -851,7 +873,13 @@ pub fn model_list(app: &App) -> Value {
         }
         v
     });
-    Value::Array(models.collect())
+    let mut models: Vec<Value> = models.collect();
+    for id in app.cfg().model_groups.keys() {
+        if !models.iter().any(|m| m["id"] == *id) {
+            models.push(json!({ "id": id, "provider": "fusebox", "capabilities": crate::model_catalog::capabilities(app, id), "codex_catalog": false }));
+        }
+    }
+    Value::Array(models)
 }
 
 #[derive(Deserialize)]
@@ -955,6 +983,44 @@ async fn reset_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
 }
 
 const RESETS_OFF: &str = "Banked resets are turned off. Turn them on under Config, Connections.";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearErrorBody {
+    error_id: String,
+}
+
+async fn clear_account_error(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(b): Json<ClearErrorBody>,
+) -> Response {
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    let Ok(error_id) = uuid::Uuid::parse_str(&b.error_id) else {
+        return err(StatusCode::BAD_REQUEST, "A valid error ID is required");
+    };
+    if !acct.state.lock().clear_error_if(&error_id.to_string()) {
+        return err(StatusCode::CONFLICT, "A newer error arrived. Review it before clearing.");
+    }
+    app.broadcast("accounts", Value::Null);
+    Json(acct.snapshot()).into_response()
+}
+
+async fn start_window(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(action): Json<crate::window_starter::Action>,
+) -> Response {
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    // The journal remains authoritative if the browser disconnects mid-request.
+    match tokio::spawn(crate::window_starter::start(app, acct, action, false)).await {
+        Ok(Ok(view)) => Json(view).into_response(),
+        Ok(Err(e)) => err(StatusCode::CONFLICT, e.to_string()),
+        Err(_) => {
+            err(StatusCode::INTERNAL_SERVER_ERROR, "Window starter interrupted; check provider status before retrying")
+        }
+    }
+}
 
 async fn banked_resets(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     if !app.cfg().banked_resets {
@@ -1650,6 +1716,117 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn clearing_an_account_error_is_authenticated_scoped_and_race_safe() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = App::new(
+            Config {
+                auth_dir: "/nonexistent".into(),
+                management_key: "management-only".into(),
+                api_keys: vec!["inference-only".into()],
+                claude_api_key: vec![crate::config::KeyEntry { api_key: "mock-only".into(), ..Default::default() }],
+                ..Default::default()
+            },
+            "/nonexistent/config.yaml".into(),
+        );
+        let account = app.pool.all()[0].clone();
+        let now = chrono::Utc::now();
+        {
+            let mut state = account.state.lock();
+            state.cooldowns.insert("claude-opus-5-5".into(), now + chrono::Duration::minutes(1));
+            state.quota_cooldowns.insert("*".into(), now + chrono::Duration::hours(1));
+            state.quota.set(
+                vec![crate::quota::Window {
+                    name: "week".into(),
+                    used: 100.0,
+                    resets_at: Some(now + chrono::Duration::hours(1)),
+                    model: None,
+                }],
+                None,
+            );
+            state.counters.requests = 19;
+            state.strikes = 3;
+            state.disabled = true;
+            state.set_error("400: billing restriction");
+        }
+        let before = account.snapshot();
+        let old_id = before["last_error_id"].as_str().unwrap().to_string();
+        let service = router(app.clone()).with_state(app.clone());
+        let post = |key: Option<&str>, body: Value, id: &str| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(format!("/accounts/{id}/error/clear"))
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header("authorization", format!("Bearer {key}"));
+            }
+            let mut request = request.body(Body::from(body.to_string())).unwrap();
+            request.extensions_mut().insert(ConnectInfo("192.0.2.1:1234".parse::<SocketAddr>().unwrap()));
+            service.clone().oneshot(request)
+        };
+        let body = json!({"error_id":old_id});
+        assert_eq!(post(None, body.clone(), &account.id).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            post(Some("inference-only"), body.clone(), &account.id).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(account.snapshot()["last_error_id"], before["last_error_id"]);
+        assert_eq!(
+            post(Some("management-only"), json!({}), &account.id).await.unwrap().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            post(Some("management-only"), json!({"error_id":"invalid"}), &account.id).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(Some("management-only"), body.clone(), "missing").await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Repeated identical messages are distinct occurrences.
+        account.state.lock().set_error("400: billing restriction");
+        let newer_id = account.snapshot()["last_error_id"].as_str().unwrap().to_string();
+        assert_ne!(old_id, newer_id);
+        assert_eq!(post(Some("management-only"), body, &account.id).await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(account.snapshot()["last_error_id"], newer_id);
+        let mut events = app.live.subscribe();
+        let body = json!({"error_id":newer_id});
+        let response = post(Some("management-only"), body.clone(), &account.id).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let after: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(after["last_error"].is_null());
+        assert!(after["last_error_id"].is_null());
+        for field in ["cooldowns", "cooldown_kinds", "quota", "counters", "disabled"] {
+            assert_eq!(after[field], before[field], "clearing an error preserves {field}");
+        }
+        assert_eq!(account.state.lock().strikes, 3);
+        assert_eq!(app.stats.recent.lock().len(), 0, "no inference or request-history entry is generated");
+        let event: Value = serde_json::from_str(&events.try_recv().unwrap()).unwrap();
+        assert_eq!(event["type"], "accounts");
+        assert_eq!(
+            post(Some("management-only"), body, &account.id).await.unwrap().status(),
+            StatusCode::OK,
+            "duplicate clears are harmless"
+        );
+
+        // An ordinary error with no cooldown must be dismissible too.
+        {
+            let mut state = account.state.lock();
+            state.cooldowns.clear();
+            state.quota_cooldowns.clear();
+            state.quota = Default::default();
+            state.set_error("400: third-party billing");
+        }
+        let body = json!({"error_id":account.snapshot()["last_error_id"]});
+        assert_eq!(post(Some("management-only"), body, &account.id).await.unwrap().status(), StatusCode::OK);
+        assert!(account.snapshot()["last_error"].is_null());
+    }
+
+    #[tokio::test]
     async fn requests_through_a_local_proxy_need_the_management_key() {
         let app = App::new(
             Config { auth_dir: "/nonexistent".into(), ..Default::default() },
@@ -1758,8 +1935,11 @@ mod tests {
         let app = App::new(cfg, "/nonexistent/config.yaml".into());
         let resets = chrono::Utc::now() + chrono::Duration::days(3);
         for (a, used) in app.pool.all().iter().zip([90.0, 60.0]) {
-            a.state.lock().quota.windows =
+            let mut state = a.state.lock();
+            state.quota.windows =
                 vec![crate::quota::Window { name: "week".into(), used, resets_at: Some(resets), model: None }];
+            state.attribution.history =
+                vec![crate::outlook::test_history(&state.quota.windows[0], chrono::Utc::now(), 20.0)];
         }
         let Json(view) = overview(State(app.clone())).await;
         let [pool] = view["pools"].as_array().unwrap().as_slice() else { panic!("one pool: {}", view["pools"]) };
@@ -1770,6 +1950,9 @@ mod tests {
         );
         assert_eq!((pool["priced"].as_bool(), pool["runs_out_early"].as_bool()), (Some(false), Some(true)));
         assert_eq!(pool["until"], resets.to_rfc3339());
+        assert_eq!(pool["outlook"]["state"], "run_out");
+        assert_eq!(pool["outlook"]["min_remaining"], 0.0);
+        assert_eq!(pool["outlook"]["recovers_at"], json!(resets));
         let faults = crate::push::current_faults(&app);
         let pace: Vec<&Value> = faults.as_array().unwrap().iter().filter(|f| f["kind"] == "pace").collect();
         assert_eq!(pace.len(), 1);

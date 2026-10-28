@@ -39,8 +39,8 @@ test('exact strings, patterns and dates translate', () => {
   assert.equal(tr('Copy gpt-6-astra'), '复制 gpt-6-astra');
   assert.equal(tr('Remove API key 2'), '移除 API 密钥 2');
   assert.equal(tr('Resets Thu 12:39 · in'), '周四 12:39 重置 · 还有');
-  assert.equal(tr('5-hour window resets Wednesday, 14 October 2026 at 07:39:18 CEST · using 12% an hour'),
-    '5 小时窗口将于 2026年10月14日 星期三 07:39:18 CEST 重置 · 每小时用掉 12%');
+  assert.equal(tr('5-hour window resets Wednesday, 14 October 2026 at 07:39:18 CEST'),
+    '5 小时窗口将于 2026年10月14日 星期三 07:39:18 CEST 重置');
   assert.equal(tr('Thu Oct 8 – Wed Oct 14'), '10月8日 周四 – 10月14日 周三');
   assert.equal(tr('Fri Oct 9: Unpriced'), '10月9日 周五：未定价');
   assert.equal(tr('Restart Fusebox to apply changes to port, log format.'), '重启 Fusebox 后，对端口、日志格式的修改才会生效。');
@@ -77,6 +77,16 @@ test('answers are remembered, up to a bound, so unmatched text is not tried twic
 test('the dictionary is fetched from a URL the server can version', () => {
   const source = fs.readFileSync(path.join(__dirname, '../ui/i18n.js'), 'utf8');
   assert.match(source, /'\/ui\/i18n-zh\.js'/);
+});
+
+test('page refresh gestures and the discard confirmation read in Chinese', () => {
+  const { tr } = load().FUSEBOX_I18N;
+  assert.equal(tr('Refresh page'), '刷新页面');
+  assert.equal(tr('Pull to refresh'), '下拉刷新');
+  assert.equal(tr('Release to refresh'), '松开刷新');
+  assert.equal(tr('Refreshing…'), '正在刷新…');
+  assert.equal(tr('Reload and discard changes?'), '重新加载并放弃更改？');
+  assert.equal(tr('Refreshing the page will discard your unsaved Config changes.'), '刷新页面将放弃尚未保存的配置更改。');
 });
 
 test('quota attribution and the usage database read in Chinese', () => {
@@ -117,4 +127,28 @@ test('combined weekly limits read in Chinese', () => {
   assert.equal(tr('Each provider’s subscriptions together, weighted by plan price'), '每个提供商的订阅合并计算，按套餐价格加权');
   assert.equal(tr('Claude weighted by plan price, Codex equally'), 'Claude 按套餐价格加权，Codex 权重相同');
   assert.match(tr('Each account counts by its plan’s monthly price: Claude Pro 1, Max 5x 5, Max 20x 10'), /^每个账号按套餐月费计权/);
+});
+
+test('model setup and scoped quota explanations translate without changing model identifiers', () => {
+  const { tr } = load().FUSEBOX_I18N;
+  assert.equal(tr('Context limit unknown'),'上下文上限未知');
+  assert.equal(tr('128,000 context tokens · Image input supported'),'128,000 个上下文 token · 支持图片输入');
+  assert.equal(tr('Individual spending limit'),'个人支出上限');
+  assert.equal(tr('Applies to all models'),'适用于所有模型');
+  assert.equal(tr('Model: team/coding'),'模型：team/coding');
+  assert.equal(tr('Model metadata overrides'),'模型元数据覆盖');
+  assert.equal(tr('Download file'),'下载文件');
+});
+
+test('weekly forecasts translate reserve, learning and gap messages', () => {
+  const { tr } = load().FUSEBOX_I18N;
+  assert.equal(tr('Weekly quota outlook'), '每周额度预测');
+  assert.equal(tr('Expected to last'), '预计额度充足');
+  assert.equal(tr('Learning usage'), '正在学习用量');
+  assert.equal(tr('Current quota while learning'), '学习期间显示当前额度');
+  assert.equal(tr('remaining now'), '当前剩余');
+  assert.equal(tr('Claude current combined weekly quota used'), 'Claude 当前每周合计额度已用');
+  assert.equal(tr('Quota readings are stale'), '额度记录已过期');
+  assert.equal(tr('Claude lowest projected weekly reserve'), 'Claude 预计最低每周剩余额度');
+  assert.equal(tr('29% lowest projected reserve over the next 7 days'), '未来 7 天预计最低剩余额度 29%');
 });
