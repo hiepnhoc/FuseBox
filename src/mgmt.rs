@@ -389,6 +389,8 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/client-identities", get(client_identities))
         .route("/client-identities/reset", post(reset_client_identities))
         .route("/playground", post(crate::server::playground))
+        .route("/procs", get(procs))
+        .route("/procs/signal", post(procs_signal))
         .route("/routes", get(routes))
         .route("/keys", post(add_key))
         .route("/keys/models", post(list_key_models))
@@ -404,6 +406,33 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/login/{target}/code", post(login_code))
         .route("/live", get(live))
         .layer(middleware::from_fn_with_state(app, auth))
+}
+
+#[derive(Deserialize)]
+struct ProcsQuery {
+    others: Option<usize>,
+}
+
+/// The Processes page: agents and the heaviest other programs on this machine.
+async fn procs(Query(q): Query<ProcsQuery>) -> Json<Value> {
+    Json(crate::procs::snapshot(q.others.unwrap_or(crate::procs::DEFAULT_OTHERS).min(100)).await)
+}
+
+#[derive(Deserialize)]
+struct SignalBody {
+    action: crate::procs::Action,
+    pids: Vec<i32>,
+}
+
+/// Pauses, resumes, ends or kills a process tree, given its pids root first.
+async fn procs_signal(Json(b): Json<SignalBody>) -> Response {
+    if b.pids.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "no processes named");
+    }
+    match crate::procs::signal(b.action, &b.pids) {
+        Ok(sent) => Json(json!({ "ok": true, "sent": sent })).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()),
+    }
 }
 
 async fn client_identities() -> Json<Value> {

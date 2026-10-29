@@ -31,7 +31,7 @@ const mob = () => PHONE.matches;
 const MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const STANDALONE = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
 const MOD = MAC ? '⌘' : 'Ctrl ';
-const ROUTES = ['overview', 'accounts', 'requests', 'usage', 'models', 'config'];
+const ROUTES = ['overview', 'accounts', 'requests', 'usage', 'models', 'procs', 'config'];
 
 const S = {
   key: store.get('key') || '',
@@ -783,7 +783,7 @@ function renderFaults() {
   }
 }
 
-const TITLES = { overview: 'Overview', accounts: 'Accounts', requests: 'Requests', usage: 'Usage', models: 'Models', config: 'Config' };
+const TITLES = { overview: 'Overview', accounts: 'Accounts', requests: 'Requests', usage: 'Usage', models: 'Models', procs: 'Processes', config: 'Config' };
 
 function renderChrome() {
   for (const a of $$('.tabs a, .mtabs a')) {
@@ -812,6 +812,7 @@ function viewClass() {
   if (S.route === 'accounts') return S.sub ? 'view detail' : 'view tight list';
   if (S.route === 'requests') return 'view tight list';
   if (S.route === 'models') return 'view tight list';
+  if (S.route === 'procs') return 'view tight list';
   if (S.route === 'config') return 'view tight config';
   return 'view';
 }
@@ -821,10 +822,11 @@ function render() {
   view.className = viewClass();
   if (S.locked) { closeResetModal(); closeLayers(); view.innerHTML = lockHTML(); bindLock(); return; }
   if (!S.overview) { view.innerHTML = skeletonHTML(); return; }
-  const pages = { overview: overviewHTML, accounts: accountsHTML, requests: requestsHTML, usage: usageHTML, models: modelsHTML, config: configHTML };
+  const pages = { overview: overviewHTML, accounts: accountsHTML, requests: requestsHTML, usage: usageHTML, models: modelsHTML, procs: procsHTML, config: configHTML };
   view.innerHTML = (pages[S.route] || overviewHTML)();
   if (S.route === 'config') bindConfig();
   if (S.route === 'usage') bindUsage();
+  if (S.route === 'procs') bindProcs();
   if (S.route === 'accounts' && S.sub) loadActivity(S.sub);
   renderDrawer();
   syncResetModal();

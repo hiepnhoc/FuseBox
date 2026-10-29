@@ -32,6 +32,7 @@ mod oauth;
 mod outlook;
 mod policy;
 mod pools;
+mod procs;
 mod provider_sessions;
 mod proxy;
 mod push;
