@@ -309,13 +309,15 @@ async fn cancelled_interrupted_and_missing_usage_remain_explicit() {
     .unwrap();
     let s = summary(&app).await;
     assert_eq!(s["proxy"]["logical_requests"], 3);
-    assert_eq!(s["proxy"]["missing_usage"], 1);
-    assert_eq!(s["proxy"]["partial"], 2);
-    assert_eq!(s["proxy"]["tokens"]["output"], 80);
+    // A success that reported no usage is estimated locally and labelled, not left missing.
+    assert_eq!(s["proxy"]["missing_usage"], 0);
+    assert_eq!(s["proxy"]["partial"], 3);
+    assert!(s["proxy"]["tokens"]["output"].as_u64().unwrap() > 80);
     let details = app.usage.as_ref().unwrap().details(store::Query::default()).await.unwrap();
     let serialized = details.to_string();
     assert!(serialized.contains("499"));
     assert!(serialized.contains("502"));
+    assert!(serialized.contains("estimated_output_tokens"));
 }
 #[tokio::test]
 async fn analytics_authentication_and_collector_scope() {

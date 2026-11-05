@@ -179,6 +179,8 @@ impl Observation {
                         | "tool_tokens"
                         | "per_request_usage"
                         | "estimated_input_tokens"
+                        | "estimated_output_tokens"
+                        | "provider_credits_milli"
                         | "request_latency_ms"
                         | "request_ttft_ms"
                         | "prepare_ms"

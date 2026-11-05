@@ -2,6 +2,7 @@
 use super::{
     collector, imports,
     store::{Query as UsageQuery, Store},
+    sync,
 };
 use crate::state::App;
 use axum::{
@@ -30,6 +31,7 @@ pub fn router() -> Router<Arc<App>> {
         .route("/usage/collectors/{id}/rotate", post(rotate))
         .route("/usage/collectors/{id}/revoke", post(revoke))
         .route("/usage/retention", post(purge))
+        .route("/usage/pricing/sync", get(sync_preview).post(sync_apply))
 }
 fn store(app: &App) -> Result<Store, Box<Response>> {
     app.usage
@@ -134,7 +136,7 @@ async fn status(State(app): State<Arc<App>>) -> Response {
         return Json(json!({"health":{"state":if app.usage_error.is_some(){"error"}else{"disabled"},"message":app.usage_error},"imports":[],"collectors":[]})).into_response();
     };
     let (i, c) = tokio::join!(imports::status(s), collector::status(s));
-    match (i,c){(Ok(i),Ok(c))=>Json(json!({"health":s.health(),"imports":i["imports"],"import_candidates":i["candidates"],"collectors":c["collectors"],"pricing":super::pricing::catalogue_info(),"database":s.database_stats()})).into_response(),_=>error(StatusCode::SERVICE_UNAVAILABLE,"Usage status unavailable")}
+    match (i,c){(Ok(i),Ok(c))=>Json(json!({"health":s.health(),"imports":i["imports"],"import_candidates":i["candidates"],"collectors":c["collectors"],"pricing":super::pricing::catalogue_info(),"pricing_sync":sync::status(&sync::supplement_path(&app)),"catalogue_version":s.catalogue().version,"synced_rates":s.catalogue().synced_rates().count(),"database":s.database_stats()})).into_response(),_=>error(StatusCode::SERVICE_UNAVAILABLE,"Usage status unavailable")}
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +220,27 @@ async fn purge(State(app): State<Arc<App>>, Json(v): Json<Purge>) -> Response {
         return error(StatusCode::BAD_REQUEST, "Cannot purge future periods");
     }
     result(s.purge(before).await)
+}
+/// What a price sync would change; nothing is written.
+async fn sync_preview(State(app): State<Arc<App>>) -> Response {
+    if let Err(r) = store(&app) {
+        return *r;
+    }
+    sync_result(sync::preview(&app).await)
+}
+/// Writes the synced prices and reprices earlier unpriced usage.
+async fn sync_apply(State(app): State<Arc<App>>) -> Response {
+    if let Err(r) = store(&app) {
+        return *r;
+    }
+    sync_result(sync::apply(&app).await)
+}
+fn sync_result(value: anyhow::Result<Value>) -> Response {
+    match value {
+        Ok(v) => Json(v).into_response(),
+        // The failure names models.dev or the file, never a private path or query.
+        Err(e) => error(StatusCode::BAD_GATEWAY, &format!("Price sync failed: {e:#}")),
+    }
 }
 pub async fn ingest(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     let s = match store(&app) {

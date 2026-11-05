@@ -26,11 +26,31 @@ function load() {
     piece('function quotaOf(w'), piece('function quotaPercent(value) {'), piece('const quotaWord ='), piece('function quotaView(q) {'),
     piece('function windowOf(a, short) {'), piece('const windowLabel ='), piece('const windowTitle ='), piece('function windowSeconds(w) {'),
     piece('function windowElapsed(w'), piece('function windowSpent(a, w) {'),
-    piece('const segsHTML ='), piece('function meterHTML(q'), piece('function pctHTML(w) {'), piece('function meterRowHTML(a, short) {'),
+    piece('const segsHTML ='), piece('function meterHTML(q'), piece('function pctHTML(w) {'), piece('function windowAmount(a, w) {'), piece('function meterRowHTML(a, short) {'),
     piece('function windowBlockHTML(a, w, title, size) {'),
   ].join('\n'), context);
   return (code) => vm.runInContext(code, context);
 }
+
+// Kiro on 2026-11-02: the month's credits as a percent and as an amount.
+test('a window reported with absolute amounts shows them beside its percent', () => {
+  const run = load();
+  const a = {
+    id: 'k', provider: 'kiro', kind: 'oauth', cooldowns: {}, cooldown_kinds: {},
+    quota: {
+      windows: [{ name: 'month', used: 11.1, resets_at: '2026-12-01T00:00:00Z' }],
+      limits: [{ id: 'kiro:credits', name: 'Monthly credits', scope: { kind: 'account' }, used: 221.56, limit: 2000, unit: 'credits', resets_at: '2026-12-01T00:00:00Z' }],
+    },
+  };
+  const html = row(run, a, false);
+  assert.match(html, /class="rst amt">221\.56 \/ 2,000 credits</);
+  const note = run(`(() => { const a = ${JSON.stringify(a)}; return windowBlockHTML(a, windowOf(a, false), 'Monthly', 'xl'); })()`);
+  assert.match(note, /221\.56 \/ 2,000 credits · Resets /);
+  // A limit that applies to another renewal, or carries its own percent, is not this window's amount.
+  a.quota.limits[0].resets_at = '2026-12-02T00:00:00Z';
+  assert.doesNotMatch(row(run, a, false), /credits/);
+  assert.doesNotMatch(row(run, account(), false), /amt/);
+});
 
 const account = (cooldowns = {}, kinds = {}) => ({
   id: 'a', provider: 'claude', kind: 'oauth', cooldowns, cooldown_kinds: kinds,

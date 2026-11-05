@@ -416,6 +416,9 @@ pub struct AccountState {
     /// banked reset or a fresh usage poll clears it; sessions move off it.
     pub quota_cooldowns: HashMap<String, DateTime<Utc>>,
     pub quota_epoch: u64,
+    /// A pay-as-you-go key whose provider said it has no money left: every model sits
+    /// out until then, and a request that succeeds ends it early.
+    pub credit_until: Option<DateTime<Utc>>,
     /// Fingerprint bound to the quota and attribution under this same lock.
     pub credential_identity: String,
     /// Changes only when the credential's identity changes, so old attempts and
@@ -552,6 +555,9 @@ impl AccountState {
         }
         if self.quota_refreshing {
             pauses.insert("*".into(), (now + chrono::Duration::seconds(30), "checking"));
+        }
+        if let Some(t) = self.credit_until.filter(|t| *t > now) {
+            pauses.insert("*".into(), (t, "credit"));
         }
         // A used-up usage window blocks every model until it resets.
         if let Some(t) = self
@@ -817,6 +823,7 @@ impl Account {
             st.cooldowns.get(model),
             st.quota_cooldowns.get("*"),
             st.quota_cooldowns.get(model),
+            st.credit_until.as_ref(),
             spent.as_ref(),
         ]
         .into_iter()
@@ -833,7 +840,7 @@ impl Account {
             .quota
             .exhausted_until(&quota_model)
             .or_else(|| st.quota.exhausted(&quota_model).then(|| Utc::now() + chrono::Duration::minutes(5)));
-        [st.quota_cooldowns.get("*"), st.quota_cooldowns.get(model), spent.as_ref()]
+        [st.quota_cooldowns.get("*"), st.quota_cooldowns.get(model), st.credit_until.as_ref(), spent.as_ref()]
             .into_iter()
             .flatten()
             .filter(|t| **t > Utc::now())
@@ -845,6 +852,19 @@ impl Account {
     pub fn exhaust(&self, model: &str, until: DateTime<Utc>, reason: &str) {
         let epoch = self.quota_epoch();
         self.cool_quota(model, until, reason, epoch);
+    }
+
+    /// Whether the key is sitting out for lack of credit right now.
+    pub fn credit_paused(&self) -> bool {
+        self.state.lock().credit_until.is_some_and(|t| t > Utc::now())
+    }
+
+    /// Pauses every model of a pay-as-you-go key its provider says has no credit left.
+    /// Sessions move off it like a spent subscription; the error ends with the pause.
+    pub fn out_of_credit(&self, until: DateTime<Utc>, reason: &str) {
+        let mut st = self.state.lock();
+        st.credit_until = Some(until);
+        st.pause_error(reason, false, "*", until);
     }
 
     /// Pauses the account (or one model) for a problem that stays shown until a
@@ -877,6 +897,7 @@ impl Account {
     pub fn record_ok(&self) {
         let mut st = self.state.lock();
         st.strikes = 0;
+        st.credit_until = None;
         st.clear_error();
     }
 
@@ -1851,6 +1872,8 @@ struct AccountCooldowns {
     rate: BTreeMap<String, DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     quota: BTreeMap<String, DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credit: Option<DateTime<Utc>>,
 }
 
 impl Cooldowns {
@@ -1873,8 +1896,12 @@ impl Pool {
         let mut out = BTreeMap::new();
         for a in self.accounts.read().iter() {
             let st = a.state.lock();
-            let entry = AccountCooldowns { rate: live(&st.cooldowns), quota: live(&st.quota_cooldowns) };
-            if !entry.rate.is_empty() || !entry.quota.is_empty() {
+            let entry = AccountCooldowns {
+                rate: live(&st.cooldowns),
+                quota: live(&st.quota_cooldowns),
+                credit: st.credit_until.filter(|t| *t > now),
+            };
+            if !entry.rate.is_empty() || !entry.quota.is_empty() || entry.credit.is_some() {
                 out.insert(a.id.clone(), entry);
             }
         }
@@ -1931,6 +1958,9 @@ impl Pool {
                 let mut st = a.state.lock();
                 merge(&mut st.cooldowns, &c.rate);
                 merge(&mut st.quota_cooldowns, &c.quota);
+                if let Some(t) = c.credit.filter(|t| *t > now) {
+                    st.credit_until = Some(st.credit_until.map_or(t, |have| have.max(t)));
+                }
             }
         }
     }
@@ -2407,6 +2437,39 @@ mod tests {
         assert_eq!(new.state.lock().active_requests.load(Ordering::Relaxed), 1);
         drop(request);
         assert_eq!(new.state.lock().active_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_out_of_credit_pause_is_saved_restored_and_reset() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: vec![crate::config::KeyEntry { api_key: "one".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let acct = pool.all()[0].clone();
+        let until = Utc::now() + chrono::Duration::hours(1);
+        acct.out_of_credit(until, "out of credit: Insufficient credits");
+        assert_eq!(acct.snapshot()["cooldown_kinds"]["*"], "credit");
+        assert_eq!(acct.snapshot()["last_error"], "out of credit: Insufficient credits");
+        assert_eq!(acct.state.lock().last_error(until), None, "the error ends with the pause");
+        let saved: Cooldowns = serde_json::from_slice(&serde_json::to_vec(&pool.cooldowns()).unwrap()).unwrap();
+        assert_eq!(saved.0[&acct.id].credit, Some(until));
+        // A fresh process restores it; a shorter saved pause never cuts a longer one short.
+        acct.state.lock().credit_until = None;
+        pool.restore_cooldowns(&saved);
+        assert_eq!(acct.state.lock().credit_until, Some(until));
+        let mut shorter = saved.clone();
+        shorter.0.get_mut(&acct.id).unwrap().credit = Some(until - chrono::Duration::minutes(30));
+        pool.restore_cooldowns(&shorter);
+        assert_eq!(acct.state.lock().credit_until, Some(until));
+        // Older state files without the field still load.
+        let old: Cooldowns = serde_json::from_str(&format!(r#"{{"{}":{{"rate":{{}}}}}}"#, acct.id)).unwrap();
+        assert_eq!(old.0[&acct.id].credit, None);
+        let mut st = acct.state.lock();
+        st.credit_until = None;
+        assert!(st.pauses(Utc::now()).is_empty());
     }
 
     #[test]

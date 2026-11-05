@@ -645,6 +645,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         } else if st.quota_refreshing
             || st.cooldowns.get("*").is_some_and(|t| *t > chrono::Utc::now())
             || st.quota_cooldowns.get("*").is_some_and(|t| *t > chrono::Utc::now())
+            || st.credit_until.is_some_and(|t| t > chrono::Utc::now())
             || st.quota.exhausted_until("").is_some()
         {
             cooling += 1;
@@ -1004,6 +1005,7 @@ async fn reset_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
     let mut st = acct.state.lock();
     st.cooldowns.clear();
     st.quota_cooldowns.clear();
+    st.credit_until = None;
     st.strikes = 0;
     st.clear_error();
     drop(st);

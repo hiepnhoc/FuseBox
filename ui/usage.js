@@ -103,6 +103,9 @@ const Usage = {
   summary: null, status: null,
   loading: false, loaded: false, error: '', actionError: '', busy: false,
   sequence: 0, credential: null, confirm: null, roots: {}, collectorDraft: '', rows: [],
+  // A price sync: the plan models.dev gave (null until checked), whether a check is in
+  // flight, and the last applied result.
+  sync: null, syncBusy: false, syncDone: null,
 };
 const ux = UsageTools.escape;
 const usageCount = (value) => value == null ? 'Unknown' : new Intl.NumberFormat('en-US').format(value);
@@ -390,6 +393,7 @@ function usageDrawerHTML() {
         ${usageDatabaseHTML(status?.database)}
         ${gaps || health.recovery_warning ? `<div class="notice warn"><span class="dot s7 warn"></span><span class="grow">${ux(gapText)}${health.recovery_warning ? `${gaps ? ' ' : ''}An earlier or concurrent writer may have left usage uncommitted.` : ''}</span></div>` : ''}
         <span class="meta">Proxy records count once they are committed to disk. Gaps and writer errors can make totals incomplete.</span></div>
+      ${usagePricesHTML(status)}
       <div class="block"><span class="label">LOCAL HISTORY IMPORTS</span><span class="meta">Reads usage metadata from Claude Code or Codex history on this server and rescans about every 30 seconds. Each record keeps the time it happened, not the time it was imported. No transcript content is stored.</span>${['claude_code', 'codex'].map(usageImportHTML).join('')}</div>
       <div class="block"><span class="label">COLLECTORS</span><span class="meta">Send usage metadata from another machine. Each credential is shown once. Last contact is a health signal; last sync reports durable ingestion.</span>
         <form id="usage-enroll" class="u-inline"><input name="label" type="${S.private ? 'password' : 'text'}" value="${S.private ? '' : ux(Usage.collectorDraft)}" placeholder="${S.private ? 'Label hidden' : 'Label, e.g. Work laptop'}" aria-label="Collector label" maxlength="120" required autocomplete="off"${Usage.busy ? ' disabled' : ''}><button class="btn" type="submit"${Usage.busy ? ' disabled' : ''}>Enroll collector</button></form>
@@ -397,6 +401,35 @@ function usageDrawerHTML() {
         <div class="u-collectors">${(status?.collectors || []).map(usageCollectorHTML).join('') || '<p class="meta">No collectors enrolled.</p>'}</div></div>
     </div>
   </aside>`;
+}
+// A list price in USD per million tokens, as models.dev and the catalogue state them.
+const usagePerM = (v) => v == null ? '—' : Number(v) === 0 ? '$0' : `$${Number(v) < 0.01 ? Number(v).toFixed(4) : Number(v).toFixed(2)}`;
+function usagePriceEntryHTML(e) {
+  const cache = [e.cache_read != null ? `read ${usagePerM(e.cache_read)}` : '', e.cache_write != null ? `write ${usagePerM(e.cache_write)}` : ''].filter(Boolean).join(', ');
+  return `<span class="mono">${ux(usagePerM(e.input))} in · ${ux(usagePerM(e.output))} out</span>${cache ? `<span class="dim"> · cache ${ux(cache)}</span>` : ''}${e.long_context ? '<span class="dim"> · long-context tier</span>' : ''}${e.free ? '<span class="dim"> · free</span>' : ''}`;
+}
+// Which models have prices, and what a sync from models.dev would add. The release's
+// own rates are never replaced; synced ones only price models it has none for.
+function usagePricesHTML(status) {
+  const bundled = status?.pricing || {}, synced = status?.pricing_sync || {}, plan = Usage.sync, done = Usage.syncDone;
+  const have = `Release catalogue ${ux(bundled.version || 'unknown')} · ${usageCount(bundled.rate_count ?? 0)} rates${synced.synced ? ` · synced from models.dev ${ux(synced.verified_at || '')} · ${usageCount(synced.rate_count)} rates` : ' · no synced prices yet'}${synced.error ? ` · <span class="err">synced file unreadable</span>` : ''}`;
+  const rows = (list, before) => list.slice(0, 40).map((x) => { const e = before ? x.entry : x; return `<div class="u-price"><span class="u-strong">${ux(usageProvName(e.provider))}</span><span class="mono">${ux(e.model)}</span>${before ? `<span class="dim">was ${ux(usagePerM(x.before.input))} in · ${ux(usagePerM(x.before.output))} out → </span>` : ''}${usagePriceEntryHTML(e)}</div>`; }).join('') + (list.length > 40 ? `<p class="meta">…and ${usageCount(list.length - 40)} more.</p>` : '');
+  let body = '';
+  if (plan) {
+    const providers = (plan.providers || []).map((p) => `${ux(p.label)} (${usageCount(p.models)})`).join(', ');
+    const changes = Number(plan.changes || 0);
+    body = `<div class="u-plan" role="status">
+      <span class="meta">${providers ? `Providers with an account here that models.dev lists: ${providers}.` : 'No account here matches a provider models.dev lists.'}${plan.bundled ? ` ${usageCount(plan.bundled)} of their models are priced by the release and left alone.` : ''}${plan.unchanged ? ` ${usageCount(plan.unchanged)} synced prices are unchanged.` : ''}</span>
+      ${changes ? `${plan.added?.length ? `<span class="u-strong">${usageCount(plan.added.length)} to add</span>${rows(plan.added)}` : ''}${plan.changed?.length ? `<span class="u-strong">${usageCount(plan.changed.length)} changed</span>${rows(plan.changed, true)}` : ''}` : '<span class="u-strong">Nothing to add.</span>'}
+      <div class="u-actions">${changes ? usageButton('sync-apply', `Apply ${usageCount(changes)} ${changes === 1 ? 'price' : 'prices'}`, '', false, 'btn sm') : ''}${usageButton('sync-dismiss', changes ? 'Cancel' : 'Dismiss', '', false, 'btn sm ghost')}</div></div>`;
+  } else if (done) {
+    body = `<p class="meta" role="status">Saved ${usageCount(done.changes)} ${done.changes === 1 ? 'price' : 'prices'}; ${done.repriced ? `${usageCount(done.repriced)} earlier unpriced calls now have an estimate` : 'no earlier calls needed repricing'}. Catalogue ${ux(done.catalogue_version || '')}.</p>`;
+  }
+  return `<div class="block"><span class="label">PRICES</span><span class="meta">Each call's cost is estimated from the catalogue's list prices. Models it doesn't know show as unpriced. A sync reads models.dev for the providers with an account here and shows what it would add before anything is saved.</span>
+    <span class="meta">${have}</span>
+    ${body}
+    ${plan ? '' : `<div class="u-actions">${usageButton('sync-check', Usage.syncBusy ? 'Checking…' : 'Check models.dev', '', Usage.syncBusy, 'btn sm')}</div>`}
+  </div>`;
 }
 // The usage database on disk (null while it is off): its size, how fast it grows, the
 // disk space left under it, and whether older records are being compressed.
@@ -571,6 +604,14 @@ async function usageMutate(path, body, after) {
   } catch (e) { Usage.actionError = e.message; }
   finally { Usage.busy = false; usageRender(); }
 }
+// Asks what a price sync would change; nothing is saved until Apply.
+async function usageSyncCheck() {
+  if (Usage.syncBusy) return;
+  Usage.syncBusy = true; Usage.sync = null; Usage.syncDone = null; Usage.actionError = ''; usageRender(undefined, ['drawer']);
+  try { Usage.sync = await api('/usage/pricing/sync'); }
+  catch (e) { Usage.actionError = e.message === 'locked' ? 'Management authentication required.' : e.message; }
+  finally { Usage.syncBusy = false; usageRender('[data-usage-act="sync-apply"], [data-usage-act="sync-dismiss"], [data-usage-act="sync-check"]', ['drawer']); }
+}
 let usageDrawerOpener = null;
 function usageOpenDrawer() {
   usageDrawerOpener = document.activeElement;
@@ -688,6 +729,9 @@ if (typeof document !== 'undefined') {
       const c = Usage.confirm; Usage.confirm = null;
       return usageMutate(`/usage/collectors/${encodeURIComponent(c.id)}/${c.action}`, null, (r) => { if (c.action === 'rotate') { Usage.credential = r.credential || null; Usage.credentialFor = c.label; } });
     }
+    if (act === 'sync-check') return usageSyncCheck();
+    if (act === 'sync-dismiss') { Usage.sync = null; return usageRender('[data-usage-act="sync-check"]', ['drawer']); }
+    if (act === 'sync-apply') return usageMutate('/usage/pricing/sync', null, (r) => { Usage.sync = null; Usage.syncDone = r; });
     if (act === 'dismiss-credential') { Usage.credential = null; Usage.credentialFor = null; return usageRender('#usage-enroll input'); }
     if (act === 'copy-credential') navigator.clipboard.writeText(Usage.credential).then(() => toast('Enrollment credential copied')).catch(() => { Usage.actionError = 'Clipboard unavailable. Turn privacy off and select the credential to copy it.'; usageRender(); });
   });

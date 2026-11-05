@@ -73,11 +73,13 @@ impl App {
         // Tests opt in with an explicit isolated database; never touch a user's default DB.
         let usage_enabled = cfg.usage.enabled && (!cfg!(test) || cfg.usage.database.is_some());
         let (usage, usage_error) = if usage_enabled {
-            match crate::usage::store::Store::open(
-                &crate::usage::database_path(&cfg, &cfg_path),
+            let database = crate::usage::database_path(&cfg, &cfg_path);
+            match crate::usage::store::Store::open_with(
+                &database,
                 cfg.usage.queue_capacity,
                 cfg.usage.retention_days,
                 cfg.usage.pricing_overrides.as_deref().map(std::path::Path::new),
+                Some(&crate::usage::sync::supplement_beside(&database)),
             ) {
                 Ok(store) => (Some(store), None),
                 Err(_) => {
@@ -434,6 +436,9 @@ pub struct RequestLog {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// Provider credits the response consumed (Kiro), when reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<f64>,
     /// Whether provider usage is final, an observed lower bound, or absent.
     pub usage_completeness: &'static str,
     pub failure_kind: Option<&'static str>,
@@ -624,6 +629,7 @@ mod tests {
             input_tokens: tokens,
             output_tokens: 2,
             cache_tokens: 3,
+            credits: None,
             usage_completeness: "complete",
             failure_kind: None,
             stream: true,

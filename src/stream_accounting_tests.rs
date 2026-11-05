@@ -55,6 +55,43 @@ fn tracker(format: Format) -> (Arc<App>, Tracker) {
     (app, tracker)
 }
 
+#[tokio::test]
+async fn a_success_without_any_usage_report_is_estimated_locally() {
+    let (app, mut tracker) = tracker(Format::Chat);
+    tracker.estimate_prompt(&json!({"messages":[{"role":"user","content":"hello there, how are you today?"}]}));
+    let tap = tracker.usage_tap().unwrap();
+    tracker.observe_stream_event(&Event::Text("Hello! I am ".into()));
+    tracker.observe_stream_event(&Event::Text("doing well, thank you.".into()));
+    tracker.observe_stream_event(&Event::Finish(Finish::Stop));
+    tracker.finish_stream();
+    let o = tap.snapshot(None, None, false);
+    assert_eq!(o.completeness, "partial");
+    assert_eq!(o.tokens.input, Some(o.numeric_metadata["estimated_input_tokens"]));
+    assert_eq!(o.tokens.output, Some(o.numeric_metadata["estimated_output_tokens"]));
+    assert!(o.tokens.input.unwrap() > 0 && o.tokens.output.unwrap() > 0);
+    assert_eq!(app.stats.recent.lock()[0].usage_completeness, "partial");
+
+    // A stream that ends in an error, or one that reported usage, is not estimated.
+    let (_app, mut tracker) = self::tracker(Format::Chat);
+    tracker.estimate_prompt(&json!({"messages":[{"role":"user","content":"hi"}]}));
+    let tap = tracker.usage_tap().unwrap();
+    tracker.observe_stream_event(&Event::Text("partial".into()));
+    tracker.observe_stream_event(&Event::Error { status: 502, message: "upstream".into() });
+    tracker.finish_stream();
+    assert_eq!(tap.snapshot(None, None, false).completeness, "missing");
+    let (_app, mut tracker) = self::tracker(Format::Chat);
+    tracker.estimate_prompt(&json!({"messages":[{"role":"user","content":"hi"}]}));
+    let tap = tracker.usage_tap().unwrap();
+    tracker.observe_stream_event(&Event::Text("partial".into()));
+    let usage = Usage { input: 5, output: 1, ..Default::default() };
+    tracker.observe_stream_event(&Event::Usage(usage.clone()));
+    tracker.observe_stream_event(&Event::Finish(Finish::Stop));
+    tracker.finish_stream();
+    let o = tap.snapshot(Some(200), Some(&usage), false);
+    assert_eq!((o.tokens.input, o.tokens.output), (Some(5), Some(1)));
+    assert!(!o.numeric_metadata.contains_key("estimated_input_tokens"));
+}
+
 fn recorded(app: &App, status: u16, input: u64, output: u64, cache: u64) -> RequestLog {
     let recent = app.stats.recent.lock();
     assert_eq!(recent.len(), 1);

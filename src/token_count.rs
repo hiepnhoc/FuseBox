@@ -11,7 +11,7 @@ use serde_json::Value;
 const IMAGE_ALLOWANCE: u64 = 1600;
 const OTHER_MEDIA_ALLOWANCE: u64 = 2048;
 
-fn text_tokens(text: &str) -> u64 {
+pub fn text_tokens(text: &str) -> u64 {
     let mut ascii = 0u64;
     let mut non_ascii = 0u64;
     for ch in text.chars() {

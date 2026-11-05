@@ -473,3 +473,40 @@ test('cache write lifetimes are independent subsets and unknown history stays ex
   assert.match(html, /Cache write lifetimes: 100 \(30 min\), 200 \(12 hr\)/);
   assert.doesNotMatch(html, /5 min|1 hr/);
 });
+
+test('the prices block shows what a models.dev sync would add, and applies it', async () => {
+  const d = dashboard();
+  d.seed({ loaded: true, drawerOpen: true, status: { health: {}, imports: [], collectors: [], pricing: { version: '2026-10-27.2', rate_count: 30 }, pricing_sync: { synced: false, rate_count: 0 } } });
+  let html = d.run('usageDrawerHTML()');
+  assert.match(html, /PRICES/);
+  assert.match(html, /Release catalogue 2026-10-27\.2 · 30 rates · no synced prices yet/);
+  assert.match(html, /data-usage-act="sync-check"/);
+  assert.doesNotMatch(html, /sync-apply/);
+  // The check asks the server and shows the plan without saving anything.
+  const calls = [];
+  d.context.api = async (endpoint, opts) => { calls.push([endpoint, opts?.method || 'GET']); return { providers: [{ provider: 'openai-compat', source: 'opencode', label: 'opencode', models: 2 }], added: [{ provider: 'openai-compat', model: 'glm-5.3', input: 1.4, output: 4.4, cache_read: 0.26, cache_write: null, free: false, long_context: false }, { provider: 'openai-compat', model: 'big-pickle', input: 0, output: 0, cache_read: 0, cache_write: 0, free: true, long_context: false }], changed: [], bundled: 1, unchanged: 0, kept: 0, changes: 2 }; };
+  await d.run('usageSyncCheck()');
+  assert.deepEqual(calls, [['/usage/pricing/sync', 'GET']]);
+  html = d.run('usageDrawerHTML()');
+  assert.match(html, /opencode \(2\)/);
+  assert.match(html, /1 of their models are priced by the release and left alone/);
+  assert.match(html, /glm-5\.3<\/span><span class="mono">\$1\.40 in · \$4\.40 out<\/span><span class="dim"> · cache read \$0\.26<\/span>/);
+  assert.match(html, /big-pickle.*\$0 in · \$0 out.* · free/);
+  assert.match(html, /data-usage-act="sync-apply"[^>]*>Apply 2 prices</);
+  assert.doesNotMatch(html, /sync-check/, 'one plan at a time');
+  // A plan with nothing new offers only to dismiss.
+  d.seed({ sync: { providers: [{ label: 'OpenAI', models: 5 }], added: [], changed: [], bundled: 5, unchanged: 0, kept: 0, changes: 0 } });
+  html = d.run('usageDrawerHTML()');
+  assert.match(html, /Nothing to add\./);
+  assert.doesNotMatch(html, /sync-apply/);
+  // Applying posts, then reports what was saved and repriced.
+  d.seed({ sync: { changes: 2, added: [], changed: [], providers: [] } });
+  calls.length = 0;
+  d.context.api = async (endpoint, opts) => { calls.push([endpoint, opts?.method || 'GET']); return endpoint === '/usage/pricing/sync' ? { applied: true, changes: 2, repriced: 7, catalogue_version: '2026-10-27.2+models.dev-2026-10-29' } : { health: {}, pricing_sync: { synced: true, rate_count: 2, verified_at: '2026-10-29' }, pricing: { version: '2026-10-27.2', rate_count: 30 } }; };
+  await d.run('usageMutate("/usage/pricing/sync", null, (r) => { Usage.sync = null; Usage.syncDone = r; })');
+  assert.equal(calls[0][1], 'POST');
+  html = d.run('usageDrawerHTML()');
+  assert.match(html, /Saved 2 prices; 7 earlier unpriced calls now have an estimate\. Catalogue 2026-10-27\.2\+models\.dev-2026-10-29\./);
+  assert.match(html, /synced from models\.dev 2026-10-29 · 2 rates/);
+  assert.match(html, /data-usage-act="sync-check"/, 'ready for the next check');
+});

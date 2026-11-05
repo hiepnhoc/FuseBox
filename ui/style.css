@@ -426,6 +426,8 @@ html.ios-pull-refresh, .ios-pull-refresh body { overscroll-behavior-y: none; }
 .pct.warn { color: var(--warn); }
 .pct.err { color: var(--err); }
 .rst { width: 10ch; flex: none; font: 400 11px/1 var(--mono); color: var(--fg-3); white-space: nowrap; }
+.mrow.has-amt { flex-wrap: wrap; }
+.mrow .rst.amt { width: 100%; padding-left: 30px; }
 .acct-table .segs { max-width: 140px; min-width: 56px; }
 .mini-meters { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .mini-meters .mrow { gap: 6px; }
@@ -1276,6 +1278,10 @@ details[open] > summary .cfg-chevron { transform: rotate(90deg); }
 .u-inline input { flex: 1; }
 .u-inline input[name="label"] { font: 400 13px var(--sans); }
 .u-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.u-plan { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; padding: 11px 13px; border: 1px solid var(--line-strong); border-radius: 6px; font-size: 13px; }
+.u-plan .u-strong { margin-top: 4px; }
+.u-price { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-size: 12.5px; padding: 3px 0; border-top: 1px solid var(--line); }
+.u-price .u-strong { min-width: 72px; }
 .u-collectors { display: flex; flex-direction: column; }
 .u-collector { display: flex; flex-direction: column; gap: 5px; padding: 12px 0; border-top: 1px solid var(--line); }
 .u-collector.faded { opacity: 1; }

@@ -880,6 +880,7 @@ function acctState(a) {
     const [model, until] = cds[0];
     const kind = (a.cooldown_kinds || {})[model] || 'rate_limit';
     if (kind === 'quota' && model === '*' && a.quota_reset_unknown) return { cls: 'cooling', dot: 'warn', word: 'Quota used up', model, until, kind, resetUnknown: true };
+    if (kind === 'credit') return { cls: 'cooling', dot: 'err', word: 'Out of credit', model, until, kind, html: `Out of credit · ${liveLeft(until)}` };
     return { cls: 'cooling', dot: 'warn', word: 'Cooling', model, until, kind, html: `Cooling ${liveLeft(until)}` };
   }
   if (a.last_error) return { cls: 'error', dot: 'err', word: 'Error', signin: a.kind !== 'api-key' && SIGNIN_ERR.test(a.last_error) };
@@ -1003,13 +1004,24 @@ function pctHTML(w) {
   return `<span class="pct ${q.cls}">${quotaPercent(q[S.quotaDisplay])}</span>`;
 }
 
+// A window's absolute amounts, when the provider reports them beside the percent
+// (Kiro: credits used of the month's allowance). Informative limits carry no percent.
+function windowAmount(a, w) {
+  if (!w) return '';
+  const l = (a.quota?.limits || []).find((l) => l.scope?.kind === 'account' && l.used_percent == null && l.used != null && l.limit != null && (!l.resets_at || !w.resets_at || l.resets_at === w.resets_at));
+  if (!l) return '';
+  const amount = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  return `${amount(l.used)} / ${amount(l.limit)}${l.unit ? ` ${l.unit}` : ''}`;
+}
+
 // One meter row: "5H [segments] 47% ↺ 2h 14m"; full reset time on hover.
 function meterRowHTML(a, short) {
   const w = windowOf(a, short);
   const label = windowLabel(w, short);
   const reset = w && w.resets_at ? `↺ ${liveLeft(w.resets_at, true)}` : '';
   const title = w && w.resets_at ? ` title="${esc(windowTitle(w))} window resets ${esc(fullResetTime(w.resets_at))}"` : '';
-  return `<div class="mrow"><span class="capsm">${esc(label)}</span>${segsHTML(w, `${windowTitle(w || { name: short ? '5h' : 'week' })}`)}${pctHTML(w)}<span class="rst"${title}>${reset}</span></div>`;
+  const amount = windowAmount(a, w);
+  return `<div class="mrow${amount ? ' has-amt' : ''}"><span class="capsm">${esc(label)}</span>${segsHTML(w, `${windowTitle(w || { name: short ? '5h' : 'week' })}`)}${pctHTML(w)}<span class="rst"${title}>${reset}</span>${amount ? `<span class="rst amt">${esc(amount)}</span>` : ''}</div>`;
 }
 const metersHTML = (a) => `<div class="meters">${!a.quota?.windows?.length && a.quota?.limits?.length ? quotaLimitsHTML(a, true) : `${meterRowHTML(a, true)}${meterRowHTML(a, false)}`}</div>`;
 
@@ -1064,6 +1076,8 @@ function windowBlockHTML(a, w, title, size) {
   let note = 'Not reported yet';
   if (w && w.resets_at) note = `${q && (q.exhausted || spent) ? 'Back' : 'Resets'} ${esc(when(w.resets_at))} · in ${liveLeft(w.resets_at)}`;
   else if (q) note = 'No reset time reported';
+  const amount = windowAmount(a, w);
+  if (amount) note = `${esc(amount)} · ${note}`;
   const big = size === 'xl';
   return `<div class="window"><div class="window-top"><span>${title}${big ? ' window' : ''}</span>${q ? `<span class="pct ${q.cls}${big ? ' big' : ''}" style="width:auto">${quotaPercent(q[S.quotaDisplay])}</span>` : '<span class="dim">–</span>'}</div>
     ${segsHTML(w, `${title} window`, size === 'xl' ? 'xl' : 'lg')}<span class="note">${note}</span>${usedByHTML(a, w)}</div>`;
@@ -1172,6 +1186,9 @@ function alertsList() {
       const others = S.overview?.session_affinity && accounts.some((x) => x.id !== a.id && x.provider === a.provider && acctState(x).cls === 'ready');
       out.push({ lvl: 'warn', id: a.id, title: `${spent ? windowTitle(spent) : 'Usage'} limit used up`,
         detail: `${st.resetUnknown ? 'Provider did not report a reset time. Refresh quota to check availability.' : `Back at ${when(back)}, in ${left(back)}.`}${others ? ` Its sessions moved to another ${provName(a)} account.` : ''}`, act: 'View' });
+    } else if (st.cls === 'cooling' && st.kind === 'credit') {
+      out.push({ lvl: 'err', id: a.id, title: 'Out of credit',
+        detail: `${provName(a)} says this key has no credit left. Other accounts answer for it; it is tried again at ${when(st.until)}, in ${left(st.until)}. Top it up, or remove the key.`, act: 'View' });
     } else if (st.cls === 'cooling' && st.kind === 'rate_limit') {
       out.push({ lvl: 'warn', id: a.id, title: 'Rate limited',
         detail: `${st.model === '*' ? 'Every model' : st.model} is paused until ${when(st.until)}, in ${left(st.until)}.`, act: 'View' });
@@ -1672,6 +1689,7 @@ const ROUTING_REASON = {
   new_session: 'New session',
   session_reused: 'Same session',
   quota_exhausted: 'Moved: quota used up',
+  out_of_credit: 'Moved: key out of credit',
   account_disabled: 'Moved: account disabled',
   account_removed: 'Moved: account removed',
   model_unavailable: 'Moved: model not served',
@@ -1716,6 +1734,7 @@ function whySentence(r) {
     session_reused: 'Stayed on the account this session is pinned to, so its prompt cache keeps working.',
     temporary_detour: 'The session’s account was busy, so this one request used another. The session stays pinned to its account.',
     quota_exhausted: 'The session’s account ran out of quota, so the session moved here and stays here. Its prompt cache starts cold.',
+    out_of_credit: 'The session’s key has no credit left at its provider, so the session moved here and stays here. Its prompt cache starts cold.',
     account_disabled: 'The session’s account was disabled, so the session moved here and stays here. Its prompt cache starts cold.',
     account_removed: 'The session’s account was removed, so the session moved here and stays here. Its prompt cache starts cold.',
     model_unavailable: 'The session’s account doesn’t serve this model, so the session moved here and stays here.',
@@ -1780,9 +1799,12 @@ function tokensText(r, field) {
   return `<span title="${Number(r[field] || 0).toLocaleString('en-US')} reported tokens${partial ? '; partial usage, total consumption is unknown' : ''}">${partial ? '≥' : ''}${fmt(r[field] || 0)}</span>`;
 }
 
+// Provider credits (Kiro meters each response in credits of its monthly allowance).
+const creditsText = (r) => typeof r.credits === 'number' && r.credits > 0 ? ` · ${r.credits.toLocaleString('en-US', { maximumFractionDigits: 3 })} credits` : '';
+
 function requestTokensHTML(r) {
-  if (usageState(r) === 'missing') return '<span class="dim">Unknown · provider usage not reported</span>';
-  return `${tokensText(r, 'input_tokens')} in · ${tokensText(r, 'output_tokens')} out · ${tokensText(r, 'cache_tokens')} cached${usageState(r) === 'partial' ? ' · partial usage' : ''}`;
+  if (usageState(r) === 'missing') return `<span class="dim">Unknown · provider usage not reported</span>${creditsText(r)}`;
+  return `${tokensText(r, 'input_tokens')} in · ${tokensText(r, 'output_tokens')} out · ${tokensText(r, 'cache_tokens')} cached${usageState(r) === 'partial' ? ' · partial usage' : ''}${creditsText(r)}`;
 }
 
 function recentRowHTML(r) {
@@ -1881,7 +1903,7 @@ function drawerHTML(a) {
       <button class="close-btn" type="button" data-act="close-drawer"><kbd class="kbd">Esc</kbd>Close</button></div>
     <div class="drawer-body">
       <div class="statline">${statusHTML(a)}<span class="dim">· last used ${liveAgo(a.last_used)}</span></div>
-      ${st.cls === 'cooling' ? `<div class="notice warn"><div class="cell2"><span class="mono">${esc(modelScope(st.model))}</span><span class="small warn">${st.kind === 'quota' ? 'Usage limit used up' : 'Cooling down'} · ${st.resetUnknown ? 'Reset time unknown' : `back at ${esc(when(st.until))}, in ${liveLeft(st.until)}`}</span></div><button class="btn sm" type="button" data-act="reset" data-id="${esc(a.id)}">Clear cooldowns</button></div>` : ''}
+      ${st.cls === 'cooling' ? `<div class="notice warn"><div class="cell2"><span class="mono">${esc(modelScope(st.model))}</span><span class="small warn">${st.kind === 'quota' ? 'Usage limit used up' : st.kind === 'credit' ? 'Out of credit' : 'Cooling down'} · ${st.resetUnknown ? 'Reset time unknown' : `back at ${esc(when(st.until))}, in ${liveLeft(st.until)}`}</span></div><button class="btn sm" type="button" data-act="reset" data-id="${esc(a.id)}">Clear cooldowns</button></div>` : ''}
       ${hasQuota ? `<div class="block" style="gap:14px"><span class="label">Limits · ${quotaWord()}</span>${quotaWindowsHTML(a, 'lg')}${quotaLimitsHTML(a)}</div>` : ''}
       ${windowStarterHTML(a)}
       ${banked && (count || ['pending', 'unknown'].includes(banked.operation?.status)) ? `<div class="notice"><div class="cell2"><span style="font-size:13px">${esc(bankedLabel(a))}</span><span class="small dim">${esc(bankedPolicyText(a))}</span></div><button class="btn sm" type="button" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog">Reset details</button></div>` : ''}

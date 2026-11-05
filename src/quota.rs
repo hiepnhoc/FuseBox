@@ -582,10 +582,11 @@ fn apply_reading(st: &mut crate::accounts::AccountState, reading: Reading) {
     st.settle_quota_error(Utc::now());
 }
 
-/// Kiro reports one monthly credit window and no per-model limits.
+/// Kiro reports one monthly credit window and no per-model limits; the same
+/// reading also carries the credits as absolute amounts, for display.
 fn kiro_reading(value: &Value) -> Reading {
     let (windows, plan) = crate::kiro::windows(value);
-    Reading { windows, limits: Vec::new(), plan }
+    Reading { windows, limits: crate::kiro::limits(value), plan }
 }
 
 pub fn usage(st: &mut crate::accounts::AccountState, provider: Provider, value: &Value) {

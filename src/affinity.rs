@@ -630,6 +630,10 @@ impl Sessions {
                 (None, _) => moving = Some("account_removed"),
                 (Some(acct), _) if acct.state.lock().disabled => moving = Some("account_disabled"),
                 (Some(_), None) => moving = Some("model_unavailable"),
+                (Some(acct), Some(_)) if acct.credit_paused() => {
+                    moving = Some("out_of_credit");
+                    paused = paused_until(acct, model, exclude);
+                }
                 (Some(acct), Some(_)) if acct.exhausted_until(model).is_some() => {
                     moving = Some("quota_exhausted");
                     paused = paused_until(acct, model, exclude);
@@ -859,7 +863,12 @@ impl Sessions {
         let writer = self.persistence.as_ref()?;
         if matches!(
             selected.reason,
-            "new_session" | "quota_exhausted" | "account_removed" | "account_disabled" | "model_unavailable"
+            "new_session"
+                | "quota_exhausted"
+                | "out_of_credit"
+                | "account_removed"
+                | "account_disabled"
+                | "model_unavailable"
         ) {
             Some(writer.flush())
         } else if matches!(selected.reason, "session_reused" | "temporary_detour") {
@@ -1268,6 +1277,23 @@ mod tests {
             a.state.lock().cooldowns.clear();
             assert_eq!(pick().id, b.id);
         }
+    }
+
+    #[test]
+    fn a_key_out_of_credit_moves_its_sessions_and_says_why() {
+        let cfg = config(Routing::LeastUsed);
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let sessions = Sessions::memory();
+        let pick = || sessions.pick_with_reason(&pool, &cfg, "gpt-6.1-sol", Some("task"), &[], None).unwrap();
+        let first = pick();
+        first.account.out_of_credit(Utc::now() + Duration::hours(1), "out of credit: Insufficient credits");
+        let moved = pick();
+        assert_eq!(moved.reason, "out_of_credit");
+        assert_eq!(moved.previous_account.as_deref(), Some(first.account.id.as_str()));
+        assert_ne!(moved.account.id, first.account.id);
+        assert_eq!(pick().reason, "session_reused", "and it stays on the account that has money");
+        assert_eq!(pick().account.id, moved.account.id);
     }
 
     #[test]

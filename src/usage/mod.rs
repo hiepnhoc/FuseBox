@@ -6,6 +6,7 @@ pub mod imports;
 pub mod keeper;
 pub mod pricing;
 pub mod store;
+pub mod sync;
 pub mod types;
 
 pub fn database_path(cfg: &crate::config::Config, config_path: &std::path::Path) -> std::path::PathBuf {

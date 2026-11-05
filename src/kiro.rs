@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::accounts::{Credential, OAuth};
 use crate::device::Signed;
 use crate::ir::{Event, Finish, Image, Part, Request, Role, Usage};
-use crate::quota::Window;
+use crate::quota::{Limit, Scope, Window};
 use crate::upstream::{Prepared, Target};
 
 /// Where sign-ins go by default; the data plane follows the profile.
@@ -890,15 +890,13 @@ impl Decoder {
             return;
         }
         let input = self.context_pct.map(|p| (p.max(0.0) / 100.0 * context_window(&self.model) as f64) as u64);
-        if input.is_some() || self.output_chars > 0 {
+        if input.is_some() || self.output_chars > 0 || self.credits > 0.0 {
             out.push(Event::Usage(Usage {
                 input: input.unwrap_or(0),
                 output: self.output_chars.div_ceil(4),
+                credits: (self.credits > 0.0).then_some(self.credits),
                 ..Default::default()
             }));
-        }
-        if self.credits > 0.0 {
-            tracing::debug!(model = %self.model, credits = self.credits, "kiro metering");
         }
         let reason = self.stop_reason.as_deref().unwrap_or_default().to_ascii_lowercase();
         out.push(Event::Finish(match reason.as_str() {
@@ -1391,6 +1389,98 @@ pub fn windows(v: &Value) -> (Vec<Window>, Option<String>) {
     (windows, plan)
 }
 
+/// The same usage response as absolute amounts: the month's credits used of its
+/// allowance, plus any free-trial or bonus credits. Informative only; the month
+/// window above is what routes.
+pub fn limits(v: &Value) -> Vec<Limit> {
+    let number = |b: &Value, precise: &str, plain: &str| b[precise].as_f64().or_else(|| b[plain].as_f64());
+    let at = |v: &Value| {
+        v.as_f64()
+            .map(|s| s as i64)
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .filter(|s| *s > 0)
+            .and_then(|s| DateTime::from_timestamp(s, 0))
+    };
+    // The data plane labels credit meters `unit: INVOCATIONS`; the plan sells credits.
+    let unit = |b: &Value| {
+        let reported = b["unit"].as_str().map(str::trim).filter(|u| !u.is_empty()).map(str::to_ascii_lowercase);
+        let credit = b["resourceType"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("CREDIT")) || reported.is_none();
+        Some(if credit { "credits".into() } else { reported.unwrap_or_default() })
+    };
+    let credits =
+        |id: String, name: String, scope: Scope, b: &Value, precise: bool, resets_at: Option<DateTime<Utc>>| {
+            let (used, limit) = if precise {
+                (
+                    number(b, "currentUsageWithPrecision", "currentUsage"),
+                    number(b, "usageLimitWithPrecision", "usageLimit"),
+                )
+            } else {
+                (b["currentUsage"].as_f64(), b["usageLimit"].as_f64())
+            };
+            let limit = limit.filter(|l| *l > 0.0)?;
+            let used = used.unwrap_or(0.0).max(0.0);
+            Some(Limit {
+                id,
+                name,
+                scope,
+                used_percent: None,
+                used: Some(used),
+                limit: Some(limit),
+                remaining: Some((limit - used).max(0.0)),
+                unit: unit(b),
+                unlimited: None,
+                enabled: None,
+                resets_at,
+            })
+        };
+    let Some(b) = v["usageBreakdownList"].as_array().and_then(|l| l.first()) else { return Vec::new() };
+    let mut out = Vec::new();
+    out.extend(credits(
+        "kiro:credits".into(),
+        "Monthly credits".into(),
+        Scope::Account,
+        b,
+        true,
+        at(&v["nextDateReset"]),
+    ));
+    let trial = &b["freeTrialInfo"];
+    if trial.is_object() {
+        let mut l = credits(
+            "kiro:trial".into(),
+            "Free trial credits".into(),
+            Scope::Credits,
+            trial,
+            false,
+            at(&trial["freeTrialExpiry"]),
+        );
+        if let Some(l) = &mut l
+            && let Some(status) = trial["freeTrialStatus"].as_str()
+        {
+            l.enabled = Some(status.eq_ignore_ascii_case("ACTIVE"));
+        }
+        out.extend(l);
+    }
+    for bonus in b["bonuses"].as_array().into_iter().flatten() {
+        let code = bonus["bonusCode"].as_str().unwrap_or("bonus");
+        let name = bonus["displayName"].as_str().filter(|n| !n.trim().is_empty()).unwrap_or(code);
+        let mut l = credits(
+            format!("kiro:bonus:{code}"),
+            name.to_string(),
+            Scope::Credits,
+            bonus,
+            false,
+            at(&bonus["expiresAt"]),
+        );
+        if let Some(l) = &mut l
+            && let Some(status) = bonus["status"].as_str()
+        {
+            l.enabled = Some(status.eq_ignore_ascii_case("ACTIVE"));
+        }
+        out.extend(l);
+    }
+    out
+}
+
 /// `ListAvailableModels`, as Fusebox names them.
 pub async fn fetch_models(
     http: &reqwest::Client,
@@ -1690,5 +1780,29 @@ mod tests {
         assert!((w[0].used - 57.364).abs() < 0.01);
         assert_eq!(w[0].resets_at.unwrap().timestamp(), 1793491200);
         assert!(windows(&json!({})).0.is_empty());
+    }
+
+    #[test]
+    fn usage_limits_also_list_absolute_credits_trial_and_bonuses() {
+        let v = json!({
+            "usageBreakdownList": [{"resourceType":"CREDIT","currentUsage":183,"usageLimit":2000,
+                "currentUsageWithPrecision":183.04,"usageLimitWithPrecision":2000.0,"unit":"INVOCATIONS",
+                "freeTrialInfo":{"currentUsage":10,"usageLimit":500,"freeTrialStatus":"EXPIRED","freeTrialExpiry":1793491200},
+                "bonuses":[{"bonusCode":"WELCOME","displayName":"Welcome bonus","currentUsage":1,"usageLimit":100,"expiresAt":"1793491200","status":"ACTIVE"}]}],
+            "nextDateReset": 1793491200
+        });
+        let l = limits(&v);
+        assert_eq!(
+            l.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
+            ["kiro:credits", "kiro:trial", "kiro:bonus:WELCOME"]
+        );
+        assert_eq!(l[0].scope, Scope::Account);
+        assert_eq!((l[0].used, l[0].limit, l[0].remaining), (Some(183.04), Some(2000.0), Some(1816.96)));
+        assert_eq!(l[0].unit.as_deref(), Some("credits"));
+        assert_eq!(l[0].used_percent, None, "informative only; the month window routes");
+        assert_eq!(l[0].resets_at.unwrap().timestamp(), 1793491200);
+        assert_eq!((l[1].scope.clone(), l[1].enabled, l[1].limit), (Scope::Credits, Some(false), Some(500.0)));
+        assert_eq!((l[2].name.as_str(), l[2].enabled, l[2].used), ("Welcome bonus", Some(true), Some(1.0)));
+        assert!(limits(&json!({"usageBreakdownList":[{"currentUsage":5}]})).is_empty());
     }
 }

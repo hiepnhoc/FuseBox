@@ -60,6 +60,26 @@ impl Capture {
     pub fn model(&self, model: &str) {
         self.0.lock().observation.actual_model = safe(model);
     }
+    /// A success whose provider reported no usage at all: local estimates of the prompt
+    /// and of the output seen, labelled so. Anything the provider reported is kept.
+    pub fn estimate(&self, input: u64, output: u64, reported: &Usage) {
+        let mut captured = self.0.lock();
+        let o = &mut captured.observation;
+        let reported = reported.input > 0 || reported.output > 0 || reported.cache_read > 0 || reported.cache_write > 0;
+        if o.completeness != "missing" || reported || o.tokens != Tokens::default() {
+            return;
+        }
+        o.tokens = Tokens {
+            input: Some(input),
+            cache_read: Some(0),
+            cache_write: Some(0),
+            output: Some(output),
+            ..Default::default()
+        };
+        o.completeness = "partial".into();
+        o.numeric_metadata.insert("estimated_input_tokens".into(), input);
+        o.numeric_metadata.insert("estimated_output_tokens".into(), output);
+    }
     /// Embeddings have no output or cache token categories. Estimates stay labelled.
     pub fn embedding(&self, tokens: Option<u64>, estimated: bool) {
         let mut captured = self.0.lock();
@@ -208,6 +228,10 @@ fn finalized(mut o: Observation, status: Option<u16>, fallback: Option<&Usage>, 
     }
     if o.status.is_none_or(|s| s >= 400) && o.completeness == "complete" {
         o.completeness = "partial".into();
+    }
+    // Provider credits (Kiro) are a separate measure, kept beside the tokens.
+    if let Some(credits) = fallback.and_then(|u| u.credits).filter(|c| *c > 0.0) {
+        o.numeric_metadata.insert("provider_credits_milli".into(), (credits * 1000.0).round() as u64);
     }
     o
 }
@@ -371,13 +395,16 @@ pub fn observe(o: &mut Observation, v: &Value) {
                 .or_else(|| u.get("cache_creation_input_tokens"));
             // OpenAI omits writes when none were reported (including older
             // models). An explicitly null/invalid value remains unknown, as do
-            // omitted categories from an arbitrary compatible provider.
+            // omitted categories from an arbitrary compatible provider, except that
+            // a compatible provider reporting cache reads in the Chat Completions
+            // shape has no field for writes at all: there, no writes were reported.
             if let (Some(canonical), Some(alias)) = (d.get("cache_write_tokens"), d.get("cache_creation_tokens")) {
                 invalid |= number(canonical) != number(alias);
             }
             let lifetime_details = d.get("cache_write_tokens_details");
+            let writes_omitted = o.provider == "openai" || (o.provider == "openai-compat" && t.cache_read.is_some());
             t.cache_write = write.map(number).unwrap_or_else(|| {
-                (o.provider == "openai" && lifetime_details.is_none()).then_some(0).filter(|_| input.is_some())
+                (writes_omitted && lifetime_details.is_none()).then_some(0).filter(|_| input.is_some())
             });
             // Lifetime metadata is evidence of writes, not evidence that their
             // missing aggregate is zero. Preserve the subsets, with unknown input.
@@ -518,6 +545,49 @@ pub fn observe(o: &mut Observation, v: &Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+    fn capture(provider: &str) -> Capture {
+        let o = Observation::new("proxy", "id".into(), provider, chrono::Utc::now().timestamp_millis());
+        Capture(Arc::new(Mutex::new(Captured { observation: o, failure: None })))
+    }
+    #[test]
+    fn a_local_estimate_fills_only_a_response_that_reported_nothing() {
+        let c = capture("openai-compat");
+        c.estimate(120, 30, &Usage::default());
+        let o = c.snapshot(Some(200), None, true);
+        assert_eq!(
+            (o.tokens.input, o.tokens.cache_read, o.tokens.cache_write, o.tokens.output),
+            (Some(120), Some(0), Some(0), Some(30))
+        );
+        assert_eq!(o.completeness, "partial");
+        assert_eq!(o.numeric_metadata["estimated_input_tokens"], 120);
+        assert_eq!(o.numeric_metadata["estimated_output_tokens"], 30);
+        assert!(o.validate().is_ok());
+        // The provider's own report is never replaced.
+        let c = capture("openai-compat");
+        c.wire(&json!({"usage":{"prompt_tokens":10,"completion_tokens":5}}));
+        c.estimate(120, 30, &Usage::default());
+        let o = c.snapshot(Some(200), None, true);
+        assert_eq!(o.tokens.output, Some(5));
+        assert!(!o.numeric_metadata.contains_key("estimated_input_tokens"));
+        // Neither is usage the translated stream carried.
+        let c = capture("openai-compat");
+        let u = Usage { input: 7, output: 3, ..Default::default() };
+        c.estimate(120, 30, &u);
+        let o = c.snapshot(Some(200), Some(&u), true);
+        assert_eq!((o.tokens.input, o.tokens.output), (Some(7), Some(3)));
+        assert!(!o.numeric_metadata.contains_key("estimated_output_tokens"));
+    }
+    #[test]
+    fn provider_credits_ride_along_as_metadata() {
+        let c = capture("kiro");
+        let u = Usage { input: 1200, output: 40, credits: Some(1.3), ..Default::default() };
+        let o = c.snapshot(Some(200), Some(&u), true);
+        assert_eq!(o.numeric_metadata["provider_credits_milli"], 1300);
+        assert_eq!(o.completeness, "partial");
+        assert!(o.validate().is_ok());
+        let o = capture("kiro").snapshot(Some(200), Some(&Usage::default()), true);
+        assert!(!o.numeric_metadata.contains_key("provider_credits_milli"));
+    }
     #[test]
     fn snapshots_and_subsets() {
         let mut o = Observation::new("proxy", "id".into(), "openai", chrono::Utc::now().timestamp_millis());
@@ -549,6 +619,26 @@ mod tests {
         assert_eq!(o.tokens.input, None);
         assert_eq!(o.numeric_metadata["input_total"], 100);
         assert_eq!(o.completeness, "partial");
+    }
+    #[test]
+    fn a_compatible_provider_reporting_cache_reads_has_no_field_for_writes() {
+        let mut o = Observation::new("proxy", "id".into(), "openai-compat", chrono::Utc::now().timestamp_millis());
+        observe(
+            &mut o,
+            &json!({"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":600},"completion_tokens":100}}),
+        );
+        assert_eq!(
+            (o.tokens.input, o.tokens.cache_read, o.tokens.cache_write, o.tokens.output),
+            (Some(400), Some(600), Some(0), Some(100))
+        );
+        assert_eq!(o.completeness, "complete");
+        // An explicit write count, or an explicitly bad one, is still taken as given.
+        let mut o = Observation::new("proxy", "id".into(), "openai-compat", chrono::Utc::now().timestamp_millis());
+        observe(
+            &mut o,
+            &json!({"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":600,"cache_write_tokens":null},"completion_tokens":100}}),
+        );
+        assert_eq!((o.tokens.input, o.tokens.cache_write), (None, None));
     }
     #[test]
     fn ordinary_openai_usage_without_cache_writes_is_priceable() {

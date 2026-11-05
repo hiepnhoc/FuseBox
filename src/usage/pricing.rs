@@ -4,6 +4,9 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Where a price sync reads its rates; also the provenance every synced rate carries.
+pub const SYNC_SOURCE: &str = "https://models.dev/api.json";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Catalogue {
@@ -100,6 +103,59 @@ impl Catalogue {
             catalogue.version =
                 format!("local:{}:{}", catalogue.version, &hex::encode(Sha256::digest(raw.as_bytes()))[..16]);
         }
+        catalogue.validate()?;
+        Ok(catalogue)
+    }
+
+    /// The bundled or override catalogue plus the rates a price sync saved beside the
+    /// usage database (see `sync.rs`). Synced rates only fill in models the catalogue
+    /// doesn't price; a missing file changes nothing, and an unreadable one is skipped
+    /// with a warning rather than taking usage down.
+    pub fn load_with_supplement(overrides: Option<&Path>, supplement: Option<&Path>) -> Result<Self> {
+        let mut catalogue = Self::load(overrides)?;
+        let Some(path) = supplement.filter(|p| p.exists()) else { return Ok(catalogue) };
+        match Self::read_supplement(path) {
+            Ok(extra) => catalogue.add_supplement(extra)?,
+            Err(e) => tracing::warn!(path = %path.display(), error = %e, "ignoring the synced price file"),
+        }
+        Ok(catalogue)
+    }
+
+    pub fn read_supplement(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).context("read synced prices")?;
+        let extra: Self = serde_json::from_str(&raw).context("parse synced prices")?;
+        if extra.rates.iter().any(|r| r.source_url != SYNC_SOURCE) {
+            bail!("synced prices must come from {SYNC_SOURCE}");
+        }
+        extra.validate()?;
+        Ok(extra)
+    }
+
+    /// Appends the supplement's rates for models this catalogue has no rate for.
+    fn add_supplement(&mut self, extra: Self) -> Result<()> {
+        let added: Vec<Rate> =
+            extra.rates.into_iter().filter(|r| !r.models.iter().any(|m| self.has_rate(&r.provider, m))).collect();
+        if added.is_empty() {
+            return Ok(());
+        }
+        self.rates.extend(added);
+        self.version = format!("{}+{}", self.version, extra.version);
+        self.validate()
+    }
+
+    /// Whether any rate in this catalogue prices the model, in any period.
+    pub fn has_rate(&self, provider: &str, model: &str) -> bool {
+        let wanted = normalize_model(model);
+        self.rates.iter().any(|r| r.provider == provider && r.models.iter().any(|m| normalize_model(m) == wanted))
+    }
+
+    /// The rates a price sync added, as opposed to the release's own.
+    pub fn synced_rates(&self) -> impl Iterator<Item = &Rate> {
+        self.rates.iter().filter(|r| r.source_url == SYNC_SOURCE)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let catalogue = self;
         if catalogue.currency != "USD" {
             bail!("only USD pricing is supported");
         }
@@ -170,7 +226,7 @@ impl Catalogue {
                 }
             }
         }
-        Ok(catalogue)
+        Ok(())
     }
     pub fn price(&self, o: &Observation) -> Snapshot {
         let mut snapshot = Snapshot {
@@ -364,6 +420,13 @@ impl Catalogue {
             "unsupported_rate_or_overflow"
         }
         .into();
+        if snapshot.cost_nanos.is_some()
+            && ["estimated_input_tokens", "estimated_output_tokens"]
+                .iter()
+                .any(|k| o.numeric_metadata.get(*k).is_some_and(|n| *n > 0))
+        {
+            snapshot.basis = "estimated_tokens".into();
+        }
         if self.local_override {
             snapshot.basis = format!("local_override:{}", snapshot.basis);
         }
@@ -399,6 +462,17 @@ pub fn catalogue_info() -> serde_json::Value {
 mod tier_tests {
     use super::*;
     use crate::usage::types::Tokens;
+    #[test]
+    fn locally_estimated_tokens_are_priced_but_labelled() {
+        let c = Catalogue::load(None).unwrap();
+        let mut o = event("openai", "gpt-6.1-sol");
+        o.completeness = "partial".into();
+        o.numeric_metadata.insert("estimated_input_tokens".into(), 1000);
+        o.numeric_metadata.insert("estimated_output_tokens".into(), 100);
+        let p = c.price(&o);
+        assert!(p.cost_nanos.is_some_and(|n| n > 0));
+        assert_eq!(p.basis, "estimated_tokens");
+    }
     fn event(provider: &str, model: &str) -> Observation {
         let mut o = Observation::new("proxy", "pricing-test".into(), provider, date_ms("2026-10-07").unwrap());
         o.actual_model = Some(model.into());

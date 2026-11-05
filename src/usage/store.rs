@@ -76,7 +76,7 @@ pub struct Store {
     shutdown_result: Arc<OnceCell<std::result::Result<(), String>>>,
     session_id: Arc<String>,
     startup_repriced: u64,
-    catalogue: Arc<Catalogue>,
+    catalogue: Arc<arc_swap::ArcSwap<Catalogue>>,
 }
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -171,7 +171,18 @@ impl Health {
     }
 }
 impl Store {
+    #[cfg(test)]
     pub fn open(path: &Path, queue_capacity: usize, retention_days: u32, overrides: Option<&Path>) -> Result<Self> {
+        Self::open_with(path, queue_capacity, retention_days, overrides, None)
+    }
+    /// `open`, plus the prices a sync saved (see `sync.rs`) on top of the catalogue.
+    pub fn open_with(
+        path: &Path,
+        queue_capacity: usize,
+        retention_days: u32,
+        overrides: Option<&Path>,
+        supplement: Option<&Path>,
+    ) -> Result<Self> {
         if !(1..=65_536).contains(&queue_capacity) {
             bail!("usage queue capacity must be 1..65536");
         }
@@ -181,7 +192,7 @@ impl Store {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let catalogue = Catalogue::load(overrides)?;
+        let catalogue = Catalogue::load_with_supplement(overrides, supplement)?;
         Self::start(path, queue_capacity, retention_days, catalogue, None)
     }
     /// Standalone outboxes install their allocation bound before migrations or
@@ -203,7 +214,11 @@ impl Store {
             conn.query_row("SELECT value FROM usage_meta WHERE key='retention_days'", [], |r| r.get(0))?;
         let raw: String = conn.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |r| r.get(0))?;
         let saved: Catalogue = serde_json::from_str(&raw)?;
-        let catalogue = if refresh_rates && !saved.local_override { Catalogue::load(None)? } else { saved };
+        let catalogue = if refresh_rates && !saved.local_override {
+            Catalogue::load_with_supplement(None, Some(&super::sync::supplement_beside(path)))?
+        } else {
+            saved
+        };
         Self::start(path, queue_capacity, retention.parse().context("stored retention invalid")?, catalogue, None)
     }
     fn start(
@@ -407,7 +422,7 @@ impl Store {
             shutdown_result: Arc::new(OnceCell::new()),
             session_id: Arc::new(session_id),
             startup_repriced,
-            catalogue: Arc::new(catalogue),
+            catalogue: Arc::new(arc_swap::ArcSwap::from_pointee(catalogue)),
         })
     }
     /// Rows the startup reprice step updated when this handle opened the database.
@@ -421,7 +436,28 @@ impl Store {
     }
 
     pub fn price(&self, observation: &Observation) -> super::pricing::Snapshot {
-        self.catalogue.price(observation)
+        self.catalogue.load().price(observation)
+    }
+    /// The catalogue pricing new records, as this handle sees it.
+    pub fn catalogue(&self) -> Arc<Catalogue> {
+        self.catalogue.load_full()
+    }
+    /// Prices new records with this catalogue from now on, and gives earlier unpriced
+    /// records another go with it. The written catalogue is what later batches and
+    /// reprices read, so it changes before this handle's copy does.
+    pub async fn replace_catalogue(&self, catalogue: Catalogue) -> Result<u64> {
+        let saved = serde_json::to_string(&catalogue)?;
+        let repriced = self
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO usage_meta(key,value) VALUES('catalogue',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    [saved],
+                )?;
+                reprice(conn)
+            })
+            .await?;
+        self.catalogue.store(Arc::new(catalogue));
+        Ok(repriced)
     }
 
     /// A limit cannot rely on totals if this writer has lost observations.

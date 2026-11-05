@@ -105,6 +105,10 @@ pub struct Tracker {
     batch_completeness: Option<&'static str>,
     /// Keeps the request on the dashboard's connected list until it ends.
     connected: Option<crate::addresses::Guard>,
+    /// Local prompt estimate, for a success whose provider reports no usage at all.
+    input_estimate: Option<u64>,
+    /// Local estimate of the output text, reasoning and tool arguments seen so far.
+    output_estimate: u64,
 }
 
 impl Tracker {
@@ -119,6 +123,8 @@ impl Tracker {
             latency_context: None,
             latency_model: None,
             connected: None,
+            input_estimate: None,
+            output_estimate: 0,
             started: Instant::now(),
             attempt_started: Instant::now(),
             prepared_ms: None,
@@ -157,6 +163,7 @@ impl Tracker {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_tokens: 0,
+                credits: None,
                 stream,
                 transport,
                 attempts: 0,
@@ -189,6 +196,7 @@ impl Tracker {
     }
     fn account_attempt(&mut self, acct: &Arc<Account>) {
         self.cache_diagnostics.reset();
+        self.output_estimate = 0;
         self.load = Some(crate::accounts::RequestLoad::new(acct));
         self.log.attempts += 1;
         self.log.provider = acct.provider.as_str().to_string();
@@ -365,7 +373,16 @@ impl Tracker {
         }
     }
 
+    /// Keep a local estimate of the prompt so a successful response whose provider
+    /// reports no usage at all can still be priced, labelled as an estimate.
+    pub fn estimate_prompt(&mut self, body: &Value) {
+        self.input_estimate = Some(crate::token_count::estimate_tokens(body));
+    }
+
     pub(crate) fn observe_stream_event(&mut self, event: &Event) {
+        if let Event::Text(t) | Event::Reasoning(t) | Event::ToolArgs { delta: t, .. } = event {
+            self.output_estimate = self.output_estimate.saturating_add(crate::token_count::text_tokens(t));
+        }
         match event {
             Event::Usage(usage) => self.stream_usage.merge(usage),
             Event::Error { status, message } => self.stream_error = Some((*status, message.clone())),
@@ -426,6 +443,11 @@ impl Tracker {
                 c.metadata("cache_downgraded", u64::from(p.downgrade_reason.is_some()));
             }
         }
+        if status < 400
+            && let (Some(input), Some(c)) = (self.input_estimate, self.usage_tap())
+        {
+            c.estimate(input, self.output_estimate, usage);
+        }
         let failure = self.usage_tap().and_then(|c| c.failure_detail());
         let captured = self.analytics.as_mut().and_then(|a| a.finish(Some(status), Some(usage), self.logical_final));
         self.log.usage_completeness =
@@ -451,6 +473,7 @@ impl Tracker {
         self.log.input_tokens = input;
         self.log.output_tokens = output;
         self.log.cache_tokens = cache;
+        self.log.credits = usage.credits.filter(|c| *c > 0.0);
         self.log.error = error.map(|e| e.chars().take(400).collect());
         if let Some(a) = &self.acct {
             if let Some(message) = &self.log.error
@@ -614,6 +637,11 @@ fn soft_failure(
 /// A 429 is also used for burst limits. Move a pinned task only when quota
 /// headers or an explicit provider error confirm subscription exhaustion.
 pub fn quota_exhausted(acct: &Account, model: &str, status: u16, body: &str) -> bool {
+    // A key without credit is paused already; its refusal must not be re-read as a
+    // spent allowance when the request's usage is settled.
+    if acct.credit_paused() {
+        return false;
+    }
     if acct.exhausted_until(model).is_some() {
         return true;
     }
@@ -638,6 +666,53 @@ pub fn quota_exhausted(acct: &Account, model: &str, status: u16, body: &str) -> 
     ]
     .iter()
     .any(|s| b.contains(s))
+}
+
+/// A pay-as-you-go key that its provider says has no money left: a 402, or a refusal
+/// about credit, balance or billing. Only API keys: a subscription's "quota" is its
+/// allowance, handled by `quota_exhausted`. Retrying would fail on every account the
+/// same way, so the key sits out for `CREDIT_PAUSE` while other accounts answer.
+pub fn out_of_credit(acct: &Account, status: u16, body: &str) -> bool {
+    if acct.is_oauth() {
+        return false;
+    }
+    if status == 402 {
+        return true;
+    }
+    if !matches!(status, 400 | 401 | 403 | 429) {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    [
+        "credit balance is too low",
+        "insufficient credits",
+        "insufficient_credits",
+        "insufficient balance",
+        "insufficient_balance",
+        "insufficient funds",
+        "insufficient_quota",
+        "exceeded your current quota",
+        "out of credits",
+        "credits exhausted",
+        "no credits",
+        "not enough credits",
+        "add credits",
+        "top up",
+        "payment required",
+        "billing hard limit",
+        "balance is insufficient",
+        "prepaid balance",
+    ]
+    .iter()
+    .any(|s| b.contains(s))
+}
+
+/// How long an out-of-credit key sits out before it is tried again, in case the
+/// account has been topped up since.
+const CREDIT_PAUSE: Duration = Duration::hours(1);
+
+pub fn mark_out_of_credit(acct: &Account, body: &str) {
+    acct.out_of_credit(Utc::now() + CREDIT_PAUSE, &format!("out of credit: {}", error_message(body)));
 }
 
 /// Codex answers "Codex is at capacity, please try again later" with a 429 when OpenAI
@@ -1089,6 +1164,7 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
     let model = app.pool.canonical(&model, only.as_ref());
     let mut tracker = Tracker::new(&app, call.format, call.stream, call.transport, &model);
     tracker.client_app(&call.headers);
+    tracker.estimate_prompt(&call.body);
     tracker.session(call.session.as_deref(), call.session_source, &cfg);
     let requested_cache = crate::cache::Requested::of(&call.body);
     tracker.latency_context = cfg.latency_routing.then(|| crate::latency::Context::new(&call.body, call.transport));
@@ -1557,6 +1633,15 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
             } else {
                 formats::error_body(call.format, status, &msg)
             };
+            if out_of_credit(&acct, status, &text) {
+                tracing::warn!(request_id = tracker.log.id, account = ?crate::diagnostics::fingerprint(Some(&acct.id)),
+                    status, "the key is out of credit; trying another account");
+                mark_out_of_credit(&acct, &text);
+                app.broadcast("accounts", Value::Null);
+                tried.push(acct.id.clone());
+                last_error = Some((status, client_body));
+                continue;
+            }
             if quota_exhausted(&acct, &model, status, &text) {
                 mark_quota_exhausted(&acct, &model, &headers, &text);
                 app.broadcast("accounts", Value::Null);
@@ -1655,7 +1740,9 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
                     if let Some(c) = &tap.usage {
                         c.headers(&HeaderMap::new(), status);
                     }
-                    if status == 429 && quota_exhausted(&acct, &model, status, &message) {
+                    if out_of_credit(&acct, status, &message) {
+                        mark_out_of_credit(&acct, &message);
+                    } else if status == 429 && quota_exhausted(&acct, &model, status, &message) {
                         mark_quota_exhausted(&acct, &model, &reqwest::header::HeaderMap::new(), &message);
                     } else if status == 429 && !at_capacity(status, &message) {
                         acct.rate_limit(&model, Utc::now() + Duration::seconds(30), &format!("429: {message}"));
@@ -1745,7 +1832,10 @@ async fn execute_inner(app: Arc<App>, call: Call, budget: &mut RetryBudget) -> R
             }
             tracker.observe_wire(&v);
             let mut agg = Aggregate::default();
-            checked_full_events(native, &v).iter().for_each(|e| agg.push(e));
+            for e in checked_full_events(native, &v) {
+                tracker.observe_stream_event(&e);
+                agg.push(&e);
+            }
             if let Some((status, message)) = &agg.error {
                 tracker.finish(*status, &agg.usage, Some(message.clone()));
                 return error_reply(call.format, *status, message);
@@ -2436,5 +2526,68 @@ mod tests {
             assert!(quota_exhausted(&account, "gpt-6.1-sol", 429, &json!({"error":{"code":code}}).to_string()));
         }
         assert!(!quota_exhausted(&account, "gpt-6.1-sol", 400, "context length exceeded"));
+    }
+
+    #[test]
+    fn a_key_with_no_money_left_sits_out_but_a_subscription_does_not() {
+        let cfg = crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: vec![crate::config::KeyEntry { api_key: "test".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let key = pool.all().remove(0);
+        // Anthropic says it with a 400, OpenAI with a 429, OpenRouter and friends with a 402.
+        let anthropic = r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}"#;
+        let openai = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+        assert!(out_of_credit(&key, 400, anthropic));
+        assert!(out_of_credit(&key, 429, openai));
+        assert!(out_of_credit(
+            &key,
+            402,
+            r#"{"error":{"message":"Insufficient credits. Add more using https://openrouter.ai/settings/credits"}}"#
+        ));
+        assert!(out_of_credit(&key, 402, "{}"), "a 402 needs no wording");
+        assert!(!out_of_credit(
+            &key,
+            429,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached"}}"#
+        ));
+        assert!(!out_of_credit(
+            &key,
+            400,
+            r#"{"error":{"message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#
+        ));
+        assert!(!out_of_credit(&key, 500, "insufficient credits"), "a server error is not a billing answer");
+        mark_out_of_credit(&key, anthropic);
+        let snap = key.snapshot();
+        assert_eq!(snap["cooldown_kinds"]["*"], "credit");
+        assert!(
+            snap["last_error"].as_str().unwrap().starts_with("out of credit: Your credit balance is too low"),
+            "{snap}"
+        );
+        assert!(key.cooling_until("claude-sonnet-5-5").is_some());
+        assert!(key.exhausted_until("claude-sonnet-5-5").is_some(), "sessions move off it like a spent subscription");
+        assert!(
+            !quota_exhausted(&key, "claude-sonnet-5-5", 429, openai),
+            "settling the request must not re-read it as a spent allowance"
+        );
+        key.state.lock().credit_until = None;
+        assert!(
+            quota_exhausted(&key, "claude-sonnet-5-5", 429, openai),
+            "a subscription-style refusal still counts once the credit pause is gone"
+        );
+        mark_out_of_credit(&key, anthropic);
+        key.record_ok();
+        assert!(key.cooling_until("claude-sonnet-5-5").is_none(), "a success means it was topped up");
+        assert!(key.snapshot()["last_error"].is_null());
+        // The same words from a subscription are its allowance, not money.
+        *key.cred.write() = crate::accounts::Credential::OAuth(crate::accounts::OAuth {
+            access_token: "synthetic-subscription".into(),
+            ..Default::default()
+        });
+        assert!(!out_of_credit(&key, 402, anthropic));
+        assert!(!out_of_credit(&key, 429, openai));
     }
 }

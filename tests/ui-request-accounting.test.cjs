@@ -106,6 +106,16 @@ test('request rows and expanded desktop/mobile details show missing usage for 49
   }
 });
 
+test('a response metered in provider credits shows them beside its tokens', () => {
+  const d = dashboard();
+  d.context.request = { ...d.record(200, 'partial', 12, 3, 0), credits: 1.25 };
+  assert.match(d.run('requestTokensHTML(request)'), /partial usage · 1\.25 credits/);
+  d.context.request = { ...d.record(200, 'missing'), credits: 0.5 };
+  assert.match(d.run('requestTokensHTML(request)'), /not reported<\/span> · 0\.5 credits/);
+  d.context.request = d.record(200, 'complete', 12, 3, 0);
+  assert.doesNotMatch(d.run('requestTokensHTML(request)'), /credits/);
+});
+
 test('reported zeros stay zero; partial usage stays visible without asserting a final count', () => {
   const d = dashboard();
   d.context.request = d.record(499, 'complete');

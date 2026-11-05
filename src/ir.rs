@@ -227,11 +227,17 @@ pub struct Usage {
     pub write_30m: Option<u64>,
     pub write_12h: Option<u64>,
     pub reasoning: u64,
+    /// Provider credits the response consumed (Kiro metering), when it says so.
+    pub credits: Option<f64>,
 }
 
 impl Usage {
     pub fn merge(&mut self, o: &Usage) {
         self.input = self.input.max(o.input);
+        self.credits = match (self.credits, o.credits) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
         self.output = self.output.max(o.output);
         self.cache_read = self.cache_read.max(o.cache_read);
         if o.cache_write > self.cache_write
