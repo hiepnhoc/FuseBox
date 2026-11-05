@@ -779,7 +779,11 @@ fn codex_headers_with_config(
         let generated_agent = CODEX_USER_AGENT.replace(CODEX_VERSION, &generated_version);
         // Recognition chooses the client profile, never the forwarding policy.
         let nominated = connection_headers(client);
+        // A source build of Codex calls itself 0.0.0. The backend gates models by
+        // release, so such a client goes out as the newest Codex Fusebox knows.
+        let dev_build = crate::clients::native_codex_version(client).is_some_and(|v| v == "0.0.0");
         let native = crate::clients::is_codex(client)
+            && !dev_build
             && !["user-agent", "originator", "version"].iter().any(|name| nominated.contains(*name));
         if !native {
             set_header(&mut h, "version", generated_version);
@@ -1709,6 +1713,23 @@ mod tests {
             ("originator", "codex-tui"),
             ("version", "0.170.0"),
             ("connection", "USER-AGENT"),
+        ]);
+        let prepared = prepare(&test_target(&acct, &cfg, &headers), json!({"input":[]}));
+        let (_, websocket) = codex_ws_url(&acct, &cfg, &headers);
+        for outbound in [&prepared.headers, &websocket] {
+            assert_eq!(get_header(outbound, "user-agent"), Some(CODEX_USER_AGENT));
+            assert_eq!(get_header(outbound, "originator"), Some(CODEX_ORIGINATOR));
+            assert_eq!(get_header(outbound, "version"), Some(CODEX_VERSION));
+        }
+    }
+
+    #[test]
+    fn codex_source_builds_reporting_0_0_0_go_out_as_the_newest_known_release() {
+        let acct = oauth_account(Provider::Codex);
+        let cfg = Config::default();
+        let headers = request_headers(&[
+            ("user-agent", "codex_exec/0.0.0 (Mac OS 14.7.2; arm64) xterm-256color (codex_exec; 0.0.0)"),
+            ("originator", "codex_exec"),
         ]);
         let prepared = prepare(&test_target(&acct, &cfg, &headers), json!({"input":[]}));
         let (_, websocket) = codex_ws_url(&acct, &cfg, &headers);
