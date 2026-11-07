@@ -360,6 +360,7 @@ pub async fn apply(app: &App) -> Result<Value> {
         version: format!("models.dev-{today}"),
         verified_at: today,
         rates: plan.rates.clone(),
+        calculation: Default::default(),
         local_override: false,
         currency: "USD".into(),
     };
@@ -475,6 +476,7 @@ mod tests {
             version: "models.dev-test".into(),
             verified_at: "2026-10-29".into(),
             rates: again.rates.clone(),
+            calculation: Default::default(),
             local_override: false,
             currency: "USD".into(),
         };

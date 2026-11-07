@@ -314,6 +314,7 @@ function connectedHTML() {
 // Limits a named client's key can have; each is optional and works on its own.
 const LIMITS = [
   ['models', 'Models', 'claude-*, gpt-6-astra', 'list', 'Patterns with * wildcards. Empty allows every model.'],
+  ['model-map', 'Model map', 'claude-opus-* = claude-sonnet-5-5', 'map', 'Serve another model instead: pattern = model, comma-separated. The target may carry an effort, as in gpt-6-astra = gpt-6-astra-mini(low). Models above are checked after mapping.'],
   ['user-agents', 'Programs', 'claude-cli/*, codex*', 'list', 'User-Agent patterns its requests must match. Empty allows any.'],
   ['addresses', 'Addresses', '10.10.0.0/24, 100.101.7.12', 'list', 'Addresses or ranges its requests must come from. Empty allows any. Behind a proxy, Fusebox must be told the real address: see trusted-proxies and proxy-protocol-port.'],
   ['requests-per-minute', 'Requests a minute', '60', 'int', ''],
@@ -335,6 +336,7 @@ function namedLimitsText(client) {
     parts.push(day < new Date(new Date().toDateString()) ? `expired ${text}` : `until ${text}`);
   }
   if (client.models?.length) parts.push(client.models.join(', '));
+  for (const [from, to] of Object.entries(client['model-map'] || {})) parts.push(`${from} → ${to}`);
   if (client['user-agents']?.length) parts.push(`from ${client['user-agents'].join(', ')}`);
   if (client.addresses?.length) parts.push(`only at ${client.addresses.map(addrText).join(', ')}`);
   return parts.join(' · ');
@@ -343,11 +345,13 @@ function namedLimitsText(client) {
 function namedLimitsForm(client) {
   const n = S.config.named;
   const off = S.config.busy ? ' disabled' : '';
-  const value = (key, kind) => (kind === 'list' ? (client[key] || []).join(', ') : client[key] ?? '');
+  const value = (key, kind) => (kind === 'list' ? (client[key] || []).join(', ')
+    : kind === 'map' ? Object.entries(client[key] || {}).map(([p, t]) => `${p} = ${t}`).join(', ')
+    : client[key] ?? '');
   return `<form class="named-limits-form" id="limits-form" data-id="${esc(client.id)}" novalidate>
-    <div class="cfg-grid">${LIMITS.map(([key, label, placeholder, kind, help]) => `<div class="field${kind === 'list' ? ' wide' : ''}">
+    <div class="cfg-grid">${LIMITS.map(([key, label, placeholder, kind, help]) => `<div class="field${kind === 'list' || kind === 'map' ? ' wide' : ''}">
       <label for="limit-${key}">${esc(label)}</label>
-      <input id="limit-${key}" name="${key}" type="${kind === 'date' ? 'date' : key === 'addresses' && S.private ? 'password' : kind === 'list' ? 'text' : 'number'}" ${kind === 'int' ? 'min="1" step="1"' : kind === 'num' ? 'min="0.01" step="0.01"' : ''}
+      <input id="limit-${key}" name="${key}" type="${kind === 'date' ? 'date' : key === 'addresses' && S.private ? 'password' : kind === 'list' || kind === 'map' ? 'text' : 'number'}" ${kind === 'int' ? 'min="1" step="1"' : kind === 'num' ? 'min="0.01" step="0.01"' : ''}
         value="${esc(String(value(key, kind)))}" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false"${off}>
       ${help ? `<small>${esc(help)}</small>` : ''}</div>`).join('')}</div>
     ${n.limitsError ? `<p class="cfg-error" role="alert">${esc(n.limitsError)}</p>` : ''}
@@ -374,11 +378,28 @@ async function saveLimits(form) {
   const list = configGet(['named-clients']) || [];
   const client = list.find((x) => x.id === form.dataset.id);
   if (!client || S.config.busy || namedBlocked()) return;
-  const updated = { id: client.id, label: client.label, key: client.key, ...(client['trust-client-identity'] ? { 'trust-client-identity': true } : {}) };
+  // Start from the client as it is: fields this form doesn't know (now or
+  // later) must survive a limits save, not be dropped by rebuilding it.
+  const updated = configClone(client);
   for (const [key, label, , kind] of LIMITS) {
     const raw = form.elements[key].value.trim();
-    if (!raw) continue;
+    if (!raw) { delete updated[key]; continue; }
     if (kind === 'list') updated[key] = raw.split(',').map((p) => p.trim()).filter(Boolean);
+    else if (kind === 'map') {
+      const map = {};
+      for (const pair of raw.split(',').map((p) => p.trim()).filter(Boolean)) {
+        const at = pair.indexOf('=');
+        const from = at > 0 ? pair.slice(0, at).trim() : '';
+        const to = at > 0 ? pair.slice(at + 1).trim() : '';
+        if (!from || !to) {
+          n.limitsError = `${label}: write each mapping as pattern = model, separated by commas.`;
+          render();
+          return form.ownerDocument.getElementById(`limit-${key}`)?.focus();
+        }
+        map[from] = to;
+      }
+      updated[key] = map;
+    }
     else if (kind === 'date') updated[key] = raw;
     else {
       const num = Number(raw);
@@ -656,17 +677,18 @@ function configWindowStarterHTML() {
   const missing = (p.accounts || []).filter((id) => !accounts.some((a) => a.id === id));
   const select = (id, name) => `<label class="cfg-starter-account"><input type="checkbox" data-config-act="window-account" data-id="${esc(id)}" ${(p.accounts || []).includes(id) ? 'checked' : ''}><span>${esc(name)}</span></label>`;
   const days = [[1, 'Mon'], [2, 'Tue'], [3, 'Wed'], [4, 'Thu'], [5, 'Fri'], [6, 'Sat'], [7, 'Sun']];
+  // Text fields, not type=time: the browser's time picker shows AM/PM in some locales.
   return `${configChoice([...path, 'mode'], 'Start idle usage windows', [['off', 'Off'], ['always', 'Always'], ['working-hours', 'During working hours']],
     'Sends a small Claude request to start an inactive five-hour window, even without a job. Uses a little subscription quota, brings its next reset forward and does not increase weekly allowance. Manual starting is available on each supported account.')}
     ${p.mode !== 'off' ? `<div class="cfg-list wide"><span class="label">Starter accounts</span>
-      ${accounts.length ? accounts.map((a) => select(a.id, `${acctLabel(a)}${a.disabled ? ' · disabled' : ''}`)).join('') : '<p class="cfg-description">Connect a Claude subscription with a verified account ID to select it here.</p>'}
+      ${accounts.length ? accounts.map((a) => select(a.id, `${acctLabel(a)}${a.disabled ? ' · disabled' : ''}${noShortNote(a)}`)).join('') : '<p class="cfg-description">Connect a Claude subscription with a verified account ID to select it here.</p>'}
       ${missing.map((id) => select(id, `Unavailable account · ${id}`)).join('')}
       <p class="cfg-description">Only selected accounts start automatically. No selection means no automatic requests. Disabled accounts, real work, active windows and exhausted limits are skipped.</p></div>
       ${configField([...path, 'model'], 'Starter model', { required: true, help: 'A native Claude model available on the selected accounts. Default: claude-haiku-4-5-20251001. No model groups, fallback or premium options.' })}
       ${p.mode === 'working-hours' ? `${configField([...path, 'timezone'], 'Working hours timezone', { required: true, help: 'IANA timezone, such as Europe/Amsterdam. Daylight saving changes are applied automatically.' })}
         <div class="cfg-choice wide" id="${configId([...path, 'weekdays'])}"><span id="starter-days-label">Working days</span><div class="seg" role="group" aria-labelledby="starter-days-label">${days.map(([n, name]) => `<button type="button" data-config-act="window-day" data-day="${n}" aria-pressed="${(p.weekdays || []).includes(n)}">${name}</button>`).join('')}</div><small class="cfg-error" id="${configId([...path, 'weekdays'])}-error" data-error-for="${configId([...path, 'weekdays'])}">${esc(S.config.errors[configId([...path, 'weekdays'])] || '')}</small></div>
-        ${configField([...path, 'start'], 'Start time', { type: 'time', required: true })}
-        ${configField([...path, 'end'], 'End time', { type: 'time', required: true, help: 'The end is exclusive. Overnight hours belong to the day on which they start.' })}` : ''}` : ''}`;
+        ${configField([...path, 'start'], 'Start time', { required: true, placeholder: '09:00', help: '24-hour clock, HH:MM.' })}
+        ${configField([...path, 'end'], 'End time', { required: true, placeholder: '17:00', help: '24-hour clock, HH:MM. The end is exclusive. Overnight hours belong to the day on which they start.' })}` : ''}` : ''}`;
 }
 
 // Model groups: one name for several models. A group is a list (tried in order) or,
@@ -799,7 +821,10 @@ function configNotificationsHTML() {
     ${configSwitch(['notifications', 'provider-exhausted'], 'Provider out of capacity', 'Every account of a provider is used up or unavailable, and again when one is back.')}
     ${configSwitch(['notifications', 'account-used-up'], 'Account limit used up', 'One account used up its 5-hour or weekly limit while others carry on.')}
     ${configSwitch(['notifications', 'account-errors'], 'Account errors', 'An account reports an error, or three or more of its requests fail within an hour.')}
-    ${configSwitch(['notifications', 'client-new-address'], 'New client address', 'A client’s key is used from an address it wasn’t used from before, or refused at one its address list doesn’t allow.')}</div>`;
+    ${configSwitch(['notifications', 'client-new-address'], 'New client address', 'A client’s key is used from an address it wasn’t used from before, or refused at one its address list doesn’t allow.')}
+    ${configSwitch(['notifications', 'banked-resets'], 'Banked resets', 'An account receives a new reset, a reset is used automatically, its outcome needs review, or one expires unused.')}
+    ${configSwitch(['notifications', 'renewals'], 'Subscription renewals', 'Two days before a subscription charges again, or ends after being cancelled: ChatGPT’s own date, or the billing day set on a Claude or Meta account’s page.')}
+    ${configSwitch(['notifications', 'renewals-day-before'], 'Subscription renewals, a day before', 'The same reminder one day before the charge or end. With both on, each date is reminded twice.')}</div>`;
 }
 
 // Where a webhook URL delivers, as the server decides it (src/push/webhooks.rs).
@@ -1228,8 +1253,9 @@ function configValidate() {
     if (!/^claude-[a-zA-Z0-9._-]+$/.test(p.model || '')) invalid(['window-starter', 'model'], 'Enter a native Claude model name without options or a prefix.');
     try { new Intl.DateTimeFormat('en', { timeZone: p.timezone }).format(); } catch { invalid(['window-starter', 'timezone'], 'Enter a valid IANA timezone.'); }
     if (!p.weekdays?.length) invalid(['window-starter', 'weekdays'], 'Choose at least one working day.');
-    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(p.start || '') || p.start === p.end) invalid(['window-starter', 'start'], 'Enter a start time different from the end time.');
-    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(p.end || '')) invalid(['window-starter', 'end'], 'Enter a valid end time.');
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(p.start || '')) invalid(['window-starter', 'start'], 'Enter a 24-hour time, such as 09:00.');
+    else if (p.start === p.end) invalid(['window-starter', 'start'], 'Enter a start time different from the end time.');
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(p.end || '')) invalid(['window-starter', 'end'], 'Enter a 24-hour time, such as 17:00.');
   }
   if ('session-affinity-idle-seconds' in changed && (!Number.isInteger(v['session-affinity-idle-seconds']) || v['session-affinity-idle-seconds'] < 60)) invalid(['session-affinity-idle-seconds'], 'Enter at least 60 seconds.');
   if ('first-token-timeout-seconds' in changed && (!Number.isInteger(v['first-token-timeout-seconds']) || v['first-token-timeout-seconds'] < 0 || v['first-token-timeout-seconds'] > 3600)) invalid(['first-token-timeout-seconds'], 'Enter 0 to 3600 seconds.');

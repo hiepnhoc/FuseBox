@@ -32,6 +32,9 @@ struct Mock {
     redirect: Mutex<bool>,
     profile_account: Mutex<String>,
     before_usage: Mutex<Option<Box<dyn Fn() + Send>>>,
+    usage_status: Mutex<axum::http::StatusCode>,
+    usage_calls: AtomicUsize,
+    profile_calls: AtomicUsize,
 }
 
 impl Default for Mock {
@@ -45,6 +48,9 @@ impl Default for Mock {
             redirect: Mutex::new(false),
             profile_account: Mutex::new(ACCOUNT.into()),
             before_usage: Mutex::new(None),
+            usage_status: Mutex::new(axum::http::StatusCode::OK),
+            usage_calls: Default::default(),
+            profile_calls: Default::default(),
         }
     }
 }
@@ -78,11 +84,13 @@ async fn fixture(copies: usize, analytics: bool) -> (Temp, Arc<App>, Arc<Mock>, 
     let message = mock.clone();
     let routes = Router::new()
         .route("/api/oauth/profile", get(move || { let m = profile.clone(); async move {
+            m.profile_calls.fetch_add(1, Ordering::SeqCst);
             Json(json!({"account":{"uuid":*m.profile_account.lock()},"organization":{"uuid":ORG}}))
         }}))
         .route("/api/oauth/usage", get(move || { let m = usage.clone(); async move {
             if let Some(f) = m.before_usage.lock().take() { f(); }
-            Json(m.usage.lock().clone())
+            m.usage_calls.fetch_add(1, Ordering::SeqCst);
+            (*m.usage_status.lock(), [("retry-after", "318")], Json(m.usage.lock().clone()))
         }}))
         .route("/v1/messages", post(move |Json(body): Json<Value>| { let m = message.clone(); async move {
             m.posts.fetch_add(1, Ordering::SeqCst);
@@ -114,8 +122,12 @@ async fn run(app: &Arc<App>, automatic: bool) -> Result<View> {
 #[test]
 fn provider_inactivity_is_explicit_and_zero_percent_can_be_active() {
     let now = Utc::now();
-    assert_eq!(window(&idle(), now), Window::Inactive);
-    assert_eq!(window(&json!({"five_hour":null}), now), Window::Inactive);
+    for ultra in [false, true] {
+        assert_eq!(window(&idle(), now, ultra), Window::Inactive);
+    }
+    assert_eq!(window(&json!({"five_hour":null}), now, false), Window::Inactive);
+    // On Ultra a bare null can mean no window at all: only a status check, no start.
+    assert_eq!(window(&json!({"five_hour":null}), now, true), Window::Unknown);
     for w in [
         json!({}),
         json!({"five_hour":{}}),
@@ -123,11 +135,25 @@ fn provider_inactivity_is_explicit_and_zero_percent_can_be_active() {
         json!({"five_hour":{"utilization":1,"resets_at":null}}),
         json!({"five_hour":{"utilization":0,"resets_at":"bad"}}),
         json!({"five_hour":{"utilization":0,"resets_at":now-chrono::Duration::hours(1)}}),
+        // A typed list without a session, or a malformed one, proves nothing.
+        json!({"five_hour":null,"limits":[]}),
+        json!({"five_hour":null,"limits":[{"kind":"weekly_all"}]}),
+        json!({"five_hour":null,"limits":[{"kind":"session","percent":"x","resets_at":null}]}),
+        json!({"five_hour":null,"limits":[{"kind":"session","percent":0}]}),
+        json!({"five_hour":null,"limits":{}}),
     ] {
-        assert_eq!(window(&w, now), Window::Unknown, "{w}");
+        assert_eq!(window(&w, now, false), Window::Unknown, "{w}");
     }
     let reset = now + chrono::Duration::hours(2);
-    assert_eq!(window(&json!({"five_hour":{"utilization":0,"resets_at":reset}}), now), Window::Active(reset));
+    assert_eq!(window(&json!({"five_hour":{"utilization":0,"resets_at":reset}}), now, false), Window::Active(reset));
+    // The typed session entry speaks when `five_hour` is null.
+    let session = |percent: f64, resets: Value| json!({"five_hour":null,"limits":[{"kind":"weekly_all","percent":1},{"kind":"session","percent":percent,"resets_at":resets}]});
+    for ultra in [false, true] {
+        assert_eq!(window(&session(0.0, Value::Null), now, ultra), Window::Inactive);
+        assert_eq!(window(&session(100.0, json!(reset)), now, ultra), Window::Active(reset));
+        assert_eq!(window(&session(0.0, json!(reset)), now, ultra), Window::Active(reset));
+        assert_eq!(window(&session(5.0, Value::Null), now, ultra), Window::Unknown);
+    }
     assert!(weekly_available(&idle(), now));
     assert!(weekly_available(&json!({"seven_day":{"utilization":0.0,"resets_at":null}}), now));
     assert!(!weekly_available(&json!({}), now));
@@ -254,6 +280,115 @@ async fn no_requests_for_unknown_active_exhausted_or_unverified_accounts() {
     *mock.profile_account.lock() = uuid::Uuid::new_v4().to_string();
     assert!(run(&app, true).await.is_err());
     assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+/// Usage as a verified Ultra account reported it on 2026-10-31 (trimmed).
+fn ultra() -> Value {
+    let week = Utc::now() + chrono::Duration::days(2);
+    json!({"five_hour":null,"seven_day":{"utilization":10.0,"resets_at":week},"limits":[
+        {"kind":"weekly_all","group":"weekly","percent":10,"resets_at":week,"scope":null,"is_active":true},
+        {"kind":"weekly_scoped","group":"weekly","percent":0,"resets_at":week,"scope":{"model":{"id":null,"display_name":"Fable"}},"is_active":false}
+    ]})
+}
+
+#[tokio::test]
+async fn accounts_without_a_five_hour_limit_are_never_started() {
+    let (_temp, app, mock, server) = fixture(1, false).await;
+    assert_eq!(window(&ultra(), Utc::now(), true), Window::Absent);
+    *mock.usage.lock() = ultra();
+    for check_only in [false, true] {
+        let a = app.pool.all()[0].clone();
+        let action = Action { request_id: uuid::Uuid::new_v4().to_string(), check_only };
+        let view = start(app.clone(), a, action, !check_only).await.unwrap();
+        assert_eq!(view.status, "not_needed");
+        assert!(view.next_check_at >= Utc::now() + chrono::Duration::minutes(59));
+    }
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    let a = app.pool.all()[0].clone();
+    {
+        let st = a.state.lock();
+        assert!(st.quota.no_five_hour_limit);
+        assert!(st.quota.windows.iter().all(|w| w.name != "5h"), "no idle window is made up");
+    }
+    // Once the provider lists a session again, the window is the starter's to start.
+    mock.usage.lock()["limits"].as_array_mut().unwrap().push(json!({"kind":"session","percent":0,"resets_at":null}));
+    assert_eq!(run(&app, true).await.unwrap().status, "started");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    assert!(!a.state.lock().quota.no_five_hour_limit);
+    server.abort();
+}
+
+#[test]
+fn a_returning_five_hour_limit_is_checked_before_the_hourly_recheck() {
+    let now = Utc::now();
+    let mut st = crate::accounts::AccountState::default();
+    assert!(due(&st, now), "never checked");
+    let mut view = View::new("not_needed", "none", now - chrono::Duration::minutes(6));
+    view.next_check_at = now + chrono::Duration::minutes(54);
+    st.window_starter = Some(view.clone());
+    st.quota.no_five_hour_limit = true;
+    assert!(!due(&st, now), "still no limit: the hourly recheck stands");
+    st.quota.no_five_hour_limit = false;
+    assert!(due(&st, now), "a 5-hour window came back");
+    st.window_starter.as_mut().unwrap().checked_at = now - chrono::Duration::minutes(1);
+    assert!(!due(&st, now), "not more often than every 5 minutes");
+    st.window_starter = Some(View { status: "active".into(), ..view });
+    assert!(!due(&st, now), "other states wait for their next check");
+}
+
+#[tokio::test]
+async fn an_active_typed_session_is_neither_started_nor_overwritten() {
+    let (_temp, app, mock, server) = fixture(1, false).await;
+    let reset = Utc::now() + chrono::Duration::hours(2);
+    let mut usage = ultra();
+    usage["limits"].as_array_mut().unwrap().push(json!({
+        "kind":"session","group":"session","percent":100,"resets_at":reset,"scope":null,"is_active":true
+    }));
+    *mock.usage.lock() = usage;
+    let view = run(&app, true).await.unwrap();
+    assert_eq!(view.status, "active");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    let acct = app.pool.all()[0].clone();
+    let st = acct.state.lock();
+    assert!(!st.quota.no_five_hour_limit);
+    assert!(st.quota.exhausted("claude-haiku-4-5-20251001"), "the session's exhaustion is kept, not made idle");
+    drop(st);
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_confirmed_absence_survives_an_unclear_reading_before_the_plan_is_known() {
+    let (_temp, app, mock, server) = fixture(1, false).await;
+    let acct = app.pool.all()[0].clone();
+    {
+        let mut st = acct.state.lock();
+        crate::quota::usage(&mut st, Provider::Claude, &ultra());
+        assert!(st.quota.no_five_hour_limit && st.quota.plan.is_none());
+    }
+    let mut partial = ultra();
+    partial.as_object_mut().unwrap().remove("limits");
+    *mock.usage.lock() = partial;
+    assert!(run(&app, true).await.is_err());
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    assert!(acct.state.lock().quota.no_five_hour_limit, "only a real 5-hour window brings the limit back");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_bare_null_on_ultra_is_unknown_and_never_started() {
+    let (_temp, app, mock, server) = fixture(1, false).await;
+    app.pool.all()[0].state.lock().quota.plan = Some("max_20x".into());
+    let mut usage = ultra();
+    usage.as_object_mut().unwrap().remove("limits");
+    *mock.usage.lock() = usage.clone();
+    assert!(run(&app, true).await.is_err());
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    assert!(app.pool.all()[0].state.lock().quota.windows.iter().all(|w| w.name != "5h"), "no idle window is made up");
+    // The same reading on another plan keeps its old meaning: an idle window.
+    app.pool.all()[0].state.lock().quota.plan = Some("max_5x".into());
+    assert_eq!(run(&app, true).await.unwrap().status, "started");
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
     server.abort();
 }
 
@@ -526,4 +661,40 @@ async fn explicit_inactive_windows_replace_old_quota_but_missing_windows_never_s
     assert_eq!(run(&app, true).await.unwrap().status, "started");
     assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn a_rate_limited_usage_endpoint_makes_every_caller_wait_it_out() {
+    let (_temp, app, mock, task) = fixture(1, false).await;
+    let acct = app.pool.all()[0].clone();
+    *mock.usage_status.lock() = axum::http::StatusCode::TOO_MANY_REQUESTS;
+    let before = Utc::now();
+    assert!(run(&app, true).await.is_err());
+    assert_eq!(mock.usage_calls.load(Ordering::SeqCst), 1);
+    let until = acct.state.lock().quota.usage_wait(Utc::now()).expect("the 429 starts a wait");
+    assert!(until >= before + chrono::Duration::seconds(318) && until <= Utc::now() + chrono::Duration::seconds(318));
+    {
+        let st = acct.state.lock();
+        let view = st.window_starter.as_ref().unwrap();
+        assert_eq!(view.status, "unavailable");
+        assert_eq!(view.next_check_at, until, "the starter's next check waits for the provider");
+        assert!(!due(&st, Utc::now()));
+    }
+    // No caller asks again while the wait lasts: not the starter (nor its profile read),
+    // not the quota poll, not the dashboard's manual refresh.
+    let profiles = mock.profile_calls.load(Ordering::SeqCst);
+    let e = run(&app, false).await.unwrap_err();
+    assert!(e.downcast_ref::<crate::quota::UsageWait>().is_some(), "{e:#}");
+    assert!(e.to_string().contains("rate limited"), "{e}");
+    let e = crate::quota::poll(&app, &acct).await.unwrap_err();
+    assert!(e.downcast_ref::<crate::quota::UsageWait>().is_some(), "{e:#}");
+    assert_eq!(mock.usage_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(mock.profile_calls.load(Ordering::SeqCst), profiles);
+    // Once it is over, the next check reads usage again.
+    *mock.usage_status.lock() = axum::http::StatusCode::OK;
+    acct.state.lock().quota.usage_wait_until = Some(Utc::now() - chrono::Duration::seconds(1));
+    run(&app, false).await.unwrap();
+    assert!(mock.usage_calls.load(Ordering::SeqCst) > 1);
+    assert!(acct.state.lock().quota.usage_wait(Utc::now()).is_none());
+    task.abort();
 }

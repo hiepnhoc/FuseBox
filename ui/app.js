@@ -42,11 +42,14 @@ const S = {
   accounts: null,
   requests: [],
   requestsFull: false, // S.requests holds the whole log, not only the newest few
+  acctTest: null, // {id, running, result} of the account drawer Test button
   models: [],
   routes: null,
   routesStale: true, // account or model changes since S.routes was fetched
   faultList: null, // the server's faults (live "faults"); null until the first arrives
+  dismissedFaults: 0, // how many of the menu's faults are dismissed (live "faults")
   activity: {}, // account id -> { series, sessions, at, fetched }
+  billing: null, // the billing form being edited: { id, date, period, ends, busy, error }
   load: null, // account id -> { in_flight, sessions } for busy accounts; null while disconnected
   live: 'connecting',
   paused: false,
@@ -70,7 +73,7 @@ const S = {
   setupModels: Object.create(null), setupContexts: Object.create(null),
   served: store.get('served') === '1', // this browser has seen Fusebox serve a request
   private: store.get('private') === '1', // hide emails and keys
-  quotaDisplay: store.get('quota-display') === 'remaining' ? 'remaining' : 'used',
+  quotaDisplay: store.get('quota-display') === 'used' ? 'used' : 'remaining',
   confirm: null,
   resets: {}, // account-specific confirmations and errors
   errorClears: {}, // pending error dismissals and action failures, separate from provider errors
@@ -80,7 +83,7 @@ const S = {
     msg: null, busy: false, loading: false, section: 'clients', provider: 'claude', oauthProvider: 'claude',
     errors: {}, opens: {}, secrets: {}, reloadConfirm: false, reveal: false, raw: { text: null, saved: null, revision: '', loading: false }, named: namedIdle(),
     webhooks: { draft: '', error: '', testing: null, results: {} }, review: null, clientUsage: null, clientUsageAt: 0 },
-  play: null, // { model, prompt, out, busy, meta, error, abort } while the playground is open
+  play: null, // the open "Try a model" card (playground.js): its mode, drafts and last result
   theme: store.get('theme') || 'system', // 'system' | 'light' | 'dark'
 };
 
@@ -113,7 +116,7 @@ const PROVIDER = {
 };
 // Accounts you can sign in to: [id, name, what it connects].
 const SIGNIN = [
-  ['claude', 'Claude', 'Pro or Max subscription'],
+  ['claude', 'Claude', 'Pro, Max or Ultra subscription'],
   ['codex', 'ChatGPT', 'Plus, Pro or Team, for Codex models'],
   ['antigravity', 'Antigravity', 'Google account, Gemini and Claude models'],
   ['xai', 'Grok', 'SuperGrok or X Premium'],
@@ -124,7 +127,7 @@ const SIGNIN = [
   ['vertex', 'Vertex AI', 'Google Cloud service account key'],
 ];
 const LOGIN = {
-  claude: { name: 'Claude', intro: 'Connect a Claude Pro or Max subscription.', port: 54545, example: 'http://localhost:54545/callback?code=…&state=…' },
+  claude: { name: 'Claude', intro: 'Connect a Claude Pro, Max or Ultra subscription.', port: 54545, example: 'http://localhost:54545/callback?code=…&state=…' },
   codex: { name: 'ChatGPT', intro: 'Connect a ChatGPT Plus, Pro or Team subscription for Codex models.', port: 1455, example: 'http://localhost:1455/auth/callback?code=…&state=…' },
   antigravity: { name: 'Antigravity', intro: 'Connect a Google account with Antigravity access for Gemini and Claude models.', port: 51121, example: 'http://localhost:51121/oauth-callback?code=…&state=…' },
   devin: { name: 'Devin', intro: 'Connect a Devin or Windsurf account.', example: 'http://127.0.0.1:…/callback?code=…, or a session token' },
@@ -171,6 +174,7 @@ const ICON = {
   search: svg('<circle cx="6" cy="6" r="4.25"/><path d="M9.2 9.2l3 3"/>', 14, 1.3),
   eye: svg('<path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>', 16, 1.3),
   eyeOff: svg('<path d="M1.5 8s2.4-4.5 6.5-4.5S14.5 8 14.5 8s-2.4 4.5-6.5 4.5S1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/><path d="M2.5 13.5l11-11"/>', 16, 1.3),
+  x: svg('<path d="M4 4l8 8M12 4l-8 8"/>', 14, 1.4),
   external: svg('<path d="M9.5 2.5h4v4M13.5 2.5 7 9M11.5 9.5v3a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1h3"/>', 16, 1.5),
 };
 const WORDMARK = $('.brand .wordmark').outerHTML;
@@ -252,13 +256,14 @@ function span(secs) {
   return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
 }
 
-const clock = (iso) => new Date(iso).toLocaleTimeString('en-GB', { hour12: false });
-const hm = (iso) => new Date(iso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
-const weekday = (iso) => new Date(iso).toLocaleDateString('en-GB', { weekday: 'short' });
-const fullResetTime = (iso) => new Date(iso).toLocaleString('en-GB', {
-  weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
-  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZoneName: 'short',
-});
+const clock = (iso) => UsageTools.localTimeText(iso, 'clock');
+const hm = (iso) => UsageTools.localTimeText(iso, 'hourMinute');
+const weekday = (iso) => UsageTools.localTimeText(iso, 'weekdayName');
+const fullResetTime = (iso) => UsageTools.localTimeText(iso, 'reset');
+const dayDate = (iso) => UsageTools.localTimeText(iso, 'dayDate');
+function syncLocalTime() {
+  if (UsageTools.refreshLocalTimezone()) minuteLabels.clear();
+}
 // Within a day "20:09", otherwise "Fri 14:58".
 const when = (iso) => (Date.parse(iso) - Date.now() < 20 * 3600e3 ? hm(iso) : `${weekday(iso)} ${hm(iso)}`);
 const liveLeft = (iso, compact = false) => `<span data-until="${esc(iso)}"${compact ? ' data-countdown="compact"' : ''}>${esc(compact ? compactLeft(iso) : left(iso))}</span>`;
@@ -328,26 +333,33 @@ async function loadAll() {
   overviewAt = Date.now();
 }
 
+// The newest snapshot wins, whether it was requested by navigation or reconnect.
+let requestsRead = 0;
+function readRequests(full) {
+  const read = ++requestsRead;
+  const before = new Set(S.requests);
+  return api(requestsPath(full)).then((list) => {
+    if (read !== requestsRead) return;
+    const seen = new Set(list.map((r) => r.id));
+    // The live socket can deliver newer rows while this snapshot is in flight.
+    // Keep only those arrivals, so a server restart still replaces the old log.
+    const arrived = S.requests.filter((r) => !before.has(r) && !seen.has(r.id));
+    S.requests = [...arrived, ...list].slice(0, 300);
+    S.requestsFull = wholeLog(list, full);
+    requestsArrived();
+  });
+}
+
 // The whole request log, merged with what arrived live while it was on its way.
 let requestsLoading = null;
 function loadRequests() {
   if (S.requestsFull || requestsLoading || S.locked) return;
-  requestsLoading = api('/requests').then((list) => {
-    const seen = new Set(list.map((r) => r.id));
-    S.requests = [...S.requests.filter((r) => !seen.has(r.id)), ...list].slice(0, 300);
-    S.requestsFull = true;
-    requestsArrived();
-  }).catch(() => {}).finally(() => { requestsLoading = null; });
+  requestsLoading = readRequests(true).catch(() => {}).finally(() => { requestsLoading = null; });
 }
 
 // After time away: the log again, as much of it as this page has had.
 function reloadRequests() {
-  const full = S.requestsFull || needsLog();
-  api(requestsPath(full)).then((list) => {
-    S.requests = list;
-    S.requestsFull = wholeLog(list, full);
-    requestsArrived();
-  }).catch(() => {});
+  readRequests(S.requestsFull || needsLog()).catch(() => {});
 }
 
 // Repaints what reads the request log once more of it is here.
@@ -376,6 +388,7 @@ function loadRoutes() {
 // overview; model changes ("models") reload the model list. Both are debounced together.
 const refreshing = { accounts: false, models: false };
 let refreshTimer = 0;
+let refreshRunning = false;
 function scheduleRefresh(kind) {
   refreshing[kind] = true;
   clearTimeout(refreshTimer);
@@ -384,22 +397,38 @@ function scheduleRefresh(kind) {
 const refreshAccounts = () => scheduleRefresh('accounts');
 const refreshModels = () => scheduleRefresh('models');
 async function runRefresh() {
-  const { accounts: acc, models: mod } = refreshing;
-  refreshing.accounts = refreshing.models = false;
-  const routes = S.route === 'models';
-  if (!routes) S.routesStale = true;
+  refreshTimer = 0;
+  if (refreshRunning || S.locked) return;
+  refreshRunning = true;
   try {
-    const [accounts, overview, models, routeData] = await Promise.all([
-      acc ? api('/accounts') : null, acc ? api('/overview') : null, mod ? api('/models') : null, routes ? api('/routes') : null,
-    ]);
-    if (accounts) S.accounts = accounts;
-    if (overview) { S.overview = overview; overviewAt = Date.now(); }
-    if (models) { S.models = models; refreshSetups(); }
-    if (routeData) Object.assign(S, { routes: routeData, routesStale: false });
-    if (acc) expireActivity();
-    refreshViews();
-    syncResetModal();
-  } catch {}
+    // Live changes received during a read share one trailing batch. These reads
+    // finish before the next batch starts, including siblings of a failed read.
+    // A stalled fetch is aborted after 30 seconds so it cannot hold the queue.
+    while (!S.locked && (refreshing.accounts || refreshing.models)) {
+      clearTimeout(refreshTimer); refreshTimer = 0;
+      const { accounts: acc, models: mod } = refreshing;
+      refreshing.accounts = refreshing.models = false;
+      const routes = S.route === 'models';
+      if (!routes) S.routesStale = true;
+      const controller = new AbortController();
+      const deadline = setTimeout(() => controller.abort(), 30000);
+      try {
+        const options = { signal: controller.signal };
+        const results = await Promise.allSettled([
+          acc ? api('/accounts', options) : null, acc ? api('/overview', options) : null, mod ? api('/models', options) : null, routes ? api('/routes', options) : null,
+        ]);
+        if (controller.signal.aborted || S.locked || results.some((r) => r.status === 'rejected')) continue;
+        const [accounts, overview, models, routeData] = results.map((r) => r.value);
+        if (accounts) S.accounts = accounts;
+        if (overview) { S.overview = overview; overviewAt = Date.now(); }
+        if (models) { S.models = models; refreshSetups(); }
+        if (routeData) Object.assign(S, { routes: routeData, routesStale: false });
+        if (acc) expireActivity();
+        refreshViews();
+        syncResetModal();
+      } catch {} finally { clearTimeout(deadline); }
+    }
+  } finally { refreshRunning = false; }
 }
 
 // Activity outlives account changes, but not by more than a minute.
@@ -478,7 +507,7 @@ function setLive(state) {
 function onLive(msg) {
   if (msg.type === 'request') return onRequest(msg.data);
   if (msg.type === 'load') return onLoad(msg.data);
-  if (msg.type === 'faults') return onFaults(msg.data);
+  if (msg.type === 'faults') return onFaults(msg.data, msg.dismissed);
   if (msg.type === 'accounts') return refreshAccounts();
   if (msg.type === 'models') return refreshModels();
   if (msg.type === 'login') return pollLogin();
@@ -492,9 +521,11 @@ function onLive(msg) {
   }
 }
 
-// The server's faults, sent whenever they change (see faultItems).
-function onFaults(list) {
+// The server's faults, sent whenever they change (see faultItems), and the ones dismissed
+// from the menu, which stay away until they clear.
+function onFaults(list, dismissed) {
   S.faultList = faultItems(list);
+  S.dismissedFaults = faultItems(dismissed).length;
   renderFaults();
   if (S.route === 'accounts' && !S.sub && !S.locked && S.overview) {
     patch('acct-filters', acctFiltersHTML);
@@ -510,7 +541,7 @@ function onFaults(list) {
 const FAULT_RANK = { err: 0, warn: 1, pace: 2 };
 function faultItems(list) {
   const items = (Array.isArray(list) ? list : []).filter((f) => f.account_id || f.kind === 'storage' || f.kind === 'pace').map((f) => ({
-    lvl: f.level === 'err' ? 'err' : 'warn', id: f.account_id || null, title: f.title, signin: f.kind === 'signin',
+    key: f.key || '', lvl: f.level === 'err' ? 'err' : 'warn', id: f.account_id || null, title: f.title, signin: f.kind === 'signin',
     provider: f.provider_name || '', label: f.label || '', kind: f.kind || '', detail: f.detail || '', badge: f.badge !== false,
     path: f.path || '',
   }));
@@ -711,6 +742,7 @@ function replaceHTML(el, html) {
 
 // Re-renders the parts of the current page that show account state.
 function refreshViews() {
+  syncLocalTime();
   renderChrome();
   if (S.locked || !S.overview) return;
   if (S.route === 'overview') {
@@ -722,7 +754,8 @@ function refreshViews() {
     patch('ov-other', ovOtherHTML);
     patch('recent', recentHTML);
   } else if (S.route === 'accounts') {
-    if (S.sub) patch('det-root', detailBodyHTML);
+    // An open billing form keeps its date picker: it repaints itself.
+    if (S.sub) { if (S.billing?.id !== S.sub) patch('det-root', detailBodyHTML); }
     else { patch('acct-head', accountHeadHTML); patch('acct-filters', acctFiltersHTML); patch('acct-timeline', resetTimelineHTML); patch('acct-list', accountListHTML); }
   } else if (S.route === 'usage') {
     usageAccountsChanged();
@@ -818,6 +851,7 @@ function viewClass() {
 }
 
 function render() {
+  syncLocalTime();
   renderChrome();
   view.className = viewClass();
   if (S.locked) { closeResetModal(); closeLayers(); view.innerHTML = lockHTML(); bindLock(); return; }
@@ -853,7 +887,12 @@ function authName(a) {
 
 // ChatGPT's active subscription SKU distinguishes Pro tiers; usage's `pro` does not.
 const CODEX_PLAN_NAMES = new Map([['chatgptprolite', 'Pro 100'], ['chatgptpro', 'Pro 200'], ['chatgptpromax', 'Pro 500']]);
+// Claude renamed Max 5x and Max 20x on 30 October 2026; their tier identifiers stayed.
+const CLAUDE_PLAN_NAMES = new Map([['max_5x', 'Max'], ['max_20x', 'Ultra']]);
+// A provider-reported display name (Claude's, Meta's tier name) wins over any tier identifier.
 const planName = (a) => (a.provider === 'codex' && CODEX_PLAN_NAMES.get(a.quota?.subscription_plan))
+  || a.quota?.plan_name
+  || (a.provider === 'claude' && CLAUDE_PLAN_NAMES.get(a.quota?.plan))
   || (a.quota && a.quota.plan ? cap(String(a.quota.plan).replace(/[_-]+/g, ' ')) : '');
 
 // "Claude · OAuth · token valid 5h 11m"
@@ -942,7 +981,7 @@ function quotaView(q) {
 }
 
 // Subscriptions that can report limits get meters (empty until they do); API keys have none.
-const metered = (a) => (a.kind === 'oauth' && ['claude', 'codex'].includes(a.provider))
+const metered = (a) => (a.kind === 'oauth' && ['claude', 'codex', 'meta'].includes(a.provider))
   || (a.quota?.windows || []).length > 0 || (a.quota?.limits || []).length > 0;
 
 // The tightest live usage window of a kind: short (5-hour) or long (weekly).
@@ -953,6 +992,14 @@ function windowOf(a, short) {
     .filter((w) => /^\d+h$/.test(w.name) === short)
     .sort((x, y) => y.used - x.used)[0];
 }
+
+// Verified Claude Ultra and ChatGPT Pro accounts have no 5-hour limit; their usage says so.
+const NO_SHORT_LIMIT = 'This account has no five-hour limit; only the weekly limits apply.';
+const noShortLimit = (a) => !!a.quota?.no_five_hour_limit && !windowOf(a, true);
+// The lists leave such an account's 5-hour meter out; the line under its name says why.
+const noShortNote = (a) => (noShortLimit(a) ? ' · no 5h limit' : '')
+  // Meta's key mint says when the subscription has lapsed; its meters then stop moving.
+  + (a.quota?.subscription_inactive ? ' · subscription inactive' : '');
 
 const windowLabel = (w, short) => (w && w.name === 'month' ? 'MO' : w && !['week', 'day'].includes(w.name) ? w.name.toUpperCase() : short ? '5H' : w && w.name === 'day' ? 'DAY' : 'WK');
 const windowTitle = (w) => (/^\d+h$/.test(w.name) ? `${w.name.replace('h', '')}-hour` : w.name === 'day' ? 'Daily' : w.name === 'month' ? 'Monthly' : w.name.startsWith('week') ? (w.name === 'week' ? 'Weekly' : `Weekly · ${w.name.slice(5)}`) : w.name);
@@ -1023,11 +1070,13 @@ function meterRowHTML(a, short) {
   const amount = windowAmount(a, w);
   return `<div class="mrow${amount ? ' has-amt' : ''}"><span class="capsm">${esc(label)}</span>${segsHTML(w, `${windowTitle(w || { name: short ? '5h' : 'week' })}`)}${pctHTML(w)}<span class="rst"${title}>${reset}</span>${amount ? `<span class="rst amt">${esc(amount)}</span>` : ''}</div>`;
 }
-const metersHTML = (a) => `<div class="meters">${!a.quota?.windows?.length && a.quota?.limits?.length ? quotaLimitsHTML(a, true) : `${meterRowHTML(a, true)}${meterRowHTML(a, false)}`}</div>`;
+const meterRowsHTML = (a) => `${noShortLimit(a) ? '' : meterRowHTML(a, true)}${meterRowHTML(a, false)}`;
+const metersHTML = (a) => `<div class="meters">${!a.quota?.windows?.length && a.quota?.limits?.length ? quotaLimitsHTML(a, true) : meterRowsHTML(a)}</div>`;
 
 function miniMetersHTML(a) {
   if (!a.quota?.windows?.length && a.quota?.limits?.length) return quotaLimitsHTML(a, true);
   const row = (short) => {
+    if (short && noShortLimit(a)) return '';
     const w = windowOf(a, short);
     return `<div class="mrow"><span class="capsm">${esc(windowLabel(w, short))}</span>${segsHTML(w, windowTitle(w || { name: short ? '5h' : 'week' }))}${pctHTML(w)}</div>`;
   };
@@ -1036,14 +1085,19 @@ function miniMetersHTML(a) {
 
 // A window as a big bar with its reset line (drawer and account page).
 function windowHTML(a, short, size) {
+  if (short && noShortLimit(a)) return noShortBlockHTML(size);
   const w = windowOf(a, short);
   return windowBlockHTML(a, w, w ? windowTitle(w) : short ? '5-hour' : 'Weekly', size);
+}
+
+function noShortBlockHTML(size) {
+  return `<div class="window"><div class="window-top"><span>5-hour${size === 'xl' ? ' window' : ''}</span><span class="dim">No limit</span></div><span class="note">${esc(NO_SHORT_LIMIT)}</span></div>`;
 }
 
 function quotaWindowsHTML(a, size = 'xl') {
   const windows = (a.quota?.windows || []).filter((w) => quotaOf(w));
   if (!windows.length) return a.quota?.limits?.length ? '' : `${windowHTML(a, true, size)}${windowHTML(a, false, size)}`;
-  return windows.map((w) => windowBlockHTML(a, w, esc(w.model ? scopedTitle(w) : windowTitle(w)), size)).join('');
+  return (noShortLimit(a) ? noShortBlockHTML(size) : '') + windows.map((w) => windowBlockHTML(a, w, esc(w.model ? scopedTitle(w) : windowTitle(w)), size)).join('');
 }
 
 function quotaLimitsHTML(a, compact = false) {
@@ -1103,7 +1157,7 @@ function quotaClientName(c) {
   return S.private ? HIDDEN : c.label || id;
 }
 const QUOTA_METHOD = 'Each rise in the window’s reported use is split over the requests that finished since the previous rise, by their API list price.';
-const dayLabel = (iso) => `${weekday(iso)} ${new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+const dayLabel = (iso) => `${weekday(iso)} ${UsageTools.localTimeText(iso, 'monthDay')}`;
 
 // One row per client (the five largest, then the rest together), then use from outside
 // Fusebox and from before it looked. Bars span the whole window, in the meter's colour.
@@ -1155,7 +1209,7 @@ function quotaControlsHTML(short = false, label = true) {
 }
 
 function setQuotaDisplay(mode, persist = true) {
-  S.quotaDisplay = mode === 'remaining' ? 'remaining' : 'used';
+  S.quotaDisplay = mode === 'used' ? 'used' : 'remaining';
   if (persist) store.set('quota-display', S.quotaDisplay);
   refreshViews();
 }
@@ -1236,7 +1290,7 @@ function overviewHTML() {
       <div class="bars" id="bars">${barsHTML()}</div>
       <div class="axis" aria-hidden="true"><span>60 min ago</span><span>now</span></div></section>`;
   const subs = `<section class="sec" id="ov-subs" aria-label="Subscriptions">${ovSubsHTML()}</section>`;
-  const pool = `<section class="sec" id="ov-pool" aria-label="Weekly quota outlook">${ovPoolHTML()}</section>`;
+  const pool = `<section class="sec" id="ov-pool" aria-label="Combined weekly quota">${ovPoolHTML()}</section>`;
   const other = `<section class="sec" id="ov-other" aria-label="Other circuits">${ovOtherHTML()}</section>`;
   const latest = `<section class="sec" aria-labelledby="latest-title"><div class="sec-head"><h2 class="h-sec" id="latest-title">Latest requests</h2><span class="grow"></span><a class="link" href="#/requests">All requests →</a></div>
       <div id="recent">${recentHTML()}</div></section>`;
@@ -1273,7 +1327,7 @@ function minuteLabel(minute) {
   let label = minuteLabels.get(minute);
   if (label == null) {
     if (minuteLabels.size > 600) minuteLabels.clear();
-    label = new Date(minute * 60000).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    label = hm(minute * 60000);
     minuteLabels.set(minute, label);
   }
   return label;
@@ -1361,9 +1415,9 @@ function ovSubsHTML() {
     const items = subs.map((a) => {
       const st = acctState(a);
       return `<div class="item click" data-open="${esc(a.id)}">
-        <div class="item-top">${acctLogo(a, 18)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span>${esc(provName(a))} · ${esc(planName(a) || authName(a))}</span></div>${statusHTML(a, 7)}</div>
-        <div class="meters indent">${meterRowHTML(a, true)}${meterRowHTML(a, false)}</div>
-        <div class="metaline indent">${st.cls === 'cooling' ? `<span class="fg2">${esc(modelScope(st.model))} · ${st.resetUnknown ? 'Reset time unknown' : `back ${esc(when(st.until))}`}</span>` : ''}${bankedLineHTML(a)}<span>${fmt(a.counters.requests)} requests · <span data-now="${esc(a.id)}" data-inline>${nowHTML(a, true)}</span></span></div>
+        <div class="item-top">${acctLogo(a, 18)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span>${esc(provName(a))} · ${esc(planName(a) || authName(a))}${esc(noShortNote(a))}</span></div>${statusHTML(a, 7)}</div>
+        <div class="meters indent">${meterRowsHTML(a)}</div>
+        <div class="metaline indent">${st.cls === 'cooling' ? `<span class="fg2">${esc(modelScope(st.model))} · ${st.resetUnknown ? 'Reset time unknown' : `back ${esc(when(st.until))}`}</span>` : ''}${bankedLineHTML(a)}${renewalLineHTML(a)}<span>${fmt(a.counters.requests)} requests · <span data-now="${esc(a.id)}" data-inline>${nowHTML(a, true)}</span></span></div>
       </div>`;
     }).join('');
     return `<div class="sec-head"><div class="stack"><h2 class="h-sec">Subscriptions</h2><span class="meta" data-subs-meta="short">${esc(subsMeta(true))}</span></div>${quotaControlsHTML(true, false)}</div>
@@ -1373,9 +1427,9 @@ function ovSubsHTML() {
     const st = acctState(a);
     return `<div class="tr click" data-open="${esc(a.id)}">
       <span class="c-idx idx">${String(i + 1).padStart(2, '0')}</span>
-      <div class="who">${acctLogo(a)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span class="sub">${esc(provName(a))} · ${esc(planName(a) || authName(a))}</span></div></div>
+      <div class="who">${acctLogo(a)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span class="sub">${esc(provName(a))} · ${esc(planName(a) || authName(a))}${esc(noShortNote(a))}</span></div></div>
       ${metersHTML(a)}
-      <div class="c-status">${statusHTML(a)}${st.cls === 'cooling' ? `<span class="subs-line">${esc(modelScope(st.model))} · ${st.resetUnknown ? 'Reset time unknown' : `back ${esc(when(st.until))}`}</span>` : ''}${bankedLineHTML(a)}</div>
+      <div class="c-status">${statusHTML(a)}${st.cls === 'cooling' ? `<span class="subs-line">${esc(modelScope(st.model))} · ${st.resetUnknown ? 'Reset time unknown' : `back ${esc(when(st.until))}`}</span>` : ''}${bankedLineHTML(a)}${renewalLineHTML(a)}</div>
       <span class="c-req r">${fmt(a.counters.requests)}</span>
       <div class="c-last c-now" data-now="${esc(a.id)}">${nowHTML(a)}</div>
     </div>`;
@@ -1386,10 +1440,10 @@ function ovSubsHTML() {
       ${rows}</div>`;
 }
 
-// Plans count by their monthly price; the weights themselves are in src/pools.rs.
-const PLAN_PRICE_NOTE = 'Each account counts by its plan’s monthly price: Claude Pro 1, Max 5x 5, Max 20x 10';
+// Plans count by Claude's published weekly allowance; the weights themselves are in src/pools.rs.
+const PLAN_WEIGHT_NOTE = 'Each account counts by its plan’s weekly allowance: Claude Pro 1, Max 5, Ultra 10';
 
-// How many accounts are on each known plan, most first: [["Max 20x", 2], ["Pro", 1]].
+// How many accounts are on each known plan, most first: [["Ultra", 2], ["Pro", 1]].
 function planCounts(list) {
   const counts = new Map();
   for (const a of list) {
@@ -1408,12 +1462,21 @@ function weeklyPools() {
   }).filter(Boolean);
 }
 
-// Forecast reserves always mean remaining quota, independently of the subscription toggle.
-const POOL_OUTLOOK_NOTE = 'Lowest combined weekly quota expected over the next 7 days, using recent consumption and each account’s scheduled resets. Assumes usage can move between accounts. Five-hour and model limits are separate; banked resets are not predicted.';
-const POOL_CURRENT_NOTE = 'Current combined weekly quota while the forecast learns from recent usage. The forecast appears automatically when enough readings are available.';
+// The status beside the bar comes from this forecast; the bar itself is current quota.
+const POOL_OUTLOOK_NOTE = 'Forecast of the next 7 days from recent consumption and each account’s scheduled resets. Assumes usage can move between accounts. Five-hour and model limits are separate; banked resets are not predicted.';
 
-function poolLearningQuota(p) {
-  return p.outlook?.state === 'learning' && p.accounts > 0 && p.reported === p.accounts ? quotaOf({ used: p.used }) : null;
+// Current combined quota, once every account reports its weekly window.
+function poolQuota(p) {
+  return p.accounts > 0 && p.reported === p.accounts ? quotaOf({ used: p.used }) : null;
+}
+
+// What the forecast assumes: the daily use, and the shortest account history behind it.
+function poolRateText(o) {
+  if (!Number.isFinite(o.rate_per_day)) return '';
+  const h = Math.floor(o.observed_hours);
+  const age = h >= 24 ? `${Math.floor(h / 24)}d${h % 24 ? ` ${h % 24}h` : ''}` : `${h}h`;
+  const short = Number.isFinite(o.observed_hours) && o.observed_hours < 168 ? ` The shortest account history is ${age}.` : '';
+  return ` · Recent use is ${quotaPercent(o.rate_per_day)} of the combined quota a day, the average of the last day and the last week of readings.${short}`;
 }
 
 function poolStatus(p) {
@@ -1425,24 +1488,14 @@ function poolStatus(p) {
   return { text: 'Forecast unavailable', cls: '' };
 }
 
+// As an account's weekly row: the current quota in the selected mode with the even-pace
+// mark and the next account's reset.
 function poolMeterHTML(p) {
   const o = p.outlook || {};
-  const reset = o.next_reset_at ? `<span title="${esc(fullResetTime(o.next_reset_at))}">Next reset in ${liveLeft(o.next_reset_at, true)}</span>` : '<span>No reset time reported</span>';
-  const current = poolLearningQuota(p);
-  if (current) {
-    const label = S.quotaDisplay === 'used' ? 'used now' : 'remaining now';
-    return `<div class="meters"><div class="mrow" title="${esc(POOL_CURRENT_NOTE)}"><span class="capsm">NOW</span>${meterHTML(current, null, `${provName(p.account)} current combined weekly`)}<span class="pct ${current.cls}">${esc(quotaPercent(current[S.quotaDisplay]))}</span><span class="rst">${label}</span></div><div class="pool-note">${reset}</div></div>`;
-  }
-  const status = poolStatus(p);
-  const known = ['on_track', 'tight', 'run_out'].includes(o.state) && Number.isFinite(o.min_remaining);
-  const reserve = known ? Math.max(0, Math.min(100, o.min_remaining)) : null;
-  const label = `${provName(p.account)} lowest projected weekly reserve`;
-  const meter = reserve == null
-    ? `<span class="segs" role="img" aria-label="${esc(label)}: forecast unavailable">${'<i></i>'.repeat(20)}</span>`
-    : `<span class="segs ${status.cls}" role="meter" aria-label="${esc(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${reserve}" aria-valuetext="${esc(`${quotaPercent(reserve)} lowest projected reserve over the next 7 days`)}">${Array.from({ length: 20 }, (_, i) => i < Math.round(reserve / 5) ? '<i class="on"></i>' : '<i></i>').join('')}</span>`;
-  const low = known && o.min_at ? ` · <span title="${esc(fullResetTime(o.min_at))}">Lowest ${esc(when(o.min_at))}</span>` : '';
-  const basis = known && Number.isFinite(o.observed_hours) ? ` · Based on ${Math.floor(o.observed_hours)}h of recent quota readings.` : '';
-  return `<div class="meters"><div class="mrow" title="${esc(POOL_OUTLOOK_NOTE + basis)}"><span class="capsm">MIN</span>${meter}<span class="pct ${status.cls}">${reserve == null ? '–' : esc(quotaPercent(reserve))}</span><span class="rst">lowest reserve</span></div><div class="pool-note">${reset}${low}</div></div>`;
+  const q = poolQuota(p);
+  const pct = q ? `<span class="pct ${q.cls}">${esc(quotaPercent(q[S.quotaDisplay]))}</span>` : '<span class="pct dim" title="Quota not reported">–</span>';
+  const reset = o.next_reset_at ? `<span class="rst" title="${esc(`Next account resets ${fullResetTime(o.next_reset_at)}`)}">↺ ${liveLeft(o.next_reset_at, true)}</span>` : '<span class="rst"></span>';
+  return `<div class="meters"><div class="mrow"><span class="capsm">WK</span>${meterHTML(q, q && p.pace, `${provName(p.account)} combined weekly`)}${pct}${reset}</div></div>`;
 }
 
 function poolStatusHTML(p) {
@@ -1458,10 +1511,11 @@ function poolStatusHTML(p) {
       missing_reset: 'Waiting for every account’s reset time', awaiting_reset: 'Waiting for reset confirmation',
       unavailable_account: 'An account needs to sign in again' })[o.reason] || 'Waiting for quota history';
   }
-  return `<span class="pool-gap ${status.cls}">${status.text}</span><span class="pool-note">${esc(detail)}</span>`;
+  const title = ['on_track', 'tight', 'run_out'].includes(o.state) ? POOL_OUTLOOK_NOTE + poolRateText(o) : '';
+  return `<span class="pool-gap ${status.cls}"${title ? ` title="${esc(title)}"` : ''}>${status.text}</span><span class="pool-note">${esc(detail)}</span>`;
 }
 
-// "3 accounts · Max 20x" when they share a plan, "2 Max 20x, 1 Pro" when every plan is known
+// "3 accounts · Ultra" when they share a plan, "2 Ultra, 1 Pro" when every plan is known
 // and they differ, and the count first whenever some plan or weekly window is missing.
 function poolCount(p) {
   const count = p.reported < p.accounts ? `${fmt(p.reported)} of ${plural(p.accounts, 'account')} reporting` : plural(p.accounts, 'account');
@@ -1473,21 +1527,20 @@ function poolCount(p) {
   return [count, mix].filter(Boolean).join(' · ');
 }
 
-// How the accounts of each pool count: by plan price, or equally when a plan is unknown.
+// How the accounts of each pool count: by plan allowance, or equally when a plan is unknown.
 function poolBasis(pools) {
   const names = (priced) => pools.filter((p) => !!p.priced === priced).map((p) => provName(p.account)).join(', ');
   const [priced, equal] = [names(true), names(false)];
-  if (!equal) return 'Each provider’s subscriptions together, weighted by plan price';
+  if (!equal) return 'Each provider’s subscriptions together, weighted by plan allowance';
   if (!priced) return 'Each provider’s subscriptions together, weighted equally';
-  return `${priced} weighted by plan price, ${equal} equally`;
+  return `${priced} weighted by plan allowance, ${equal} equally`;
 }
-// A forecast per provider, with the lowest reserve before any of the coming resets.
+// Each provider's weekly quota now; the status says whether it lasts until the coming resets.
 function ovPoolHTML() {
   const pools = weeklyPools();
   if (!pools.length) return '';
-  const note = `${POOL_OUTLOOK_NOTE} · ${poolBasis(pools)}${pools.some((p) => p.priced) ? ` · ${PLAN_PRICE_NOTE}` : ''}`;
-  const learning = pools.every((p) => poolLearningQuota(p));
-  const heading = `<div class="sec-head"><h2 class="h-sec">Weekly quota outlook</h2><span class="meta" title="${esc(learning ? POOL_CURRENT_NOTE : note)}">${learning ? 'Current quota while learning' : 'Next 7 days · lowest projected reserve'}</span></div>`;
+  const note = pools.some((p) => p.priced) ? ` title="${esc(PLAN_WEIGHT_NOTE)}"` : '';
+  const heading = `<div class="sec-head"><h2 class="h-sec">Combined weekly quota</h2><span class="meta"${note}>${esc(poolBasis(pools))}</span></div>`;
   if (mob()) {
     const items = pools.map((p) => `<div class="item">
         <div class="item-top">${acctLogo(p.account, 18)}<div class="cell2"><span>${esc(provName(p.account))}</span><span>${esc(poolCount(p))}</span></div></div>
@@ -1909,7 +1962,7 @@ function drawerHTML(a) {
       ${banked && (count || ['pending', 'unknown'].includes(banked.operation?.status)) ? `<div class="notice"><div class="cell2"><span style="font-size:13px">${esc(bankedLabel(a))}</span><span class="small dim">${esc(bankedPolicyText(a))}</span></div><button class="btn sm" type="button" data-act="banked-details" data-id="${esc(a.id)}" aria-haspopup="dialog">Reset details</button></div>` : ''}
       ${accountErrorHTML(a)}
       <div class="block"><span class="label">Since start</span><div class="figs" id="drawer-since">${drawerSinceHTML()}</div></div>
-      <div class="block" style="gap:6px"><span class="label">Sign-in</span><span class="fg2" style="font-size:13px">${esc(signinLine(a))}</span></div>
+      <div class="block" style="gap:6px"><span class="label">Sign-in</span><span class="fg2" style="font-size:13px">${esc(signinLine(a))}</span>${renewalOf(a) ? `<span class="fg2" style="font-size:13px">${esc(renewalRow(a).join(' '))}</span>` : ''}</div>
       <div class="block" style="gap:0" id="drawer-reqs">${drawerRequestsHTML()}</div>
     </div>
     <div class="drawer-foot">${drawerActionsHTML(a)}</div>
@@ -1945,7 +1998,13 @@ function drawerActionsHTML(a) {
   if (S.confirm === a.id) {
     return `<span class="meta grow">Remove ${esc(acctLabel(a))}?</span><button class="btn ghost" type="button" data-act="cancel-delete">Keep</button><button class="btn danger" type="button" data-act="delete" data-id="${esc(a.id)}" style="border-color:var(--err-btn-line)">Remove</button>`;
   }
+  const tested = S.acctTest && S.acctTest.id === a.id ? S.acctTest : null;
+  const result = tested && tested.result ? (tested.result.ok
+    ? `<span class="meta" role="status">Replied “${esc(tested.result.reply || 'ok')}” in ${ms(tested.result.ms)} · ${esc(tested.result.model)}</span>`
+    : `<span class="meta warn" role="status">HTTP ${tested.result.status} · ${esc(tested.result.error || 'failed')}</span>`) : '';
   return `${a.kind === 'oauth' ? `<button class="btn" type="button" data-act="refresh" data-id="${esc(a.id)}">Refresh</button>` : ''}
+    <button class="btn" type="button" data-act="test" data-id="${esc(a.id)}" ${a.disabled || tested?.running ? 'disabled' : ''} title="Sends one small request to this account only — no other account is tried. It counts against quota and may start a 5-hour window.">${tested?.running ? 'Testing…' : 'Test'}</button>
+    ${result}
     <button class="btn" type="button" data-act="toggle" data-id="${esc(a.id)}">${a.disabled ? 'Enable' : 'Disable'}</button>
     <span class="grow"></span><button class="btn danger" type="button" data-act="confirm-delete" data-id="${esc(a.id)}">Remove</button>`;
 }
@@ -2095,9 +2154,43 @@ function renderFaultsMenu(list = faultsList()) {
     const where = al.kind === 'storage' ? esc(al.provider || 'Usage')
       : !al.id ? `${esc(al.provider)} · all subscriptions`
         : `${esc(a ? provName(a) : al.provider || '')} · ${esc(a ? acctLabel(a) : al.label ? who(al.label) : '')}`;
-    return `<button class="fault-item" type="button" data-act="alert-open" data-id="${i}"${tip}><span class="dot ${al.lvl}"></span><span class="cell2"><b>${esc(al.title)}</b><span class="mono">${where}</span></span><span class="chev" aria-hidden="true">›</span></button>`;
+    // Only the server's faults have a key to dismiss them by.
+    const dismiss = al.key ? `<button class="icon-btn fault-x" type="button" data-act="fault-dismiss" data-id="${esc(al.key)}" aria-label="Dismiss ${esc(al.title)}" title="Dismiss until it clears">${ICON.x}</button>` : '';
+    return `<div class="fault-row"><button class="fault-item" type="button" data-act="alert-open" data-id="${i}"${tip}><span class="dot ${al.lvl}"></span><span class="cell2"><b>${esc(al.title)}</b><span class="mono">${where}</span></span><span class="chev" aria-hidden="true">›</span></button>${dismiss}</div>`;
   }).join('');
-  $('#lay-faults').innerHTML = `<div class="scrim menu" data-act="close-faults"></div><div class="faults-menu" id="faults-menu" role="dialog" aria-label="Faults"${style}>${items || '<p class="pal-none">Nothing tripped. Every account is in rotation.</p>'}</div>`;
+  const n = S.faultList ? S.dismissedFaults : 0;
+  const restore = n ? `<div class="faults-foot"><span>${n} dismissed until ${n === 1 ? 'it clears' : 'they clear'}</span><button class="linkbtn" type="button" data-act="faults-restore">Show again</button></div>` : '';
+  const none = n ? '<p class="pal-none">Nothing else tripped.</p>' : '<p class="pal-none">Nothing tripped. Every account is in rotation.</p>';
+  $('#lay-faults').innerHTML = `<div class="scrim menu" data-act="close-faults"></div><div class="faults-menu" id="faults-menu" role="dialog" aria-label="Faults"${style}>${items || none}${restore}</div>`;
+}
+
+// Dismisses a fault everywhere (the dashboards and the app) until it clears or a warning
+// turns into an error. The menu updates at once; the live list confirms it.
+async function dismissFault(key) {
+  const at = $$('#faults-menu .fault-x').findIndex((b) => b.dataset.id === key);
+  if (S.faultList) {
+    S.faultList = S.faultList.filter((f) => f.key !== key);
+    S.dismissedFaults += 1;
+    renderFaults();
+  }
+  const next = $$('#faults-menu .fault-x')[at] || $$('#faults-menu .fault-x').at(-1) || $('#faults-menu [data-act="faults-restore"]');
+  next?.focus();
+  try {
+    await api('/faults/dismiss', { method: 'POST', body: JSON.stringify({ key }) });
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+async function restoreFaults() {
+  try {
+    await api('/faults/restore', { method: 'POST', body: '{}' });
+    S.dismissedFaults = 0;
+    renderFaults();
+    $('#faults-menu .fault-item')?.focus();
+  } catch (e) {
+    toast(e.message);
+  }
 }
 
 function closeLayers() {
@@ -2216,7 +2309,7 @@ function accountListHTML() {
       const st = acctState(a);
       const fails = a.counters.failures;
       return `<div class="item click${a.disabled ? ' off' : ''}" data-open="${esc(a.id)}" style="${a.disabled ? 'opacity:.55' : ''}">
-        <div class="item-top">${acctLogo(a, 18)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span>${esc(provName(a))} · ${esc(authName(a))}</span></div>${statusHTML(a, 7)}</div>
+        <div class="item-top">${acctLogo(a, 18)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span>${esc(provName(a))} · ${esc(authName(a))}${esc(noShortNote(a))}</span></div>${statusHTML(a, 7)}</div>
         ${metered(a) ? `<div class="indent">${miniMetersHTML(a)}</div>` : ''}
         <div class="metaline indent">${st.cls === 'cooling' ? `<span>${esc(modelScope(st.model))}</span>` : ''}${bankedLineHTML(a)}<span>${fmt(a.counters.requests)} req · ${liveAgo(a.last_used)}</span>${fails ? `<span class="err">${fmt(fails)} failed</span>` : ''}${a.counters.cancelled ? `<span>${fmt(a.counters.cancelled)} cancelled</span>` : ''}${usageCoverageText(a.counters) ? `<span>Usage: ${usageCoverageText(a.counters)}</span>` : ''}</div>
         ${a.last_error && !a.disabled ? `<span class="errline indent">${esc(hideEmails(a.last_error))}</span>` : ''}
@@ -2229,7 +2322,7 @@ function accountListHTML() {
     return `<div class="acct-item${a.disabled ? ' off' : ''}">
       <div class="tr click" data-open="${esc(a.id)}">
         <span class="c-idx idx">${String(list.indexOf(a) + 1).padStart(2, '0')}</span>
-        <div class="who">${acctLogo(a)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span class="sub">${esc(acctSub(a))}</span></div></div>
+        <div class="who">${acctLogo(a)}<div class="cell2"><button class="name-btn" type="button" data-act="open-acc" data-id="${esc(a.id)}">${esc(acctLabel(a))}</button><span class="sub">${esc(acctSub(a) + noShortNote(a))}</span></div></div>
         ${metered(a) ? metersHTML(a) : '<span class="no-limits">No usage limits</span>'}
         <div class="c-status">${statusHTML(a)}${statusExtrasHTML(a)}</div>
         <div class="c-traffic"><span>${fmt(c.requests)} <span class="dim">requests</span></span><span class="subs-line">${aggregateTokensHTML(c, 'input_tokens')} in · ${aggregateTokensHTML(c, 'output_tokens')} out${c.failures ? ` · <span class="err">${fmt(c.failures)} failed</span>` : ''}${c.cancelled ? ` · ${fmt(c.cancelled)} cancelled` : ''}</span>${usageCoverageText(c) ? `<span class="subs-line">Usage: ${usageCoverageText(c)}</span>` : ''}</div>
@@ -2316,17 +2409,22 @@ function detBankedHTML(a) {
 function windowStarterHTML(a) {
   if (!a.window_starter_supported) return '';
   const v = a.window_starter;
+  // Without a 5-hour limit there is no window to start, so there is no starter either.
+  // Fresh quota wins: a 5-hour window reported since the last check means it is back.
+  if (noShortLimit(a) || (v?.status === 'not_needed' && !windowOf(a, true))) return '';
   const busy = !!S.windowStarterBusy?.[a.id];
   const reset = windowOf(a, true)?.resets_at || v?.resets_at;
   const active = reset && Date.parse(reset) > Date.now();
   const held = v?.retry_after && Date.parse(v.retry_after) > Date.now() && ['unknown', 'refused'].includes(v.status);
-  const status = active ? `Window resets ${when(reset)}` : v?.message || (a.window_starter_selected ? 'Automatic starting is enabled for this account.' : 'Automatic starting is off for this account.');
+  const message = v?.status === 'not_needed' ? '' : v?.message;
+  const status = active ? `Window resets ${when(reset)}` : message || (a.window_starter_selected ? 'Automatic starting is enabled for this account.' : 'Automatic starting is off for this account.');
+  const check = active || held;
   return `<div class="window-starter block" aria-label="Window starter"><div class="cell2"><span class="label">Window starter</span>
     <span class="fg2">${esc(status)}</span>
     ${held ? `<span class="small dim">${esc(`Next starter allowed ${when(v.retry_after)}`)}</span>` : ''}
     ${v?.attempted_at ? `<span class="small dim">${esc(`Last requested ${when(v.attempted_at)}${v.automatic ? ' · automatic' : ' · manual'}`)}</span>` : ''}
     <span class="small dim">Starting sends a small Claude request and uses subscription quota.</span></div>
-    <div><button type="button" class="btn sm" data-act="${active || held ? 'window-check' : 'window-start'}" data-id="${esc(a.id)}" ${busy || a.disabled ? 'disabled' : ''}>${busy ? 'Checking…' : active || held ? 'Check status' : 'Start now'}</button></div></div>`;
+    <div><button type="button" class="btn sm" data-act="${check ? 'window-check' : 'window-start'}" data-id="${esc(a.id)}" ${busy || a.disabled ? 'disabled' : ''}>${busy ? 'Checking…' : check ? 'Check status' : 'Start now'}</button></div></div>`;
 }
 
 async function windowStarterAction(id, checkOnly) {
@@ -2411,13 +2509,135 @@ async function setPriority(id, priority) {
   } catch (e) { toast(e.message); }
 }
 
+// When a subscription charges next, or ends when cancelled (src/quota/renewal.rs): the date
+// ChatGPT gives, or a billing day set by hand where the provider gives none (Claude, Meta).
+// A ChatGPT date that passed before the next read is moved on a period and marked estimated.
+// A day set by hand (`manual`) has no time: it stays the next charge until the day is over,
+// and is an estimate only once the plan changed since it was set.
+function renewalOf(a) {
+  const r = a.quota?.renewal;
+  const at = Date.parse(r?.at);
+  if (!at) return null;
+  const until = r.manual ? new Date(at).setHours(24, 0, 0, 0) : at;
+  return until > Date.now() ? r : null;
+}
+
+// Whole local days until `iso`: "today", "tomorrow", "in 19 days".
+function daysAway(iso) {
+  const n = Math.round((new Date(iso).setHours(0, 0, 0, 0) - new Date().setHours(0, 0, 0, 0)) / 864e5);
+  return n <= 0 ? 'today' : n === 1 ? 'tomorrow' : `in ${n} days`;
+}
+
+function renewalRow(a) {
+  const r = renewalOf(a);
+  if (!r) {
+    const b = a.billing;
+    return b?.ends ? ['Ended', `${dayDate(`${b.date}T12:00:00`)} · cancelled`] : null;
+  }
+  if (r.manual) {
+    const parts = [dayDate(r.at), daysAway(r.at)];
+    if (r.ends) return ['Ends', [...parts, 'cancelled'].join(' · ')];
+    parts.push(r.period || 'monthly');
+    if (r.estimated) parts.push('plan changed, check the date');
+    return ['Renews', parts.join(' · ')];
+  }
+  if (r.ends) return ['Ends', `${dayDate(r.at)} · in ${left(r.at)} · cancelled`];
+  const parts = [r.estimated ? `about ${dayDate(r.at)}` : `${dayDate(r.at)}, ${hm(r.at)}`, `in ${left(r.at)}`];
+  if (r.estimated) parts.push('estimated');
+  else if (r.period) parts.push(r.period);
+  return ['Renews', parts.join(' · ')];
+}
+
+// The renewal row, with a way to set the billing day where the provider gives none.
+function billingRowHTML(a) {
+  if (S.billing?.id === a.id) return billingFormHTML(a);
+  const row = renewalRow(a);
+  // A date the provider gives (ChatGPT's) isn't overridden.
+  const editable = a.takes_billing && (!a.quota?.renewal || a.quota.renewal.manual);
+  const button = (label, aria) => `<button class="linkbtn" type="button" data-act="billing-edit" data-id="${esc(a.id)}"${aria ? ` aria-label="${aria}"` : ''}>${label}</button>`;
+  if (!row) return editable ? `<div class="kv"><span>Renews</span><span>${button('Set billing date')}</span></div>` : '';
+  return `<div class="kv"><span>${row[0]}</span><span>${esc(row[1])}${editable ? ` · ${button('Change', 'Change billing date')}` : ''}</span></div>`;
+}
+
+// Today in the browser's time zone, `months` on, as a date input's value.
+function localDay(months = 0) {
+  const d = new Date();
+  d.setMonth(d.getMonth() + months);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Only Claude Pro is sold yearly; Max, Ultra and Meta's plans are monthly only.
+const yearlyBilling = (a) => a.provider === 'claude' && (a.quota?.plan === 'pro' || a.billing?.period === 'yearly');
+
+function billingFormHTML(a) {
+  const B = S.billing;
+  const id = esc(a.id);
+  const yearly = B.period === 'yearly';
+  const seg = (act, value, label, on) => `<button type="button" data-act="${act}" data-id="${id}" data-value="${value}" aria-pressed="${on}">${label}</button>`;
+  const note = B.ends
+    ? 'Cancelled: it ends when the period paid for runs out, on the first billing day from this date that hasn’t passed.'
+    : `${provName(a)} doesn’t share billing dates. Enter the day of your last or next charge: Fusebox counts on ${yearly ? 'a year' : 'a month'} at a time and reminds you before each charge.`;
+  const changed = a.billing?.plan_changed ? '<small class="warn">The plan changed since this date was set, and a plan change can move the billing day.</small>' : '';
+  return `<form class="billing-form" data-form="billing" data-id="${id}" aria-label="Billing date" aria-busy="${!!B.busy}">
+    <label class="field"><span>Billing day</span><input id="billing-date" type="date" name="date" value="${esc(B.date || '')}" max="${localDay(yearly ? 12 : 1)}" required ${B.busy ? 'disabled' : ''}></label>
+    <div class="billing-segs">${yearlyBilling(a) ? `<div class="seg" role="group" aria-label="Billed">${seg('billing-period', 'monthly', 'Monthly', !yearly)}${seg('billing-period', 'yearly', 'Yearly', yearly)}</div>` : ''}<div class="seg" role="group" aria-label="Subscription">${seg('billing-ends', '0', 'Renews', !B.ends)}${seg('billing-ends', '1', 'Cancelled', !!B.ends)}</div></div>
+    <small class="meta">${esc(note)}</small>${changed}
+    ${B.error ? `<small class="err" role="alert">${esc(B.error)}</small>` : ''}
+    <div class="billing-actions"><button class="btn sm primary" type="submit" ${B.busy ? 'disabled' : ''}>${B.busy ? 'Saving…' : 'Save'}</button><button class="btn sm" type="button" data-act="billing-cancel" data-id="${id}">Cancel</button>${a.billing ? `<button class="btn sm danger" type="button" data-act="billing-clear" data-id="${id}" ${B.busy ? 'disabled' : ''}>Remove date</button>` : ''}</div>
+  </form>`;
+}
+
+function editBilling(id) {
+  const a = accountById(id);
+  if (!a) return;
+  const b = a.billing;
+  S.billing = { id, date: b?.date || '', period: b?.period === 'yearly' && yearlyBilling(a) ? 'yearly' : 'monthly', ends: !!b?.ends, busy: false, error: '' };
+  patch('det-root', detailBodyHTML);
+  $('#billing-date')?.focus();
+}
+
+function closeBilling() {
+  const id = S.billing?.id;
+  S.billing = null;
+  patch('det-root', detailBodyHTML);
+  if (id) $(`[data-act="billing-edit"][data-id="${CSS.escape(id)}"]`)?.focus();
+}
+
+// Saves the billing day (or removes it, without a date) in the account's credential file.
+async function saveBilling(id, date) {
+  const B = S.billing;
+  if (!B || B.id !== id || B.busy) return;
+  Object.assign(B, { busy: true, error: '' });
+  patch('det-root', detailBodyHTML);
+  try {
+    const body = date ? { date, period: B.period, ends: B.ends } : { date: null };
+    await api(`/accounts/${encodeURIComponent(id)}/billing`, { method: 'POST', body: JSON.stringify(body) });
+    toast(!date ? 'Billing date removed' : B.ends ? 'Saved: the subscription ends then' : 'Billing date saved');
+    closeBilling();
+    refreshAccounts();
+  } catch (e) {
+    if (S.billing !== B) return toast(e.message);
+    Object.assign(B, { busy: false, error: e.message });
+    patch('det-root', detailBodyHTML);
+    $('#billing-date')?.focus();
+  }
+}
+
+// "Renews tomorrow" under a subscription's status in the last days before a charge.
+function renewalLineHTML(a) {
+  const r = renewalOf(a);
+  if (!r || new Date(r.at).setHours(0, 0, 0, 0) - new Date().setHours(0, 0, 0, 0) > 2 * 864e5) return '';
+  return `<span class="subs-line" title="${esc(renewalRow(a).join(': '))}">${r.ends ? 'Ends' : 'Renews'} ${daysAway(r.at)}</span>`;
+}
+
 function detSigninHTML(a) {
   const pad = mob() ? '12px 14px 4px' : '18px 20px 8px';
   const rows = [['Method', authName(a)]];
   if (planName(a)) rows.push(['Plan', `${provName(a)} ${planName(a)}`]);
+  const after = [];
   if (a.kind === 'oauth' && a.expires_at) {
     const secs = (Date.parse(a.expires_at) - Date.now()) / 1000;
-    rows.push(['Token', secs > 0 ? `valid ${span(secs)} · refreshes on its own` : 'expired · refreshes on its own']);
+    after.push(['Token', secs > 0 ? `valid ${span(secs)} · refreshes on its own` : 'expired · refreshes on its own']);
   }
   const models = (a.models || []).slice(0, 24);
   const more = (a.models || []).length - models.length;
@@ -2427,8 +2647,9 @@ function detSigninHTML(a) {
   const serves = editing
     ? `<div class="kv col" style="gap:6px"><span>Serves</span>${acctModelPickerHTML(S.modelEdit)}</div>`
     : `<div class="kv col" style="gap:6px"><span>Serves ${fetchBtn}</span><span class="chipset">${models.map((m) => `<span class="idchip static">${esc(m)}</span>`).join('')}${more > 0 ? `<span class="idchip static">+${more} more</span>` : ''}${models.length ? '' : '<span class="dim">No models</span>'}</span></div>`;
+  const kv = (list) => list.map(([k, v]) => `<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`).join('');
   return `<section class="card" style="padding:${pad}" aria-label="Sign-in"><span class="label">Sign-in</span>
-    <div style="margin-top:10px">${rows.map(([k, v]) => `<div class="kv"><span>${k}</span><span>${esc(v)}</span></div>`).join('')}
+    <div style="margin-top:10px">${kv(rows)}${billingRowHTML(a)}${kv(after)}
       <div class="kv col"><span>Stored in</span><span class="mono fg2" style="font-size:12px;word-break:break-all">${esc(storedIn(a))}</span></div>
       ${serves}</div>
     ${canSignIn(a) ? `<button class="btn" type="button" data-act="signin-again" data-id="${esc(a.id)}" style="margin:8px 0;${mob() ? 'width:100%;height:44px' : ''}">Sign in again</button>` : ''}</section>`;
@@ -2793,8 +3014,9 @@ function bankedLineHTML(a) {
 function resetButton(a, act, label, disabled = false, extra = '') {
   return `<button type="button" class="btn sm ${['banked-open', 'banked-confirm'].includes(act) ? 'primary' : ''}" data-act="${act}" data-id="${esc(a.id)}" ${disabled ? 'disabled' : ''} ${extra}>${label}</button>`;
 }
+// The browser's locale orders the date; the clock is always 24-hour, as elsewhere.
 function resetDate(value) {
-  return value ? new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'No expiry reported';
+  return value ? new Date(value).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short', hourCycle: 'h23' }) : 'No expiry reported';
 }
 function grantDetail(g) {
   return `${g.expires_at ? `Expires ${resetDate(g.expires_at)}` : 'No expiry reported'} · Clears ${g.clears.join(', ') || 'provider limits'}`;
@@ -2815,7 +3037,8 @@ function bankedResetsHTML(a) {
       const selection = a.provider === 'claude' && choices.length > 1
         ? `<label class="reset-selection">Grant<select data-reset-grant="${esc(a.id)}" ${local.busy ? 'disabled' : ''}>${choices.map((g) => `<option value="${esc(g.id)}" ${g.id === d.grant ? 'selected' : ''}>${esc(g.label)} · ${g.remaining} left</option>`).join('')}</select></label>`
         : grant ? `<p class="reset-grant-name">${esc(grant.label)}</p>` : '';
-      content = `<p>This uses one saved reset.</p>${a.provider === 'codex' ? '<p class="sub">Codex chooses the reset and restores its subscription limits.</p>' : `${selection}${grant ? `<p class="sub">${esc(grantDetail(grant))}</p>` : ''}`}`;
+      const codexNote = a.provider !== 'codex' ? '' : grant ? '<p class="sub">Uses the reset that expires first.</p>' : '<p class="sub">Codex chooses the reset and restores its subscription limits.</p>';
+      content = `<p>This uses one saved reset.</p>${selection}${grant ? `<p class="sub">${esc(grantDetail(grant))}</p>` : ''}${codexNote}`;
       controls = `${resetButton(a, 'banked-cancel', 'Back', local.busy)}${resetButton(a, 'banked-confirm', local.busy ? 'Applying…' : 'Apply reset', local.busy || a.disabled)}`;
     } else if (d.action === 'retry') {
       title = 'Retry reset request?';
@@ -3181,14 +3404,19 @@ function famRoute(f) {
   const rep = f.ids.reduce((best, id) => (routeSteps(id).length > routeSteps(best).length ? id : best), f.ids[0]);
   const rows = routeSteps(rep).map((s) => ({ ...s }));
   const seen = new Set(rows.map((r) => r.account));
+  const models = new Set(), coverage = new Map();
   for (const id of f.ids) {
+    const model = unprefixed(id);
+    models.add(model);
     for (const s of routeSteps(id)) {
       if (!seen.has(s.account)) { seen.add(s.account); rows.push({ ...s, next: false }); }
+      if (!coverage.has(s.account)) coverage.set(s.account, new Set());
+      coverage.get(s.account).add(model);
     }
   }
   // Coverage counts models, so an account's prefixed copies don't make the others look partial.
-  const models = new Set(f.ids.map(unprefixed));
-  for (const r of rows) r.serves = new Set(f.ids.filter((id) => routeSteps(id).some((s) => s.account === r.account)).map(unprefixed)).size;
+  // Accumulate it while visiting routes, instead of rescanning all routes for every account.
+  for (const r of rows) r.serves = coverage.get(r.account).size;
   return { rep, models: models.size, rows: rows.filter((r) => accountById(r.account)) };
 }
 
@@ -3205,6 +3433,8 @@ function failuresByModel() {
 function routeStepText(step, a) {
   const st = acctState(a);
   if (step.state === 'disabled' || a.disabled) return { txt: 'Disabled · skipped', short: 'Disabled', cls: 'off' };
+  // Held out until a sign-in, even after its error was cleared or the account reset.
+  if (step.state === 'signin') return { txt: 'Sign-in expired · skipped', short: 'Sign-in expired', cls: 'err' };
   if (step.state === 'cooling' || st.cls === 'cooling') {
     if (st.resetUnknown) return { txt: 'Quota used up · Reset time unknown', short: 'Quota used up', cls: 'warn' };
     const until = step.until || st.until;
@@ -3245,92 +3475,7 @@ function groupsCardHTML() {
     ${background ? line('<span class="idchip static">Claude Code background calls</span>', 'go to', [background], '') : ''}</section>`;
 }
 
-// The playground: one prompt to one model, through routing like any request, streamed.
-function playHTML() {
-  const P = S.play;
-  if (!P) return '';
-  const ids = [...Object.keys(S.routes?.groups || {}), ...S.models.map((m) => m.id)];
-  return `<section class="card pad play" aria-label="Try a model">
-    <div class="card-head"><span class="label">Try a model</span><button class="icon-btn" type="button" data-act="close-play" aria-label="Close the playground">×</button></div>
-    <form id="play-form" class="play-form">
-      <div class="field"><label for="play-model">Model</label><input id="play-model" list="play-models" value="${esc(P.model)}" required autocomplete="off" spellcheck="false" placeholder="claude-sonnet-5-5">
-        <datalist id="play-models">${ids.map((id) => `<option value="${esc(id)}">`).join('')}</datalist></div>
-      <div class="field"><label for="play-prompt">Prompt</label><textarea id="play-prompt" rows="3" required>${esc(P.prompt)}</textarea></div>
-      <div class="play-actions"><button class="btn primary" type="submit"${P.busy ? ' disabled' : ''}>${P.busy ? 'Sending…' : 'Send'}</button>
-        ${P.busy ? '<button class="btn ghost" type="button" data-act="stop-play">Stop</button>' : ''}
-        <span class="meta" id="play-meta" role="status">${esc(P.meta || 'Shows on the Usage page as the client dashboard.')}</span></div>
-    </form>
-    <pre class="play-out${P.error ? ' err' : ''}" id="play-out"${P.out || P.error ? '' : ' hidden'}>${esc(P.error || P.out)}</pre></section>`;
-}
-
-async function runPlay(form) {
-  const P = S.play;
-  if (!P || P.busy) return;
-  P.model = form.querySelector('#play-model').value.trim();
-  P.prompt = form.querySelector('#play-prompt').value;
-  if (!P.model || !P.prompt.trim()) return;
-  Object.assign(P, { busy: true, out: '', error: '', meta: '', abort: new AbortController() });
-  patch('models-play', playHTML);
-  const started = performance.now();
-  let first = null;
-  let usage = null;
-  let account = null;
-  try {
-    const headers = { 'content-type': 'application/json' };
-    if (S.key) headers.authorization = `Bearer ${S.key}`;
-    const res = await fetch('/api/playground', { method: 'POST', headers, body: JSON.stringify({ model: P.model, prompt: P.prompt }), signal: P.abort.signal });
-    account = res.headers.get('x-fusebox-account');
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error?.message || data.error || res.statusText);
-    }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let cut;
-      while ((cut = buf.indexOf('\n\n')) >= 0) {
-        const block = buf.slice(0, cut);
-        buf = buf.slice(cut + 2);
-        for (const line of block.split('\n')) {
-          if (!line.startsWith('data:')) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === '[DONE]') continue;
-          let v;
-          try { v = JSON.parse(data); } catch { continue; }
-          if (v.error) throw new Error(v.error.message || 'The request failed');
-          const delta = v.choices?.[0]?.delta || {};
-          if ((delta.content || delta.reasoning_content) && first == null) first = performance.now() - started;
-          if (delta.content) {
-            P.out += delta.content;
-            const out = $('#play-out');
-            if (out) { out.hidden = false; out.textContent = P.out; }
-          }
-          if (v.usage) usage = v.usage;
-        }
-      }
-    }
-    P.meta = [account && `Answered by ${who(account)}`, first != null && `first token ${ms(Math.round(first))}`, `total ${ms(Math.round(performance.now() - started))}`,
-      usage && `${fmt(usage.prompt_tokens || 0)} in · ${fmt(usage.completion_tokens || 0)} out`].filter(Boolean).join(' · ');
-  } catch (e) {
-    if (e.name === 'AbortError') P.meta = 'Stopped.';
-    else P.error = e.message;
-  }
-  Object.assign(P, { busy: false, abort: null });
-  if (S.play === P) patch('models-play', playHTML);
-}
-
-document.addEventListener('submit', (e) => {
-  if (e.target.id !== 'play-form') return;
-  e.preventDefault();
-  runPlay(e.target);
-});
-document.addEventListener('keydown', (e) => {
-  if (e.target.id === 'play-prompt' && e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); runPlay(e.target.form); }
-});
+// The playground ("Try a model") is in playground.js.
 
 const MODEL_EXAMPLE = {
   claude: 'claude-opus-6', codex: 'gpt-7', gemini: 'gemini-4-pro', vertex: 'gemini-4-pro', antigravity: 'gemini-4-pro',
@@ -3416,8 +3561,12 @@ async function checkModels(btn) {
   const m = S.addModel;
   try {
     const r = await api('/models/check', { method: 'POST' });
-    const msg = !r.asked ? 'Every account was checked in the last 10 minutes.'
-      : r.new.length ? `New: ${r.new.join(', ')}.` : `Asked ${plural(r.asked, 'account')}; nothing new.`;
+    let msg = r.new.length ? `New: ${r.new.join(', ')}.`
+      : r.asked ? `Asked ${plural(r.asked, 'account')}; nothing new.` : 'Every account was checked in the last 10 minutes.';
+    if (r.in_progress) {
+      const pending = 'Some accounts are still being checked; results will appear automatically.';
+      msg = r.asked || r.new.length ? `${msg} ${pending}` : pending;
+    }
     if (m) Object.assign(m, { msg, err: false, model: $('#models-panel input[name="model"]')?.value || m.model });
     refreshAccounts();
   } catch (e) {
@@ -3646,7 +3795,7 @@ function pushDeviceInner() {
   return `<div class="cfg-list-head"><div class="cell2"><h3>This device</h3><p class="cfg-description">${esc(text)}</p></div>${actions ? `<div class="push-actions">${actions}</div>` : ''}</div>
     ${p.msg ? `<p class="msg err" role="alert">${esc(p.msg)}</p>` : ''}
     ${others.length ? `<div class="push-devices"><span class="label">Other devices</span>${others.map((d) => `<div class="push-device">
-      <span class="dot s6 ok" aria-hidden="true"></span><span class="grow"><span>${esc(d.label)}</span><span class="meta">${esc(d.origin.replace(/^https?:\/\//, ''))} \u00b7 added ${esc(day(d.created_at))}</span></span>
+      <span class="dot s6 ok" aria-hidden="true"></span><span class="grow"><span>${esc(d.label)}</span><span class="meta">${esc(d.kind === 'apns' ? 'iPhone app' : d.origin.replace(/^https?:\/\//, ''))} \u00b7 added ${esc(day(d.created_at))}</span></span>
       <button type="button" class="btn sm" data-act="push-remove" data-id="${esc(d.id)}" ${p.busy ? 'disabled' : ''} aria-label="Remove ${esc(d.label)}">Remove</button></div>`).join('')}</div>` : ''}`;
 }
 
@@ -3874,6 +4023,21 @@ async function accountAction(act, id) {
   refreshAccounts();
 }
 
+// One tiny request pinned to this account (no failover), so the drawer can
+// say whether this sign-in itself answers. The result stays in the drawer.
+async function testAccount(id) {
+  S.acctTest = { id, running: true, result: null };
+  refreshViews();
+  try {
+    const result = await api(`/accounts/${encodeURIComponent(id)}/test`, { method: 'POST' });
+    S.acctTest = { id, running: false, result };
+  } catch (e) {
+    S.acctTest = { id, running: false, result: { ok: false, status: e.status || 0, error: e.message } };
+  }
+  refreshViews();
+  refreshAccounts();
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -3937,19 +4101,10 @@ document.addEventListener('click', (e) => {
       patchModelsPanel();
       return $('#models-panel input[name="model"]')?.focus();
     case 'check-models': return checkModels(el);
-    case 'open-play':
-      if (S.play) { S.play.abort?.abort(); S.play = null; patch('models-play', playHTML); return; }
-      S.play = { model: S.models.find((m) => m.id.startsWith('claude-'))?.id || S.models[0]?.id || '', prompt: 'Say hello in one sentence.', out: '', error: '', meta: '', busy: false, abort: null };
-      patch('models-play', playHTML);
-      for (const b of $$('[data-act="open-play"]')) b.setAttribute('aria-expanded', 'true');
-      return $('#play-prompt')?.focus();
-    case 'close-play':
-      S.play?.abort?.abort();
-      S.play = null;
-      patch('models-play', playHTML);
-      for (const b of $$('[data-act="open-play"]')) b.setAttribute('aria-expanded', 'false');
-      return $('[data-act="open-play"]')?.focus();
-    case 'stop-play': S.play?.abort?.abort(); return;
+    case 'open-play': return openPlay();
+    case 'close-play': return closePlay();
+    case 'stop-play': return stopPlay();
+    case 'play-mode': return setPlayMode(id);
     case 'remove-model': return removeModel(id, el.dataset.provider);
     case 'dismiss-removed':
       store.set('removedSeen', (S.routes?.removed_models || []).map((r) => r.at).sort().pop() || new Date().toISOString());
@@ -3961,6 +4116,8 @@ document.addEventListener('click', (e) => {
     case 'faults': return toggleFaults(el);
     case 'close-faults': return closeFaults();
     case 'alert-open': return runAlert(id);
+    case 'fault-dismiss': return dismissFault(id);
+    case 'faults-restore': return restoreFaults();
     case 'open-acc': return openAccount(id);
     case 'close-drawer': return closeDrawer();
     case 'to-list': location.hash = '#/accounts'; return;
@@ -3977,6 +4134,15 @@ document.addEventListener('click', (e) => {
       patch('acct-timeline', resetTimelineHTML);
       return patch('acct-list', accountListHTML);
     case 'priority': return setPriority(id, Number(el.dataset.value));
+    case 'billing-edit': return editBilling(id);
+    case 'billing-cancel': return closeBilling();
+    case 'billing-clear': return saveBilling(id, null);
+    case 'billing-period': case 'billing-ends':
+      if (!S.billing) return;
+      if (act === 'billing-period') S.billing.period = el.dataset.value;
+      else S.billing.ends = el.dataset.value === '1';
+      patch('det-root', detailBodyHTML);
+      return $(`[data-act="${act}"][data-value="${el.dataset.value}"]`)?.focus();
     case 'filter-session':
       e.stopPropagation();
       S.reqSess = id;
@@ -4074,6 +4240,9 @@ document.addEventListener('click', (e) => {
       e.stopPropagation();
       if (act === 'reset') toast('Cooldowns cleared');
       return accountAction(act, id);
+    case 'test':
+      e.stopPropagation();
+      return testAccount(id);
     case 'clear-error':
       e.stopPropagation();
       return clearAccountError(id);
@@ -4087,7 +4256,9 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('input', (e) => {
-  if (e.target.id === 'req-filter') {
+  if (e.target.id === 'billing-date' && S.billing) {
+    S.billing.date = e.target.value;
+  } else if (e.target.id === 'req-filter') {
     S.filter = e.target.value;
     S.openReq = null;
     const base = visibleRequests();
@@ -4198,6 +4369,7 @@ document.addEventListener('submit', async (e) => {
   if (kind === 'paste') return submitPaste(form);
   if (kind === 'key') return submitKey(form);
   if (kind === 'add-model') return submitAddModel(form);
+  if (kind === 'billing') return saveBilling(form.dataset.id, form.elements.date.value);
   if (kind === 'vertex') return submitVertex(form);
   if (kind === 'kiro') return submitKiro(form);
   if (kind === 'unlock') {
@@ -4389,6 +4561,7 @@ function setTimerText(el, text) {
   el.textContent = text;
 }
 function tickTimers() {
+  syncLocalTime();
   const now = Date.now();
   let expired = S.accounts.some((a) => a.last_error_until && Date.parse(a.last_error_until) <= now);
   let quota = false;

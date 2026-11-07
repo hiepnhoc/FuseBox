@@ -24,6 +24,10 @@ pub struct Member<'a> {
     pub windows: &'a [Window],
     pub history: &'a [crate::outlook::History],
     pub forecast_available: bool,
+    /// The provider confirmed the account has no 5-hour limit.
+    pub no_five_hour: bool,
+    /// Paused as a whole for a quota or rate limit.
+    pub paused: bool,
 }
 
 impl Member<'_> {
@@ -33,15 +37,15 @@ impl Member<'_> {
     }
 }
 
-/// Each plan's monthly price, relative to the provider's cheapest paid plan. Claude doesn't
-/// publish its weekly limits, and they don't grow with the 5x and 20x in Max's names (those
-/// are for the 5-hour window); prices come closest to the weekly sizes people have measured.
-/// Every window is weighed the same way, so the meter and the warnings agree.
+/// Each plan's weekly allowance, relative to the provider's smallest paid plan. Claude
+/// publishes Pro 1x, Max 5x and Ultra 10x a week (since 30 October 2026; the plans were
+/// Max 5x and Max 20x, and their tier identifiers still are). The same weights are the
+/// monthly prices. Every window is weighed the same way, so the meter and the warnings agree.
 pub fn plan_weight(provider: &str, plan: Option<&str>) -> Option<f64> {
     match (provider, plan?) {
         ("claude", "pro") => Some(1.0),
         ("claude", "max_5x") => Some(5.0),
-        ("claude", "max_20x") => Some(10.0),
+        ("claude", "max_20x" | "ultra") => Some(10.0),
         _ => None,
     }
 }
@@ -132,8 +136,22 @@ fn pool(provider: &str, name: &str, model: Option<&str>, members: &[Member], now
         })
         .collect();
     // A member without a model's own limit takes that model's requests until its
-    // whole-account limits stop it, and those have pools of their own.
-    if reports.is_empty() || (model.is_some() && reports.len() < members.len()) {
+    // whole-account limits stop it, and those have pools of their own. One without a
+    // 5-hour limit (Claude Ultra, ChatGPT Pro) takes what the others can't, so together
+    // they have none, as long as it is signed in, not paused and has weekly quota left.
+    // Otherwise the pool is the accounts that have the limit.
+    let carries = |m: &Member| {
+        m.no_five_hour
+            && m.forecast_available
+            && !m.paused
+            && !m.windows.iter().any(|w| {
+                w.name == "week" && w.model.is_none() && w.used >= 100.0 && w.resets_at.is_none_or(|r| r > now)
+            })
+    };
+    if reports.is_empty()
+        || (model.is_some() && reports.len() < members.len())
+        || (name == "5h" && model.is_none() && members.iter().any(carries))
+    {
         return None;
     }
     let priced = reports.iter().all(|(m, _)| plan_weight(m.provider, m.plan).is_some());
@@ -244,11 +262,20 @@ mod tests {
         subscription: bool,
         disabled: bool,
         windows: Vec<Window>,
+        no_five_hour: bool,
     }
 
     /// A Claude subscription reporting these windows.
     fn sub(id: &'static str, windows: Vec<Window>) -> Account {
-        Account { id, provider: "claude", plan: None, subscription: true, disabled: false, windows }
+        Account {
+            id,
+            provider: "claude",
+            plan: None,
+            subscription: true,
+            disabled: false,
+            windows,
+            no_five_hour: false,
+        }
     }
 
     fn on(plan: &'static str, id: &'static str, windows: Vec<Window>) -> Account {
@@ -266,6 +293,8 @@ mod tests {
                 windows: &a.windows,
                 history: &[],
                 forecast_available: true,
+                no_five_hour: a.no_five_hour,
+                paused: false,
             })
             .collect()
     }
@@ -335,17 +364,19 @@ mod tests {
     }
 
     #[test]
-    fn each_account_counts_by_its_plans_price_when_every_plan_is_known() {
-        // Max 20x half through its week at 30%, Max 5x seven eighths through at 60%: by price
-        // (10 and 5) the pool is at 40% with even pace at 62.5%.
+    fn each_account_counts_by_its_plans_weekly_allowance_when_every_plan_is_known() {
+        // Ultra half through its week at 30%, Max seven eighths through at 60%: by weekly
+        // allowance (10 and 5) the pool is at 40% with even pace at 62.5%.
         let list = [on("max_20x", "a", vec![week(30.0, Some(3.5))]), on("max_5x", "b", vec![week(60.0, Some(0.875))])];
         let [p] = &weekly(&list)[..] else { panic!() };
         assert!(p.priced);
         assert!(close(p.used, 40.0) && close(p.pace.unwrap(), 0.625));
         assert_eq!(p.weights, [("a".to_string(), 10.0), ("b".to_string(), 5.0)]);
-        // Pro against Max 20x is 1 to 10.
-        let pro = [on("max_20x", "a", vec![week(0.0, Some(7.0))]), on("pro", "b", vec![week(88.0, Some(3.5))])];
-        assert!(close(weekly(&pro)[0].used, 8.0));
+        // Pro against Ultra is 1 to 10, under its old identifier or a new one.
+        for ultra in ["max_20x", "ultra"] {
+            let pro = [on(ultra, "a", vec![week(0.0, Some(7.0))]), on("pro", "b", vec![week(88.0, Some(3.5))])];
+            assert!(close(weekly(&pro)[0].used, 8.0));
+        }
 
         // An unknown plan, Max without its multiple, or any ChatGPT plan: they count equally.
         let unknown = [
@@ -416,5 +447,33 @@ mod tests {
             pools(&members(&some), now()).iter().all(|p| p.model.is_none()),
             "b takes Opus without a limit of its own"
         );
+        // A verified Ultra account has no 5-hour limit and takes what a Max account can't.
+        let mixed = [
+            on("max_5x", "a", vec![week(10.0, Some(5.0)), five(90.0, 1.0)]),
+            Account { no_five_hour: true, ..on("max_20x", "b", vec![week(10.0, Some(5.0))]) },
+        ];
+        let found: Vec<String> = pools(&members(&mixed), now()).into_iter().map(|p| p.window).collect();
+        assert_eq!(found, ["week"]);
+        // Not with its week used up: then the Max account's 5 hours are all there is.
+        let spent = [
+            on("max_5x", "a", vec![week(10.0, Some(5.0)), five(90.0, 1.0)]),
+            Account { no_five_hour: true, ..on("max_20x", "b", vec![week(100.0, Some(5.0))]) },
+        ];
+        let five_hours: Vec<Pool> = pools(&members(&spent), now()).into_iter().filter(|p| p.window == "5h").collect();
+        assert_eq!(five_hours.len(), 1);
+        assert_eq!(five_hours[0].weights, [("a".to_string(), 5.0)], "only the limited account is in it");
+        // A ChatGPT Pro account without the limit takes over its own provider's 5 hours only.
+        let codex = |id, no_five_hour, windows| Account { provider: "codex", no_five_hour, ..sub(id, windows) };
+        let both = [
+            sub("a", vec![week(10.0, Some(5.0)), five(90.0, 1.0)]),
+            sub("b", vec![week(10.0, Some(5.0)), five(20.0, 1.0)]),
+            codex("plus", false, vec![week(10.0, Some(5.0)), five(90.0, 1.0)]),
+            codex("pro", true, vec![week(10.0, Some(5.0))]),
+        ];
+        let found: Vec<(String, String)> =
+            pools(&members(&both), now()).into_iter().map(|p| (p.provider, p.window)).collect();
+        assert!(found.contains(&("claude".into(), "5h".into())), "{found:?}");
+        assert!(found.contains(&("codex".into(), "week".into())), "{found:?}");
+        assert!(!found.contains(&("codex".into(), "5h".into())), "{found:?}");
     }
 }

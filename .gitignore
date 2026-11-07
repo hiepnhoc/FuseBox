@@ -9,3 +9,9 @@
 
 __pycache__/
 /pricing-sync.json
+
+# iOS app (ios/): the Xcode project is generated from ios/project.yml by XcodeGen
+/ios/Fusebox.xcodeproj/
+/ios/build/
+/ios/DerivedData/
+*.xcuserstate

@@ -25,7 +25,7 @@ pub mod xai {
     pub const API_BASE: &str = "https://api.x.ai/v1";
     /// Grok Build subscriptions are served by the CLI chat proxy.
     pub const CLI_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
-    pub const CLIENT_VERSION: &str = "1.0.67";
+    pub const CLIENT_VERSION: &str = "1.0.70";
 }
 
 pub mod meta {
@@ -35,9 +35,9 @@ pub mod meta {
     pub const MINT_URL: &str = "https://api.meta.ai/muse-code/key";
     pub const API_BASE: &str = "https://api.meta.ai/v1";
     pub const AUTH_UA: &str = "muse-code/1.0.2";
-    /// Muse Code 1.4.12 for macOS arm64; the build hash is the commit compiled into that release.
+    /// Muse Code 1.4.14 for macOS arm64; the build hash is the commit compiled into that release.
     pub const API_UA: &str =
-        "muse-build/1.4.12 (interactive; macos-aarch64; build 80d5266d8a4cb84d6d4ec595a4ef39cc596fa128)";
+        "muse-build/1.4.14 (interactive; macos-aarch64; build dec7d7497fecdad135ec5835a8161dbc92e55b58)";
 }
 
 const GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -245,11 +245,10 @@ async fn finish(app: &App, provider: Provider, d: &Device, access: &str, v: &Val
             if let Some(t) = expires_at {
                 extra.push(("dca_expired", t.to_rfc3339().into()));
             }
-            for k in ["user_full_name", "subs_tier_name"] {
-                if let Some(s) = minted[k].as_str() {
-                    extra.push((if k == "user_full_name" { "name" } else { "subs_tier_name" }, s.into()));
-                }
+            if let Some(s) = minted["user_full_name"].as_str() {
+                extra.push(("name", s.into()));
             }
+            extra.extend(crate::oauth::meta_tier_fields(&OAuth::default(), &minted));
             format!("meta-{}.json", file_safe(o.email.as_deref().unwrap_or("account")))
         }
     };

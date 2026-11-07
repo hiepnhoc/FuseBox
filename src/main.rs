@@ -21,8 +21,12 @@ mod embeddings;
 mod feature_tests;
 mod files;
 mod formats;
+#[cfg(test)]
+mod golden_tests;
+mod inspect;
 mod ir;
 mod kiro;
+mod json_size;
 mod latency;
 mod media;
 mod metrics;
@@ -40,9 +44,13 @@ mod quota;
 #[cfg(test)]
 mod routing_tests;
 mod schema;
+#[cfg(test)]
+mod schema_props;
 mod server;
 mod source;
 mod sse;
+#[cfg(test)]
+mod sse_props;
 mod state;
 mod stream_limits;
 mod tls;
@@ -52,6 +60,10 @@ mod usage;
 mod vertex;
 mod window_starter;
 mod ws;
+mod yaml;
+#[cfg(test)]
+mod yaml_props;
+mod zone;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -115,6 +127,25 @@ enum Cmd {
     /// Show what the config and auth directory contain, without starting the server.
     /// Handy before switching from CLIProxyAPI.
     Check,
+    /// Run the push relay that gets notifications from any Fusebox to the iPhone app.
+    /// It needs the app's APNs key; a proxy or tunnel in front adds HTTPS.
+    PushRelay {
+        #[arg(long, env = "FUSEBOX_RELAY_LISTEN", default_value = "127.0.0.1:4750")]
+        listen: std::net::SocketAddr,
+        /// Where it keeps its device list.
+        #[arg(long, env = "FUSEBOX_RELAY_STATE_DIR", default_value = "/var/lib/fusebox-push-relay")]
+        state_dir: PathBuf,
+        #[arg(long, env = "FUSEBOX_RELAY_TEAM_ID")]
+        team_id: String,
+        #[arg(long, env = "FUSEBOX_RELAY_KEY_ID")]
+        key_id: String,
+        /// The `AuthKey_<key-id>.p8` file.
+        #[arg(long, env = "FUSEBOX_RELAY_KEY_FILE")]
+        key_file: PathBuf,
+        /// The app's bundle ID.
+        #[arg(long, env = "FUSEBOX_RELAY_TOPIC", default_value = "com.digitalpals.fusebox")]
+        topic: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -198,6 +229,11 @@ async fn run() -> Result<()> {
         }
         Some(Cmd::Usage { command }) => return usage::imports::run_command(command).await,
         Some(Cmd::Collector { command }) => return usage::collector::run_command(command).await,
+        Some(Cmd::PushRelay { listen, state_dir, team_id, key_id, key_file, topic }) => {
+            init_logging(false, config::LogFormat::Text);
+            let apns = config::Apns { team_id, key_id, key_file: key_file.to_string_lossy().into_owned(), topic };
+            return push::relay::serve(push::relay::Settings { listen, state_dir, apns }).await;
+        }
         other => other,
     };
     let path = config_path(cli.config, |n| std::env::var(n).ok());
@@ -412,6 +448,7 @@ async fn serve(app: Arc<App>) -> Result<()> {
     app.refresh_tasks.shutdown().await;
     app.sessions.save_async().await;
     save_cooldowns(&app);
+    save_quota(&app);
     save_attribution(&app, true);
     app.addresses.save(&app.cfg().named_clients, true);
     if let Some(store) = &app.usage
@@ -479,6 +516,22 @@ fn save_attribution(app: &App, force: bool) {
     }
 }
 
+/// Keeps confirmed quota facts (no 5-hour limit) across restarts; written only when they changed.
+fn save_quota(app: &App) {
+    static LAST: parking_lot::Mutex<Option<quota::Saved>> = parking_lot::Mutex::new(None);
+    let now = quota::Saved::of(&app.pool);
+    let mut last = LAST.lock();
+    if last.as_ref() == Some(&now) {
+        return;
+    }
+    let path = app.cfg().auth_dir().join(quota::SAVED_FILE);
+    if let Err(e) = now.save(&path) {
+        tracing::warn!("could not save quota state: {e:#}");
+        return;
+    }
+    *last = Some(now);
+}
+
 /// Keeps cooldowns across restarts; written only when they changed.
 fn save_cooldowns(app: &App) {
     static LAST: parking_lot::Mutex<Option<accounts::Cooldowns>> = parking_lot::Mutex::new(None);
@@ -513,27 +566,34 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-fn auth_signature(dir: &Path) -> Vec<(String, Option<SystemTime>)> {
-    let mut v: Vec<_> = std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-                .map(|e| (e.file_name().to_string_lossy().to_string(), mtime(&e.path())))
-                .collect()
-        })
-        .unwrap_or_default();
+/// The credential files and their times. A missing directory has none; one that exists
+/// but can't be read is an error, which says nothing about its files.
+fn auth_signature(dir: &Path) -> std::io::Result<Vec<(String, Option<SystemTime>)>> {
+    // As in the account scan: an error part-way through the listing is no complete answer.
+    let mut v: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .map(|e| (e.file_name().to_string_lossy().to_string(), mtime(&e.path())))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(e),
+    };
     v.sort();
-    v
+    Ok(v)
 }
 
 /// Hot-reloads the config file and the auth directory.
 async fn watch(app: Arc<App>) {
     let mut cfg_time = mtime(&app.cfg_path);
-    let mut auth = auth_signature(&app.cfg().auth_dir());
+    let mut auth = auth_signature(&app.cfg().auth_dir()).unwrap_or_default();
+    let mut unreadable = false;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         app.sessions.flush(app.cfg().session_affinity_idle_seconds);
         save_cooldowns(&app);
+        save_quota(&app);
         save_attribution(&app, false);
         app.addresses.save(&app.cfg().named_clients, false);
         let t = mtime(&app.cfg_path);
@@ -548,13 +608,23 @@ async fn watch(app: Arc<App>) {
                 Err(e) => tracing::error!("config not reloaded: {e:#}"),
             }
         }
-        let sig = auth_signature(&app.cfg().auth_dir());
-        if sig != auth {
-            auth = sig;
-            if !app.reload_suppressed() {
-                tracing::info!("auth directory changed, reloading accounts");
-                app.reload_accounts();
+        // While the directory can't be read, its accounts and the last signature stay.
+        match auth_signature(&app.cfg().auth_dir()) {
+            Ok(sig) => {
+                unreadable = false;
+                if sig != auth {
+                    auth = sig;
+                    if !app.reload_suppressed() {
+                        tracing::info!("auth directory changed, reloading accounts");
+                        app.reload_accounts();
+                    }
+                }
             }
+            Err(e) if !unreadable => {
+                unreadable = true;
+                tracing::warn!("cannot read the auth directory, so its accounts stay as they were: {e}");
+            }
+            Err(_) => {}
         }
     }
 }
@@ -733,6 +803,19 @@ mod tests {
         assert!(ok && enabled(&t, "anything", Level::INFO));
         let (t, ok) = log_filter(Some("fusebox[span{field=1}]=debug"), false);
         assert!(!ok && enabled(&t, "fusebox", Level::INFO) && !enabled(&t, "fusebox", Level::DEBUG));
+    }
+
+    #[test]
+    fn an_unreadable_auth_directory_is_an_error_and_a_missing_one_is_empty() {
+        let dir = std::env::temp_dir().join(format!("fusebox-auth-signature-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), "{}").unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        assert_eq!(auth_signature(&dir).unwrap().len(), 1);
+        // A file where the directory should be: ENOTDIR says nothing about the accounts.
+        assert!(auth_signature(&dir.join("a.json")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(auth_signature(&dir).unwrap().is_empty());
     }
 
     #[test]

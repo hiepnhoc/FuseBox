@@ -19,6 +19,15 @@ impl Fixture {
         Connection::open(&fixture.source).unwrap().execute_batch(SCHEMA).unwrap();
         let store = Store::open(&fixture.destination, 1024, 90, None).unwrap();
         store.shutdown().await.unwrap();
+        drop(store);
+        // Historical keeper lifetime-estimate fixtures retain their provider catalogue.
+        Connection::open(&fixture.destination)
+            .unwrap()
+            .execute(
+                "UPDATE usage_meta SET value=?1 WHERE key='catalogue'",
+                [serde_json::to_string(&Catalogue::provider_fixture()).unwrap()],
+            )
+            .unwrap();
         fixture
     }
     fn add(&self, id: i64, claude: bool) {
@@ -383,6 +392,7 @@ async fn cache_estimate_rejects_incompatible_evidence_and_rolls_back_the_batch()
     f.add(2, true);
     f.run(true);
     let c = Connection::open(&f.destination).unwrap();
+    store::register_functions(&c).unwrap();
     c.execute("UPDATE usage_observations SET payload=json_set(payload,'$.parser_version','unverified-parser') WHERE id=(SELECT max(id) FROM usage_observations)",[]).unwrap();
     assert!(estimate_cache(&f.destination, ORIGIN, true).is_err());
     assert_eq!(

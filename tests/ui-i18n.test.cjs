@@ -35,6 +35,7 @@ test('the browser language picks Chinese, and a saved choice wins', () => {
 test('exact strings, patterns and dates translate', () => {
   const { tr } = load().FUSEBOX_I18N;
   assert.equal(tr('Overview'), '概览');
+  assert.equal(tr('Some accounts are still being checked; results will appear automatically.'), '部分账号仍在检查中；结果将自动显示。');
   assert.equal(tr('  Accounts '), '  账号 ', 'surrounding space is kept');
   assert.equal(tr('Copy gpt-6-astra'), '复制 gpt-6-astra');
   assert.equal(tr('Remove API key 2'), '移除 API 密钥 2');
@@ -123,10 +124,15 @@ test('combined weekly limits read in Chinese', () => {
   assert.equal(tr('On pace'), '符合均匀用量');
   assert.equal(tr('Claude combined weekly quota used'), 'Claude 每周合计额度已用');
   assert.equal(tr('22% used · Healthy · even pace 32% used by now').split(' · ')[2], '均匀用量此刻应为 32%');
-  assert.equal(tr('3 accounts · Max 20x'), '3 个账号 · Max 20x', 'plan names stay as the provider writes them');
-  assert.equal(tr('Each provider’s subscriptions together, weighted by plan price'), '每个提供商的订阅合并计算，按套餐价格加权');
-  assert.equal(tr('Claude weighted by plan price, Codex equally'), 'Claude 按套餐价格加权，Codex 权重相同');
-  assert.match(tr('Each account counts by its plan’s monthly price: Claude Pro 1, Max 5x 5, Max 20x 10'), /^每个账号按套餐月费计权/);
+  assert.equal(tr('3 accounts · Ultra'), '3 个账号 · Ultra', 'plan names stay as the provider writes them');
+  assert.equal(tr('Each provider’s subscriptions together, weighted by plan allowance'), '每个提供商的订阅合并计算，按套餐额度加权');
+  assert.equal(tr('Claude weighted by plan allowance, Codex equally'), 'Claude 按套餐额度加权，Codex 权重相同');
+  assert.match(tr('Each account counts by its plan’s weekly allowance: Claude Pro 1, Max 5, Ultra 10'), /^每个账号按套餐每周额度计权/);
+  assert.equal(tr('No limit'), '无限制');
+  assert.equal(tr('Claude · Ultra · no 5h limit'), 'Claude · Ultra · 无 5 小时限制');
+  assert.equal(tr('Meta · Max Usage · subscription inactive'), 'Meta · Max Usage · 订阅未生效');
+  assert.equal(tr('This account has no five-hour limit; only the weekly limits apply.'), '此账号没有五小时限制，只适用每周限制。');
+  assert.equal(tr('This account has no five-hour limit, so there is no window to start'), '此账号没有五小时限制，无需启动窗口');
 });
 
 test('model setup and scoped quota explanations translate without changing model identifiers', () => {
@@ -142,13 +148,17 @@ test('model setup and scoped quota explanations translate without changing model
 
 test('weekly forecasts translate reserve, learning and gap messages', () => {
   const { tr } = load().FUSEBOX_I18N;
-  assert.equal(tr('Weekly quota outlook'), '每周额度预测');
+  assert.equal(tr('Combined weekly quota'), '每周额度合计');
   assert.equal(tr('Expected to last'), '预计额度充足');
   assert.equal(tr('Learning usage'), '正在学习用量');
-  assert.equal(tr('Current quota while learning'), '学习期间显示当前额度');
-  assert.equal(tr('remaining now'), '当前剩余');
-  assert.equal(tr('Claude current combined weekly quota used'), 'Claude 当前每周合计额度已用');
+  assert.equal(tr('Claude combined weekly quota used'), 'Claude 每周合计额度已用');
   assert.equal(tr('Quota readings are stale'), '额度记录已过期');
-  assert.equal(tr('Claude lowest projected weekly reserve'), 'Claude 预计最低每周剩余额度');
-  assert.equal(tr('29% lowest projected reserve over the next 7 days'), '未来 7 天预计最低剩余额度 29%');
+  assert.equal(tr('Forecast of the next 7 days from recent consumption and each account’s scheduled resets. Assumes usage can move between accounts. Five-hour and model limits are separate; banked resets are not predicted. · Recent use is 12% of the combined quota a day, the average of the last day and the last week of readings.'),
+    '根据近期用量和各账号的计划重置时间预测未来 7 天。假定请求可以在账号间转移。五小时和模型限制单独计算；不预测已储存的重置。 · 近期用量约为每天合计额度的 12%，取最近一天与最近一周记录的平均值。');
+  assert.equal(tr('Each provider’s subscriptions together, weighted by plan allowance'), '每个提供商的订阅合并计算，按套餐额度加权');
+  assert.equal(tr('Each account counts by its plan’s weekly allowance: Claude Pro 1, Max 5, Ultra 10'), '每个账号按套餐每周额度计权：Claude Pro 1、Max 5、Ultra 10');
+  assert.equal(tr('Next account resets Monday, 2 November 2026 at 14:00:00 CET'), '下一个账号将于 2026年11月2日 星期一 14:00:00 CET 重置');
+  assert.equal(tr('Recent use is 12% of the combined quota a day, the average of the last day and the last week of readings. The shortest account history is 2d 4h.'),
+    '近期用量约为每天合计额度的 12%，取最近一天与最近一周记录的平均值。最短的账号记录为 2 天 4 小时。');
+  assert.equal(tr('22% used · Healthy · even pace 50% used by now'), '已用 22% · 正常 · 均匀用量此刻应为 50%');
 });

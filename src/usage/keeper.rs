@@ -73,8 +73,12 @@ fn observation(row: &Row<'_>, origin: &str) -> Result<Option<Observation>> {
     o.auth_type = label(row, 5)?;
     o.account_id =
         label(row, 6)?.map(|id| format!("keeper-account:{}", hash(format!("{origin}\0{provider}\0{id}").as_bytes())));
-    // A requested priority tier can resolve to default. Prefer the response tier.
-    o.service_tier = label(row, 9)?.or(label(row, 8)?);
+    // Preserve the returned tier; T3 pricing separately follows requested speed.
+    let requested_tier = label(row, 8)?;
+    o.service_tier = label(row, 9)?.or(requested_tier.clone());
+    if requested_tier.is_some() {
+        o.set_requested_speed(requested_tier.as_deref());
+    }
     o.logical_success = boolean(row, 10)?.map(|failed| !failed);
     let (input, output, reasoning, read, write, total) =
         (number(row, 12)?, number(row, 13)?, number(row, 14)?, number(row, 15)?, number(row, 16)?, number(row, 17)?);
@@ -168,6 +172,7 @@ pub fn estimate_cache(database: &Path, origin: &str, apply: bool) -> Result<Valu
     }
     let flags = if apply { OpenFlags::SQLITE_OPEN_READ_WRITE } else { OpenFlags::SQLITE_OPEN_READ_ONLY };
     let mut conn = Connection::open_with_flags(database, flags)?;
+    store::register_functions(&conn)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     if conn.query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))? != APPLICATION_ID
         || conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? != VERSION
@@ -286,6 +291,7 @@ pub fn import(database: &Path, input_database: &Path, origin: &str, apply: bool)
     source.execute_batch("PRAGMA query_only=ON; BEGIN;")?;
     let mode = if apply { OpenFlags::SQLITE_OPEN_READ_WRITE } else { OpenFlags::SQLITE_OPEN_READ_ONLY };
     let mut destination = Connection::open_with_flags(database, mode)?;
+    store::register_functions(&destination)?;
     destination.busy_timeout(Duration::from_secs(5))?;
     if destination.query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))? != APPLICATION_ID
         || destination.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? != VERSION

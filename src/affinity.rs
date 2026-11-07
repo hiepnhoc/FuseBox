@@ -167,9 +167,7 @@ fn hash_content(content: &Value, hasher: &mut Sha256) -> bool {
                 match &part["text"] {
                     Value::String(text) => feed(text.as_bytes()),
                     _ if part.is_object() => {
-                        let mut part = part.clone();
-                        strip_cache_markers(&mut part);
-                        feed(&serde_json::to_vec(&part).unwrap_or_default());
+                        feed(&serde_json::to_vec(&WithoutCacheMarkers(part)).unwrap_or_default());
                     }
                     _ => continue,
                 }
@@ -182,15 +180,31 @@ fn hash_content(content: &Value, hasher: &mut Sha256) -> bool {
     true
 }
 
-fn strip_cache_markers(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("cache_control");
-            object.remove("prompt_cache_breakpoint");
-            object.values_mut().for_each(strip_cache_markers);
+/// Serialize the same marker-free JSON as before without cloning potentially
+/// large image/tool blocks. Reproduce Map::remove's swap removal order so
+/// existing inferred session keys remain stable.
+struct WithoutCacheMarkers<'a>(&'a Value);
+
+impl Serialize for WithoutCacheMarkers<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0 {
+            Value::Object(object) => {
+                let mut fields: Vec<_> = object.iter().collect();
+                for marker in ["cache_control", "prompt_cache_breakpoint"] {
+                    if let Some(index) = fields.iter().position(|(key, _)| key.as_str() == marker) {
+                        fields.swap_remove(index);
+                    }
+                }
+                let mut map = serializer.serialize_map(Some(fields.len()))?;
+                for (key, value) in fields {
+                    map.serialize_entry(key, &WithoutCacheMarkers(value))?;
+                }
+                map.end()
+            }
+            Value::Array(items) => serializer.collect_seq(items.iter().map(WithoutCacheMarkers)),
+            value => value.serialize(serializer),
         }
-        Value::Array(items) => items.iter_mut().for_each(strip_cache_markers),
-        _ => {}
     }
 }
 
@@ -270,7 +284,6 @@ impl From<Vec<Value>> for History {
 }
 
 impl History {
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -628,7 +641,8 @@ impl Sessions {
             let upstream = assigned.as_ref().and_then(|acct| pool.resolve_account(acct, model, only));
             match (&assigned, upstream) {
                 (None, _) => moving = Some("account_removed"),
-                (Some(acct), _) if acct.state.lock().disabled => moving = Some("account_disabled"),
+                // Waiting for a sign-in is out of rotation the way disabled is.
+                (Some(acct), _) if acct.state.lock().disabled || acct.held_out() => moving = Some("account_disabled"),
                 (Some(_), None) => moving = Some("model_unavailable"),
                 (Some(acct), Some(_)) if acct.credit_paused() => {
                     moving = Some("out_of_credit");
@@ -898,6 +912,17 @@ impl Sessions {
         Some((session, input))
     }
 
+    /// `previous` without refreshing the stored response's last use, for inspection.
+    pub fn peek_previous(&self, headers: &HeaderMap, id: &str, session: Option<&str>) -> Option<(String, History)> {
+        let key = digest(&[&client_scope(headers), "response", id]);
+        let registry = self.registry.lock();
+        let previous = registry.responses.get(&key)?;
+        if session.is_some_and(|s| s != previous.session) {
+            return None;
+        }
+        Some((previous.session.clone(), previous.input.clone()))
+    }
+
     /// Takes the input by value: the caller's copy becomes the stored history.
     pub fn remember(&self, headers: &HeaderMap, session: &str, response: &Value, full_input: impl Into<History>) {
         let Some(id) = response["id"].as_str() else {
@@ -907,7 +932,7 @@ impl Sessions {
             return;
         };
         let mut input = full_input.into();
-        input.extend(output.clone());
+        input.extend(output.iter().cloned().map(replayable_output).collect());
         let bytes = input.bytes;
         if bytes > MAX_RESPONSE_BYTES {
             return;
@@ -933,6 +958,21 @@ impl Sessions {
     }
 }
 
+/// An output item as it is replayed for the next turn. Codex tags its output with a
+/// `content_token_count` that is output-only, so it is left out of the replayed copy,
+/// with its parent object if nothing else is left in it.
+fn replayable_output(mut item: Value) -> Value {
+    const PARENT: &str = "internal_chat_message_metadata_passthrough";
+    if let Some(metadata) = item.get_mut(PARENT).and_then(Value::as_object_mut)
+        && metadata.remove("content_token_count").is_some()
+        && metadata.is_empty()
+        && let Some(item) = item.as_object_mut()
+    {
+        item.remove(PARENT);
+    }
+    item
+}
+
 /// Count the exact serialized array size, stopping at the entry limit before
 /// copying the history or allocating a second, serialized conversation.
 fn history_size(input: &[Value], output: &[Value], limit: usize) -> Option<usize> {
@@ -947,25 +987,7 @@ fn history_size(input: &[Value], output: &[Value], limit: usize) -> Option<usize
             seq.end()
         }
     }
-    struct Counter {
-        bytes: usize,
-        limit: usize,
-    }
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if buf.len() > self.limit.saturating_sub(self.bytes) {
-                return Err(std::io::Error::other("history exceeds entry limit"));
-            }
-            self.bytes += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter { bytes: 0, limit };
-    serde_json::to_writer(&mut counter, &History(input, output)).ok()?;
-    Some(counter.bytes)
+    crate::json_size::serialized_size(&History(input, output), limit).ok()
 }
 
 /// Some Codex backends omit output from the final event after streaming it.
@@ -1620,6 +1642,44 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_cache_marker_filter_preserves_existing_serialization_and_session_hashes() {
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Object(object) => {
+                    object.remove("cache_control");
+                    object.remove("prompt_cache_breakpoint");
+                    object.values_mut().for_each(strip);
+                }
+                Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        for value in [
+            json!({"type":"image", "source":{"type":"base64","data":"aBc".repeat(100_000)},
+                "cache_control":{"type":"ephemeral"}}),
+            json!({"before":1,"cache_control":{},"middle":[{"prompt_cache_breakpoint":true,"text":"é\\\n🦀"},
+                null,false,1.25,{"nested":{"cache_control":null,"value":-1}}],"after":2}),
+            json!({"prompt_cache_breakpoint":{},"type":"future","value":u64::MAX,"array":[[],{},"*"]}),
+        ] {
+            let original = value.clone();
+            let mut stripped = value.clone();
+            strip(&mut stripped);
+            assert_eq!(
+                serde_json::to_vec(&WithoutCacheMarkers(&value)).unwrap(),
+                serde_json::to_vec(&stripped).unwrap()
+            );
+            let mut expected = Sha256::new();
+            let bytes = serde_json::to_vec(&stripped).unwrap();
+            expected.update((bytes.len() as u64).to_le_bytes());
+            expected.update(bytes);
+            let mut actual = Sha256::new();
+            assert!(hash_content(&json!([value]), &mut actual));
+            assert_eq!(actual.finalize(), expected.finalize());
+            assert_eq!(original, value);
+        }
+    }
+
+    #[test]
     fn identifiers_are_client_scoped_and_claude_metadata_is_read() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer first".parse().unwrap());
@@ -1718,6 +1778,39 @@ mod tests {
         assert!(sessions.previous(&headers, "r1", Some("another-task")).is_none());
         headers.insert("authorization", "Bearer second".parse().unwrap());
         assert!(sessions.previous(&headers, "r1", None).is_none());
+    }
+
+    #[test]
+    fn replayed_output_leaves_out_its_token_counts_but_client_input_is_kept_as_sent() {
+        let sessions = Sessions::memory();
+        let meta = "internal_chat_message_metadata_passthrough";
+        let input = vec![
+            json!({"type":"message", "role":"user", "content":"question", meta:{"content_token_count":99}}),
+            json!({"type":"function_call_output", "call_id":"c0", "output":"ok", meta:{"content_token_count":7, "turn_id":"t0"}}),
+        ];
+        let output = json!([
+            {"type":"message", "role":"assistant", "content":[], meta:{"turn_id":"t1", "create_time":1.5, "content_token_count":64}},
+            {"type":"message", "role":"assistant", "content":[], meta:{"content_token_count":3}},
+            {"type":"message", "role":"assistant", "content":[], meta:{"turn_id":"t3"}},
+            {"type":"message", "role":"assistant", "content":[], meta:{}},
+            {"type":"message", "role":"assistant", "content":[], meta:null},
+            {"type":"function_call", "call_id":"c1", "name":"lookup", "arguments":"{}", meta:{"content_token_count":5, "turn_id":"t1"}},
+            {"type":"message", "role":"assistant", "content":[], "content_token_count":1},
+        ]);
+        sessions.remember(&HeaderMap::new(), "task", &json!({"id":"r1", "output":output}), input.clone());
+        let history = sessions.previous(&HeaderMap::new(), "r1", Some("task")).unwrap().1.to_values();
+        assert_eq!(&history[..2], &input[..], "client input is replayed as the client sent it");
+        let replayed = &history[2..];
+        assert_eq!(replayed[0][meta], json!({"turn_id":"t1", "create_time":1.5}));
+        assert!(replayed[1].get(meta).is_none(), "an object emptied by the removal goes too");
+        assert_eq!(replayed[2][meta], json!({"turn_id":"t3"}));
+        assert_eq!(replayed[3][meta], json!({}), "only an object the removal emptied is dropped");
+        assert!(replayed[4][meta].is_null() && replayed[4].get(meta).is_some());
+        assert_eq!(replayed[5][meta], json!({"turn_id":"t1"}));
+        assert_eq!(replayed[6]["content_token_count"], 1, "only that key, only under its parent");
+        assert_eq!(history.len(), 9);
+        let bytes = serde_json::to_vec(&history).unwrap().len();
+        assert_eq!(sessions.registry.lock().history_bytes, bytes, "sizes count what is stored");
     }
 
     #[test]

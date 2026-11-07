@@ -31,7 +31,7 @@ Point Claude Code, Codex, your editor or any SDK at one URL and stop caring whic
 - **Ten providers.** Subscription sign-in for Claude, ChatGPT (Codex), Antigravity, Grok, Kimi, Meta and Devin; service accounts for Vertex AI; API keys for Anthropic, OpenAI, Gemini, Vertex, Kimi, xAI, Meta and anything OpenAI-compatible.
 - **Images and video too.** `/v1/images/generations` and `/v1/images/edits` work with ChatGPT accounts, OpenAI and xAI keys, Vertex Imagen and Gemini image models. xAI video generation is behind `/v1/videos`.
 - **WebSockets.** Codex WebSocket sessions are relayed to ChatGPT's own WebSocket upstream, so `previous_response_id` works on the server side. Switch to a Claude or Gemini model mid-session and Fusebox carries the conversation over.
-- **Many accounts, no babysitting.** Each new coding session goes to the account with the most quota left, using the 5-hour and weekly usage Claude and ChatGPT report, and stays there so its prompt cache keeps paying off. An account whose limit is used up sits out until it resets, a rate limit cools down only that model on that account, failed requests move to the next account (even when the error arrives inside a stream that already started), and OAuth tokens refresh themselves.
+- **Many accounts, no babysitting.** Each new coding session goes to the account with the most quota left, using the 5-hour and weekly usage Claude, ChatGPT and Meta report, and stays there so its prompt cache keeps paying off. An account whose limit is used up sits out until it resets, a rate limit cools down only that model on that account, failed requests move to the next account (even when the error arrives inside a stream that already started), and OAuth tokens refresh themselves.
 - **Fallbacks and limits.** Model groups give one name to several models that take over from each other. Each tool can get its own key with its own models, request rate, daily tokens, monthly budget and end date.
 - **A dashboard you'll actually open.** Live over WebSocket: every subscription's 5-hour and weekly limits as segmented meters with an even-pace mark, a warning when the pace would run a limit out early, what has tripped and why, an hour of load, cooldown timers, sign-in flows, a request log that explains each routing decision, the route order for every model, a playground, and a config editor that shows its changes before saving. Dark or light, in English or Chinese, and it works on a phone too.
 - **Drop-in for CLIProxyAPI users.** Same credential files, same `config.yaml` (both of its layouts), same Docker paths and flags. Swap the image and keep everything else.
@@ -64,7 +64,7 @@ The first run writes a commented `config.yaml` in the current directory (or wher
 **3. Add an account.** Click **Connect account** in the dashboard, or use the terminal:
 
 ```sh
-fusebox login claude        # Claude Pro / Max
+fusebox login claude        # Claude Pro / Max / Ultra
 fusebox login codex         # ChatGPT Plus / Pro / Team
 fusebox login antigravity   # Google account with Antigravity
 fusebox login xai           # SuperGrok / X Premium (shows a code to confirm)
@@ -109,6 +109,8 @@ fusebox --config config.yaml check
 | Payload rules, plugins, Redis usage queue, weighted routing, the `/v0/management` API | Not supported. The built-in dashboard replaces the separate management panel. |
 
 Changes made from the dashboard keep your file's layout, YAML comments, and settings this binary doesn't use, so you can switch back at any time. The rare layout that can't be edited in place, such as lists written without indentation, is rewritten instead, and the original is kept as `config.yaml.bak`.
+
+`config.yaml` is read with YAML 1.2's core schema: `yes`, `on` and `017` stay strings, quoted values are always strings, a repeated key or a second document is an error, and `<<` is an ordinary key rather than a merge. Every file earlier releases loaded still loads, including sections Fusebox doesn't use that hold numeric keys, local tags or `.inf`. When the dashboard has to rewrite the file, it quotes strings other YAML readers could take for something else, such as `yes` or `017`, so CLIProxyAPI reads the same values.
 
 ## Connect your tools
 
@@ -174,8 +176,11 @@ curl http://127.0.0.1:8317/v1/messages \
 | `POST /v1/completions` | Legacy OpenAI completions |
 | `POST /v1/embeddings` | OpenAI embeddings, from OpenAI, OpenAI-compatible, Gemini and Vertex keys |
 | `GET /v1/models` · `GET /v1beta/models` | Model lists, model groups included |
+| `GET /v1/fusebox/status` | Pool-level quota status for client keys (`?format=line` for one text line) |
 
 Clients authenticate with `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `?key=`.
+
+`GET /v1/fusebox/status` answers any client key (collector keys excluded) with pool-level status only — combined quota pools, ready/cooling account counts and next resets, with no account ids, labels or emails — so a status line or a coding agent can check how much quota is left before starting work. `?format=line` returns one text line such as `claude week 31% · 4/5 accounts ready`, ready for a Claude Code `statusLine` command: `curl -s -H "authorization: Bearer $FUSEBOX_KEY" "http://127.0.0.1:8317/v1/fusebox/status?format=line"`. A status read is not a request: it ignores model lists, programs, rates and budgets, and is never recorded in usage. A named client's expiry and address list still apply.
 
 Embeddings accept `encoding_format: float` (default) or `base64`; base64 encodes little-endian float32 values. Google adapters preserve input order, split Vertex batches to one text for Gemini embedding models or five for older text embedding models, and disable automatic truncation. A failed later chunk returns an error without replaying completed chunks; their usage is still recorded. Gemini embedding token counts are labelled estimates in the usage database. Models without a known price remain unpriced and cannot be treated as free by monthly budgets.
 
@@ -187,7 +192,7 @@ JSON API requests and multipart image edits support `Content-Encoding: gzip` or 
 
 | Provider | Sign-in | Models | Speaks upstream |
 | --- | --- | --- | --- |
-| Claude | OAuth (Pro / Max) or API key | `claude-*` | Anthropic Messages |
+| Claude | OAuth (Pro / Max / Ultra) or API key | `claude-*` | Anthropic Messages |
 | Codex / ChatGPT | OAuth (Plus / Pro / Team) or OpenAI API key | `gpt-*`, `o*`, `codex-*`, `gpt-image-*` | Responses (+ WebSocket) |
 | Gemini | API key | `gemini-*`, `gemma-*` | Gemini |
 | Vertex AI | Service account or express API key | `gemini-*`, `imagen-*` | Gemini |
@@ -217,7 +222,7 @@ extra-models:
   claude: [claude-opus-6]
 ```
 
-Every account of that provider then serves and lists it, apart from API keys with their own `models` list. Once a Fusebox release or the provider's model list includes it, Fusebox removes the entry from `config.yaml` and says so on the Models page. **Check Claude and Codex for new models** in the Add model form asks every signed-in Claude and Codex account now, skipping any checked in the last 10 minutes.
+Every account of that provider then serves and lists it, apart from API keys with their own `models` list. Once a Fusebox release or the provider's model list includes it, Fusebox removes the entry from `config.yaml` and says so on the Models page. **Check Claude and Codex for new models** in the Add model form schedules eligible signed-in Claude and Codex accounts, skipping any checked in the last 10 minutes. Manual and automatic checks share four slots. If another check is already running, the form says so and its results appear automatically when it completes.
 
 ### Model capabilities
 
@@ -243,6 +248,7 @@ gpt-6-astra(high)                  effort level
 claude-opus-5-5(max)               adaptive thinking at max effort
 claude-sonnet-4-5-20250929(16000)  thinking budget in tokens
 gemini-2.5-pro(0)                  thinking off
+devin/claude-opus-5-5(high-fast)   Devin fast mode at high effort; (fast) uses the default effort
 ```
 
 ### Images
@@ -259,6 +265,8 @@ curl http://127.0.0.1:8317/v1/images/generations \
 
 Account details and drawers show each reported usage window separately, alongside spending limits, credit balances, feature allowances, and optional paid usage. Codex Business spending-only responses are usable quota readings: a spent individual cap pauses the account even when no five-hour or weekly window exists. A missing reset time stays unknown, and a partial response cannot erase exhaustion learned earlier. Numeric strings and explicit zero balances are preserved; provider credits are not treated as dollars.
 
+Meta subscriptions report a 5-hour window and a weekly window too. Meta has no usage endpoint, so Fusebox reads them from the subscription frame each response streams, and keeps the last reading across restarts. An idle account is also checked through Meta's key mint, which is free and returns the same key; it is used when the mint carries the usage, along with its tier name as the plan.
+
 Claude model limits, OAuth-app limits, and optional extra usage are kept distinct. Code-review/Cowork allowances and extra credits do not block ordinary chat or grant permission to spend on overages. Additional Codex limits with explicit model IDs (or a model ID as their metered-feature identifier) apply only to that model. Antigravity quota groups preserve independent bucket reset times; the provider's Gemini and Claude/GPT groups, or explicit model IDs, determine which models they constrain. Unknown groups remain informational. Smart quota routing also accounts for the tightest applicable spending/model cap.
 
 Everything is served from the binary at `/`, with no external requests.
@@ -273,7 +281,7 @@ Everything is served from the binary at `/`, with no external requests.
 <td valign="top"><b>Requests:</b> every request as it happens, showing which client format went to which provider, time to first token and tokens. Click a row to see why it went to that account, which key sent it and from which address; click a session to follow it.</td>
 </tr>
 <tr>
-<td width="50%" valign="top"><img src="assets/screenshots/account.png" alt="One Claude account's page: its 5-hour and weekly windows with the clients that used each, its Max 20x plan, its hour of load and its pinned coding sessions"></td>
+<td width="50%" valign="top"><img src="assets/screenshots/account.png" alt="One Claude account's page: its 5-hour and weekly windows with the clients that used each, its plan, its hour of load and its pinned coding sessions"></td>
 <td width="50%" valign="top"><img src="assets/screenshots/usage.png" alt="Usage page: a week of estimated cost by day and provider, a breakdown by provider, and the top clients by name"></td>
 </tr>
 <tr>
@@ -294,11 +302,11 @@ Everything is served from the binary at `/`, with no external requests.
 </tr>
 </table>
 
-The **Models** tab groups every model id by family, shows aliases and model groups, and lists the order in which accounts would take a new session, with the next one marked. **Try a model** sends a prompt through routing like any request and shows which account answered and how fast.
+The **Models** tab groups every model id by family, shows aliases and model groups, and lists the order in which accounts would take a new session, with the next one marked. **Try a model** sends a prompt through routing like any request and shows which account answered and how fast. Its **Inspect a request** mode takes a request body as a client would send it (Responses, Chat Completions, Claude Messages or Gemini, with optional headers and a named client) and shows what Fusebox would send for it without sending anything: the model it becomes after `model-map`, model groups and `background-model`, the route and the account a new session would use, whether the body passes through or is translated, the upstream URL, headers and body with credentials and account ids redacted, the generation controls a translation drops, or the refusal the client would get. An inspection uses no quota and records no usage, log or session. The same is available as management-authenticated `POST /api/inspect` with `{"body": …, "format"?, "headers"?, "client"?, "model"?, "stream"?}`.
 
 **Who used the quota.** Under each meter, an account's page shows which of your named clients and shared keys used the current window and the last one, in points of the window, plus what was used outside Fusebox (claude.ai, the desktop app). Its coding sessions show their share of the current windows. The Usage page's **Top clients** ranks every client by name in the selected range, with its share of the estimated cost, its tokens and the models it used. Tokens and models are what Fusebox recorded; the points of a window are estimates: each rise in the provider's reported use is split over the attempts that finished since the previous rise, by their API list price ([how](docs/usage-costs.md#who-used-a-subscription-window)).
 
-Each quota meter has a thin mark where usage would be if spread evenly over the window. Each meter shows a countdown to the provider-reported reset, with the full reset time on hover. Claude subscriptions show their plan (Max 20x, Max 5x, Pro). Codex Pro subscriptions show **Pro 100**, **Pro 200** or **Pro 500** when ChatGPT's active subscription identifies the tier; these names refer to the USD list-price tiers, not the account's local-currency bill or a usage multiplier. Plan details are checked every six hours without using model tokens. If ChatGPT does not expose a recognized active subscription, the broad usage plan (such as Pro) is shown. The overview's **Weekly quota outlook** estimates the lowest combined weekly reserve over the next seven days, counting Claude accounts by plan price (Pro 1, Max 5x 5, Max 20x 10) when every plan is known and equally otherwise. It uses recent provider-reported quota consumption, spends the account resetting first, and refills each account only at its scheduled reset; unused quota expires. A ready forecast always shows **remaining reserve**, independently of the Used/Remaining toggle above it. **Expected to last**, **Low reserve** (below 10%) or **Quota gap expected** describes the estimate; a gap names the projected depletion and recovery times. New accounts show **Learning usage** until six hours of continuous readings are available. During learning, the bar shows current combined quota, labeled **NOW** and **used now** or **remaining now**, following the subscription display toggle; it switches automatically to the forecast when ready. The rolling 24-hour history survives resets and restarts; missing quota/reset data, expired resets awaiting confirmation, stale readings or a required sign-in make the forecast unavailable. This forecasts weekly capacity assuming requests can move between accounts, not uninterrupted service under five-hour/model limits. Banked resets are not assumed. See [the forecast calculation](docs/weekly-outlook.md). The Accounts page lines up every subscription's next weekly reset over seven days, and each account page sets whether it takes new sessions **First**, **Normal** or **Last**.
+Each quota meter has a thin mark where usage would be if spread evenly over the window. Each meter shows a countdown to the provider-reported reset, with the full reset time on hover. Claude subscriptions show their plan (Ultra, Max, Pro), as Claude names it; Max 20x and Max 5x were renamed Ultra and Max on 30 October 2026. Verified Ultra accounts, and ChatGPT Pro accounts while OpenAI keeps Pro free of it, have no five-hour limit: Fusebox reads this from each usage reading, not the plan name. The finding is kept in `.quota.state` in the auth directory, so a restart doesn't bring the meter back while the usage endpoint is busy; a reported five-hour window clears it. When a provider's usage endpoint answers 429, the quota check, banked resets and the window starter all wait for its Retry-After (one to 30 minutes) before asking again. The account lists show only their weekly meter, with **no 5h limit** under the account name; the account page explains it, and the window starter is hidden and leaves them alone. Codex Pro subscriptions show **Pro 100**, **Pro 200** or **Pro 500** when ChatGPT's active subscription identifies the tier; these names refer to the USD list-price tiers, not the account's local-currency bill or a usage multiplier. Plan details are checked every six hours without using model tokens. ChatGPT accounts also show when the subscription charges next (**Ends** when cancelled), with a notification two days before (`notifications.renewals`), a day before (`notifications.renewals-day-before`, off by default), or both. Claude and Meta give no billing date to signed-in tools, so their account page has **Set billing date** in the sign-in card: enter the day of the last or next charge and Fusebox counts on from it every month (or every year, for Claude Pro, the only one of these plans sold yearly), with the same reminder. **Cancelled** makes it **Ends** on the first billing day still to come. The day is kept as `billing` in the account's credential file, with the plan it was set on: after a plan change, which can move the billing day, it shows as an estimate to check and sends no reminder until it is saved again. The overview shows **Renews tomorrow** (or **Ends**) under a subscription's status in the last three days. If ChatGPT does not expose a recognized active subscription, the broad usage plan (such as Pro) is shown. The overview's **Combined weekly quota** shows each provider's subscriptions together as one weekly row, drawn like an account's: the current combined quota in the Used/Remaining mode, the even-pace mark and a countdown to the next account's reset. Claude accounts count by their published weekly allowance (Pro 1, Max 5, Ultra 10) when every plan is known and equally otherwise. Beside the bar, a forecast of the next seven days says whether the quota will last. It uses recent provider-reported quota consumption, the average of the last day's rate and the last week's, spends the account resetting first, and refills each account only at its scheduled reset; unused quota expires. **Expected to last**, **Low reserve** (below 10%) or **Quota gap expected** describes the estimate; a gap names the projected depletion and recovery times. New accounts show **Learning usage** until six hours of continuous readings are available. The week of history survives resets and restarts; missing quota/reset data, expired resets awaiting confirmation, stale readings or a required sign-in make the forecast unavailable. This forecasts weekly capacity assuming requests can move between accounts, not uninterrupted service under five-hour/model limits. Banked resets are not assumed. See [the forecast calculation](docs/weekly-outlook.md). The Accounts page lines up every subscription's next weekly reset over seven days, and each account page sets whether it takes new sessions **First**, **Normal** or **Last**.
 
 Sharing a screenshot or your screen? The eye button in the top bar (or <kbd>.</kbd>) hides every email and API key on the page, and copy buttons still copy the real values.
 
@@ -312,7 +320,7 @@ Choose **Used** or **Remaining** beside the quota meters (or press <kbd>U</kbd>)
 
 **Banked resets** (off by default). Claude and ChatGPT sometimes give subscribers saved resets that clear a usage limit early. Turn on `banked-resets` (Config, Connections) and subscriptions that have some show “↻ 2 resets banked” under their status; click it to see expiry dates and spend one with confirmation. Smart quota balancing prefers accounts with a reset expiring within seven days. Automatic use is separately opt-in under Config, Routing: redeem at 95% weekly use, or one hour before expiry regardless of usage, including 0%. It shares the crash-safe reset journal. See [banked resets](docs/banked-resets.md).
 
-**Start idle usage windows** (off by default). Under Config, Routing, choose Claude subscription accounts and start their inactive five-hour windows automatically, always or during selected working hours. Each starter sends one small model request and consumes a little subscription quota; it brings the next reset forward without increasing weekly allowance. Supported accounts also have a manual **Start now** action. Active windows, real work, exhausted limits and uncertain provider data are skipped. Attempts survive restarts and share locking with banked resets. See [window starters](docs/window-starters.md).
+**Start idle usage windows** (off by default). Under Config, Routing, choose Claude subscription accounts and start their inactive five-hour windows automatically, always or during selected working hours. Each starter sends one small model request and consumes a little subscription quota; it brings the next reset forward without increasing weekly allowance. Supported accounts also have a manual **Start now** action. Active windows, real work, exhausted limits, accounts without a five-hour limit (verified Ultra) and uncertain provider data are skipped. Attempts survive restarts and share locking with banked resets. See [window starters](docs/window-starters.md).
 
 <sub>Screenshots use sample data.</sub>
 
@@ -337,6 +345,7 @@ named-clients:
     key: fbx_...
     trust-client-identity: false     # default; opt in only for clients allowed to teach shared identities
     models: [claude-*, gpt-6-astra]   # model patterns it may ask for
+    model-map: {claude-opus-*: claude-sonnet-5-5}  # serve another model instead (see below)
     user-agents: [claude-cli/*]       # programs it may use (User-Agent patterns)
     requests-per-minute: 60           # over it: 429 with Retry-After
     tokens-per-day: 5000000           # input, cache writes and output; cache reads don't count
@@ -346,6 +355,8 @@ named-clients:
 ```
 
 Under **Config → Clients → More**, **Allow identity learning** / **Stop identity learning** toggles `trust-client-identity`. Only an authenticated named client with this setting enabled can teach Fusebox Claude Code/Codex releases and Claude runtime profiles. Shared keys and open access cannot learn; recognizing a native client alone does not grant trust. Learned profiles are shared, so enable this only for clients you control. Inspect or reset them under **Config → Connections → Client identities**. See [provider identity](docs/provider-identity.md#trusted-identity-learning).
+
+A client's **model map** (`model-map`, also in its Limits form) rewrites the model it asks for before routing — batch agents can keep asking for Opus and be served Sonnet, without changing their own configuration. Patterns match case-insensitively on the model with any reasoning suffix removed; an exact pattern beats a wildcard, and among wildcards the longest literal wins. The target may be a model group and may carry its own suffix (`gpt-6-astra: "gpt-6-astra-mini(low)"`), which replaces the request's; without one, the request's suffix is kept. The `models` allowlist is checked against the mapped model, and a mapped model is never mapped again. Mapping changes which model answers, not who the request claims to be: client identity and account selection follow the same rules as any other request for that model. Older Fusebox versions refuse a config that uses `model-map`.
 
 Days and months follow the server's time zone. Completed provider attempts update tokens and estimated spend immediately; every 30 seconds, Fusebox reconciles those totals with the usage database. Concurrent requests can still run slightly past a limit. Budget-limited keys receive 503 if accounting is unavailable, incomplete, or more than 90 seconds old, including while the initial totals load. Unknown prices are never counted as zero spend. WebSocket opening handshakes are free; each turn counts toward the request rate. Config, Clients shows each client's use beside its limits, and `GET /api/clients/usage` returns it, with when each key was last used since Fusebox started, the addresses each named key was used from, and which keys and addresses are connected now. A named key used from an address it wasn't used from before sends a notification (`client-new-address`, on by default), as does one refused by its `addresses` list. Where an address comes from behind a proxy is in [Source addresses](docs/source-addresses.md).
 
@@ -357,7 +368,7 @@ api-keys: []                  # shared keys from before named clients; with neit
 management-key: ""            # empty = dashboard only from localhost
 proxy-url: ""                 # optional http://, https:// or socks5:// upstream proxy; never falls back to direct
 request-retry: 3              # account/model choices across the whole request (at most 10)
-first-token-timeout-seconds: 120 # a stream silent this long moves to the next account; 0 = off
+first-token-timeout-seconds: 120 # a stream silent this long moves to the next account (twice as long when there is none); 0 = off
 routing: least-used           # new sessions: most quota left; or smart-quota, round-robin, fill-first
 session-affinity: true        # keep each coding session on one account, for prompt caching
 session-affinity-idle-seconds: 86400 # forget assignments after a day without requests
@@ -374,6 +385,7 @@ notifications:                # push notifications, for devices that turn them o
   provider-exhausted: true    # every account of a provider is out, and when one is back
   account-used-up: false
   account-errors: false
+  banked-resets: true         # a banked reset used automatically, needing review, or expired unused
   webhooks:                   # the same messages in Discord, Slack, Teams, Telegram, ntfy or any URL
     - https://discord.com/api/webhooks/...
 log-format: text              # or json, one object per line (needs a restart)
@@ -381,7 +393,7 @@ model-groups:                 # one name, several models; see "Model groups" bel
   smart: [claude-opus-5-5, gpt-6-astra]
 background-model: gemini-3.8-flash # Claude Code's quick Haiku calls go here
 # client-identities:          # operator-selected emulation versions (see Client compatibility)
-#   claude-code: 2.1.310
+#   claude-code: 2.1.319
 # upstream-header-allowlist:  # optional exact extra inbound names; reserved/private names are rejected
 #   claude: [x-provider-feature]
 #   codex: [x-provider-feature]
@@ -433,17 +445,36 @@ With `balance: true`, new sessions start on different models instead of always t
 
 Every account has a priority, 0 unless set. New sessions go to the highest priority with an account ready; the routing strategy chooses among those, and lower priorities only take over when none of them can. Set it on the account's page (**First**, **Normal** or **Last**), as `priority` on an API key in `config.yaml`, or as `"priority"` in a sign-in's credential file, as CLIProxyAPI does. Sessions already on an account stay there.
 
+The account's **Enabled** switch survives configuration reloads and restarts. Sign-ins keep it in their credential file; API-key accounts (including individual compatible keys and keyless endpoints) keep account IDs in `.disabled-api-keys.state` in `auth-dir`. That file contains no API keys. Keep it with the credentials when moving an installation.
+
 ### When a request fails
 
 A request tries up to `request-retry` account/model choices and at most ten attempts, including temporary retries on the same account. These limits and the two-minute retry budget cover every model in a model group together. A connection that never opened gets one more try on the same account; one that broke after the request went out moves to the next account, so the same account never runs it twice. An upstream HTTP 504 is answered, including in a model group, because the provider may still be working on it.
 
-Streams are held back until their first content, at most 5 seconds after they start. A rate limit or overload that arrives inside a successful response before then moves the request to the next account, and the client never sees it. A stream that sends nothing at all for `first-token-timeout-seconds` (120 by default) moves too, and that account sits out the model for two minutes.
+Streams are held back until their first content, at most 5 seconds after they start. A rate limit or overload that arrives inside a successful response before then moves the request to the next account, and the client never sees it. A stream that sends nothing at all for `first-token-timeout-seconds` (120 by default) moves too, and that account sits out the model for two minutes. When no other account could take the request, the account gets twice as long and stays in, so the client's retry can reach it again.
 
 Rate limits and used-up limits are kept in `.cooldowns.state` in the auth directory, so a restart doesn't send requests straight back to an account that is sitting out.
 
 An API key whose provider says it has no money left (a 402, or a refusal about credit, balance or billing, such as Anthropic's "credit balance is too low" or OpenAI's `insufficient_quota`) is **out of credit**: the request moves to the next account at once, and the key sits out every model for an hour before it is tried again, in case it has been topped up. The Accounts page shows it in red as *Out of credit*, with the provider's words; **Clear cooldowns** ends the pause early. Subscriptions never count as out of credit: their limits are allowances, handled as above.
 
 A 429 that says the provider is at capacity ("Codex is at capacity, please try again later") is an overload, not the account's rate limit: it is retried on the same account after 1 and 3 seconds, and if it lasts only that request fails, with the provider's error. The model stays available to the account's other sessions.
+When a provider refuses a refresh token for good (`invalid_grant`, `token_revoked`, an expired, reused or invalidated refresh token, or a bare 401 from OpenAI's token endpoint), Fusebox stops asking with that token. It first checks the credential file, in case another program already renewed the token there, and uses that one if so. Otherwise the account keeps serving while its access token is valid, then sits out of rotation, as a switched-off account does, until a sign-in or a different refresh token in its file. Its error says to sign in again, and that shows on the dashboard and in notifications rather than as a cooldown. A restart keeps that: `.cooldowns.state` remembers the refused token by its digest, never the token. `invalid_client` is not held: refreshing waits 5 minutes, doubling up to an hour. Vertex and Meta mint their own keys and are not held.
+
+If the auth directory exists but can't be read, its accounts stay as they were, with their sessions and cooldowns, until it can be read again; an empty or deleted directory removes them.
+
+Meta answers a Muse Code subscription's key used from another client with 403 `client_attestation_denied`. That rejects the request, not the account: Fusebox skips Meta's other accounts for that request, tries another provider that serves the same model, and otherwise returns Meta's message. The account gets no pause, error or failed-request count.
+
+When every account for a model is sitting out, the 429 says when the next one is back. If a rate limit, a used-up limit or a quota check keeps it away for a minute or less, the answer carries a `Retry-After` header, which clients wait out before trying again. A longer wait gets no header, because clients would sleep through it; OpenAI clients get a `usage_limit_reached` error with `resets_at` instead, which Codex shows as a usage limit. A sign-in or permission problem is never offered as a wait.
+
+A 429 that says the provider is at capacity ("Codex is at capacity, please try again later", or Codex's `turn_rate_limit_exceeded`) is an overload, not the account's rate limit. If it names a wait of 10 seconds or less, or none, it is retried on the same account after 1 and 3 seconds; a longer wait moves the request to the next account at once, since retries within it fail. If no account answers, only that request fails, with the provider's error and any wait it named as `Retry-After` (at most ten minutes), so Codex sits out just that turn. That holds for a capacity error inside a successful stream too. The model stays available to the account's other sessions.
+
+On a Codex WebSocket, a rate limit or capacity error that arrives before anything else moves the turn to HTTP, with the retries and failover above. A plain rate limit does so only when another account can take the model; otherwise the client gets the provider's own error. WebSocket error events carry any wait in their `headers`, where Codex reads it.
+
+An Anthropic API key whose credit has run out (a 400 "Your credit balance is too low…") sits out for 30 minutes and the request moves to the next account; the dashboard and notifications say "API credit used up". Meanwhile a request with no other account left gets that 400 again, without asking Anthropic, also after a restart. Subscriptions are not paused for it.
+
+ChatGPT's 502 "response protection is unavailable" refuses the request as sent, so it is answered at once, also when it arrives inside a stream, without retries on this account or another, and the account shows no error. The request log counts it as `response_protection_unavailable`.
+
+Codex asks for remote compaction (a `compaction_trigger` input item) by provider, not by model, and Kimi and Meta can't do it, so such a request leaves their accounts out. If only they serve the model, it gets a 400 without calling them: point Codex at those models through a model provider entry of their own with `capabilities.remote_compaction = "unsupported"`, and Codex compacts locally.
 
 Temporary upstream failures (connection failures, capacity 429s and HTTP 500, 502, 503 and 529, including errors before a stream's first content) appear as a recent account error for 30 seconds. The error then clears automatically, even if the account is idle; the original failure remains in the request log. Ready means the account is eligible to serve requests, without sending an inference to probe it.
 
@@ -466,7 +497,7 @@ Sessions are recognised from what clients already send: Claude Code's session me
 
 An HTTP request without any of them is recognised by its conversation's first user message, which every turn repeats, so the conversation's turns still share one account and its prompt cache. Cache markers are ignored for this, since clients move them from turn to turn. Conversations that start with the same message share an account; send an explicit session id to distinguish them. These inferred assignments use the same configured idle timeout as explicit sessions (a day by default), allowing reuse across longer cache lifetimes. The Requests page marks them as **Inferred session**. A request with no user message at all is routed on its own.
 
-Assignments are saved to `.routing-sessions.state` in the auth directory (hashed ids, owner-only permissions), so they survive restarts, and forgotten after `session-affinity-idle-seconds` without requests (a day by default). Send `x-fusebox-session-end: true` (or `x-cliproxy-session-end: true`) with a task's last request to release it early. Responses history for `previous_response_id` is kept in memory only, up to 64 MiB. Run one proxy per auth directory.
+Assignments are saved to `.routing-sessions.state` in the auth directory (hashed ids, owner-only permissions), so they survive restarts, and forgotten after `session-affinity-idle-seconds` without requests (a day by default). Send `x-fusebox-session-end: true` (or `x-cliproxy-session-end: true`) with a task's last request to release it early. Responses history for `previous_response_id` is kept in memory only, up to 64 MiB. Run one proxy per auth directory. To move an installation to another machine, see [moving Fusebox](docs/moving.md).
 
 Claude/Codex provider sessions have a separate lifetime. Each conversation gets a generated provider session for its current account; every account/subscription switch starts a fresh one, including a temporary A → B → A fallback. Inactivity expires it after `provider-session-idle-seconds` (default 1800; range 1–86400), and restart starts fresh provider sessions. The logical chat, available history and tool state continue across rotation. Routing assignments and prompt-cache keys remain separate; rotating the provider session does not itself replace a cache key. See [session and account identity](docs/provider-identity.md#conversation-and-account-sessions).
 
@@ -521,7 +552,7 @@ stream-limits:
 
 The decoder bounds SSE events and unfinished lines; native WebSocket events also have a size check. Models whose names contain `image`, `audio` or `video` use the larger media limit. Once the first event has arrived, reaching the bootstrap threshold releases buffered chunks for streaming; it does not repeat inference. Before the first event, the first-token deadline still applies and the event limit bounds buffering. An oversized event ends the stream with an error and retains usage already received. A nonzero pre-output timeout gives HTTP headers and the first event one absolute deadline, or bounds the first native WebSocket event including its send. Expiry is terminal `504`, with no automatic inference retry. Zero keeps the existing timeout behavior.
 
-Output limits are preserved during translation. Manual Claude thinking needs an output limit greater than 1,024 tokens; incompatible requests receive a `400` instead of silently increasing the limit. Gemini reasoning suffixes use the same mapping for native and translated requests.
+Output limits are preserved during translation. Manual Claude thinking needs an output limit greater than 1,024 tokens; incompatible requests receive a `400` instead of silently increasing the limit. Gemini reasoning suffixes use the same mapping for native and translated requests. Claude 4.6 and later, Fable and Mythos reject a final assistant message (prefill), so translated requests to them leave it out and record `prefill_unsupported` in request diagnostics; native Claude requests are sent as they are.
 
 Chat↔Responses translation retains late system/developer messages in their original positions, with cache boundaries. ChatGPT subscription requests map system roles to developer roles at the OAuth boundary, on HTTP and WebSocket transports. Public OpenAI API requests keep their original roles. Routes to Claude, Gemini or Devin add late instructions to the system prompt in their original order, as before, rather than demoting them to user turns. Translated low-verbosity preferences are retained for supported GPT-5/6 models on the Codex provider. Translated OpenAI service tiers require `translation.allow-service-tier: true`; dropped controls appear in request diagnostics. Native requests keep caller controls. Codex subscription preparation still removes output caps that its backend does not accept, so those caps are not a subscription billing limit.
 
@@ -558,7 +589,7 @@ To sign in accounts on a server, open the dashboard, click **Connect account**, 
 
 On Ctrl-C or SIGTERM, Fusebox stops taking connections, tells open WebSockets to reconnect, and gives requests in flight up to 10 seconds before it saves sessions, cooldowns and the usage database, well inside `TimeoutStopSec`.
 
-**Keeping an eye on it.** `GET /healthz` answers while the process runs. `GET /readyz` answers 200 when at least one account can take requests and the usage database works, and 503 with the reason otherwise. `GET /metrics` serves Prometheus metrics (requests, tokens, each account's readiness, load and quota windows, faults, client spend), with the dashboard's authentication: from localhost, or with the management key as a bearer token:
+**Keeping an eye on it.** `GET /healthz` answers while the process runs. `GET /readyz` answers 200 when at least one account can take requests and the usage database works, and 503 with the reason otherwise. `GET /metrics` serves Prometheus metrics (requests, tokens, each account's readiness, load and quota windows, faults, client spend, private Responses events left out per client program), with the dashboard's authentication: from localhost, or with the management key as a bearer token:
 
 ```yaml
 scrape_configs:
@@ -698,12 +729,17 @@ Plugins are Go shared libraries loaded into CLIProxyAPI's process, and the Redis
 ## Development
 
 ```sh
-cargo test            # translator and protocol tests
-cargo clippy --all-targets
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+node --test tests/*.test.cjs
+python3 -m unittest discover -s tests -p 'test_*.py'
 cargo run -- --config dev.yaml
 ```
 
 The dashboard lives in `ui/`. Its text assets are compressed and embedded at build time, so rebuild after editing them.
+
+After a release build, `python3 scripts/dev-smoke.py` checks native and translated requests against a loopback provider, compressed input, and the current embedded dashboard assets. `python3 scripts/usage-e2e.py --binary target/release/fusebox` checks collectors, durable replay and restart. Both use synthetic data; on `thebeast`, run them inside `agent-resource` as shown in the [optimization report](docs/optimization-report.md), which also documents reproducible component benchmarks.
 
 ### Client compatibility
 
@@ -719,8 +755,8 @@ Inspect effective versions, runtime values and their sources under **Config → 
 
 ```yaml
 client-identities:     # explicit operator override for generated identities
-  claude-code: 2.1.310
-  codex: 0.164.0       # also grok-build, devin-cli, antigravity
+  claude-code: 2.1.319
+  codex: 0.167.0       # also grok-build, devin-cli, antigravity
 ```
 
 An entry older than the built-in release is ignored, so a forgotten one can't hold Fusebox back. `fusebox check` prints the release it claims for each client. Muse Code's identity includes a build hash, so it can't be set this way.

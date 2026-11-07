@@ -86,6 +86,101 @@ test('unknown pricing remains unpriced and small backend estimates retain precis
   assert.equal(helpers.dollars(12345000), '$0.0123');
 });
 
+test('coverage distinguishes unavailable usage from missing rates without inventing free calls', () => {
+  const d = dashboard();
+  assert.equal(d.run('usageCoverage({ observations: 100, unpriced: 8, unpriced_reasons: { missing_usage: 8 } })[0]'), '8 missing usage');
+  assert.equal(d.run('usageCoverage({ observations: 5, unpriced: 5, unpriced_reasons: { unknown_model: 5 } })[0]'), '5 no model rate');
+  assert.equal(d.run('usageCoverage({ observations: 10, unpriced: 3, unpriced_reasons: { missing_usage: 2, unknown_model: 1 } })[0]'), '3 unpriced');
+  d.seed({ summary: { combined: { totals: { observations: 100, unpriced: 8, unpriced_reasons: { missing_usage: 7, unknown_model: 1 } } } } });
+  const line = d.run('usageCoverageLine(Usage.summary.combined.totals)');
+  assert.match(line, /92\.0% of calls priced/);
+  assert.match(line, /7 missing usage · 1 without a model rate/);
+  assert.doesNotMatch(line, /8 unpriced/);
+  const notice = d.run('usageNoticesHTML()');
+  assert.match(notice, /7 calls have missing or incomplete token usage/);
+  assert.match(notice, /costs remain unknown and are excluded/);
+  assert.match(notice, /Adding model prices cannot recover missing usage/);
+  d.seed({ summary: { combined: { totals: { observations: 3, unpriced: 0, missing_usage: 3, unpriced_reasons: {} } } } });
+  assert.doesNotMatch(d.run('usageNoticesHTML()'), /costs remain unknown/);
+});
+
+test('usage formatting reuses formatters while retaining unknown, zero and currency precision', () => {
+  let constructed = 0;
+  const d = dashboard({ Intl: { DateTimeFormat: Intl.DateTimeFormat, NumberFormat: class extends Intl.NumberFormat {
+    constructor(...args) { super(...args); constructed++; }
+  } } });
+  const initial = constructed;
+  for (let i = 0; i < 100; i++) {
+    assert.equal(d.run('usageCount(1234.5)'), '1,234.5');
+    assert.equal(d.run('UsageTools.dollars(12345000)'), '$0.0123');
+    assert.equal(d.run('UsageTools.dollars(1200000000)'), '$1.20');
+  }
+  assert.equal(constructed, initial, 'live renders do not allocate more number formatters');
+  assert.equal(d.run('usageCount(null)'), 'Unknown');
+  assert.equal(d.run('usageCount(0)'), '0');
+  assert.equal(d.run('UsageTools.dollars(null)'), 'Unpriced');
+  assert.equal(d.run('UsageTools.dollars(0)'), '$0.00');
+});
+
+test('usage dates retain native locale, timezone, DST and invalid-date behavior', () => {
+  const script = `
+    const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+    const context = { Intl, Date, URLSearchParams, S: {} };
+    vm.createContext(context);
+    vm.runInContext(fs.readFileSync(${JSON.stringify(path.join(__dirname, '../ui/usage.js'))}, 'utf8'), context);
+    const run = (source) => vm.runInContext(source, context);
+    for (const zone of ['UTC', 'Europe/Amsterdam', 'America/Los_Angeles', 'Asia/Kathmandu']) {
+      run('Usage.timezone = ' + JSON.stringify(zone));
+      for (const value of ['2026-03-29T00:30:00Z', '2026-03-29T01:30:00Z', '2026-10-25T00:30:00Z', '2026-10-25T01:30:00Z', '2026-10-29T23:59:59Z', -1, 1]) {
+        const at = new Date(value), literal = JSON.stringify(value);
+        assert.equal(run('usageTime(' + literal + ')'), at.toLocaleString(undefined, { timeZone: zone, hourCycle: 'h23' }));
+        assert.equal(run('usageClock(' + literal + ')'), at.toLocaleTimeString('en-GB', { timeZone: zone, hour12: false }));
+        assert.equal(run('UsageTools.localDate(' + literal + ', Usage.timezone)'), new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(at));
+        assert.equal(run('UsageTools.timeText(' + literal + ', Usage.timezone, "weekday")'), at.toLocaleString('en-GB', { timeZone: zone, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false }));
+      }
+    }
+    for (const literal of ['null', 'undefined', '0']) {
+      assert.equal(run('usageTime(' + literal + ')'), 'Not reported');
+      assert.equal(run('usageClock(' + literal + ')'), 'Not reported');
+    }
+    for (const literal of ['"bad date"', 'NaN', 'Infinity', '8640000000000001']) {
+      assert.equal(run('usageTime(' + literal + ')'), 'Not reported');
+      assert.equal(run('usageClock(' + literal + ')'), 'Invalid Date');
+    }
+    run('Usage.timezone = "not/a-timezone"');
+    assert.equal(run('usageTime("bad date")'), 'Not reported');
+    assert.throws(() => run('usageTime(1)'), /time zone/i);
+  `;
+  for (const locale of ['en_US.UTF-8', 'en_GB.UTF-8', 'nl_NL.UTF-8', 'zh_CN.UTF-8']) {
+    execFileSync(process.execPath, ['-e', script], { env: { ...process.env, LANG: locale, LC_ALL: locale, TZ: 'UTC' }, encoding: 'utf8' });
+  }
+});
+
+test('usage timestamps and chart history labels reuse formatters and update after a timezone change', () => {
+  let constructed = 0;
+  const d = dashboard({ Intl: { NumberFormat: Intl.NumberFormat, DateTimeFormat: function (...args) {
+    constructed++;
+    return new Intl.DateTimeFormat(...args);
+  } } });
+  const exercise = () => d.run(`[
+    usageTime(1793314800000), usageClock(1793314800000),
+    UsageTools.localDate(1793314800000, Usage.timezone),
+    UsageTools.beforeProxy('2026-10-28', 1793314800000, Usage.timezone),
+    UsageTools.timeText(1793314800000, Usage.timezone, 'weekday')
+  ]`);
+  d.seed({ timezone: 'UTC' });
+  const utc = exercise(), warm = constructed;
+  for (let i = 0; i < 100; i++) exercise();
+  assert.equal(constructed, warm, 'no new formatters during warm renders');
+  d.seed({ timezone: 'Asia/Tokyo' });
+  const tokyo = exercise();
+  assert.notEqual(tokyo[2], utc[2], 'the calendar date moves with the timezone');
+  assert.equal(constructed, warm + 4, 'each style replaces its cached timezone');
+  d.seed({ timezone: 'UTC' });
+  assert.deepEqual(exercise(), utc);
+  assert.equal(constructed, warm + 8, 'the cache retains only one timezone per style');
+});
+
 test('privacy hides all labels, IDs, paths, credentials and draft values in rendered markup', () => {
   const d = dashboard();
   d.context.S.private = true;
@@ -191,6 +286,76 @@ test('readout shows the hovered day with each group, and history-only days befor
   assert.match(html, /Before the proxy was set up · history only/);
   assert.equal(helpers.beforeProxy('2026-10-06', Date.UTC(2026, 9, 5, 23, 30), 'Europe/Amsterdam'), false);
   assert.equal(helpers.beforeProxy('2026-10-05', null, 'UTC'), false);
+});
+
+test('chart aggregation is reused on hover and invalidates for data, range, metric, stack and theme', () => {
+  const d = dashboard();
+  const trend = [{ date: '2026-10-05', group: 'anthropic', observations: 4, estimated_cost_nanos: 3e9 }];
+  d.seed({ range: { start: '2026-10-05', end: '2026-10-07', through: '2026-10-06' }, summary: { combined: { trend } } });
+  d.run('let aggregations = 0; const originalChart = UsageTools.chart; UsageTools.chart = (...args) => { aggregations++; return originalChart(...args); }; usageChartHTML()');
+  d.run('Usage.hoverDay = "2026-10-05"; usageChartHTML(); usageChartHTML()');
+  assert.equal(d.run('aggregations'), 1);
+  d.run('Usage.metric = "calls"');
+  assert.match(d.run('usageChartHTML()'), /4 calls/);
+  assert.equal(d.run('usageChartData().max'), 4);
+  d.run('Usage.range.end = "2026-10-06"; usageChartHTML()');
+  assert.equal(d.run('usageChartData().series.length'), 1);
+  d.run('Usage.summary.combined.trend = [{date: "2026-10-05", group: "anthropic", observations: 9}]; usageChartHTML()');
+  assert.equal(d.run('usageChartData().max'), 9);
+  d.run('Usage.summary.combined.trends = {model: [{date: "2026-10-05", group: "model-a", observations: 2}]}; Usage.stack = "model"; usageSelectStack(Usage.summary); usageChartHTML()');
+  assert.equal(d.run('usageChartData().keys[0]'), 'model-a');
+  // Introduce only the document properties chart generation needs, after setup.
+  d.context.document = { documentElement: { dataset: { shade: 'light' } } };
+  d.run('usageChartHTML()');
+  assert.equal(d.run('usageChartData().colors[0]'), 'oklch(0.6 0.09 30)');
+  assert.equal(d.run('aggregations'), 6);
+});
+
+test('empty charts reuse their aggregate and labels remain fresh without re-aggregation', () => {
+  const d = dashboard();
+  d.seed({ range: { start: '2026-10-05', end: '2026-10-07', through: '2026-10-06' }, summary: { combined: {} } });
+  d.run('let aggregations = 0; const originalChart = UsageTools.chart; UsageTools.chart = (...args) => { aggregations++; return originalChart(...args); }; usageChartHTML(); usageChartHTML()');
+  assert.equal(d.run('aggregations'), 1);
+  assert.equal(d.run('usageChartData().max'), 0);
+  assert.equal(d.run('usageChartData().series.length'), 2);
+  d.run('Usage.summary.combined.trend = [{date: "2026-10-05", group: "anthropic", observations: 1}]');
+  assert.match(d.run('usageChartHTML()'), /Claude/);
+  d.context.provName = () => 'Updated provider';
+  assert.match(d.run('usageChartHTML()'), /Updated provider/);
+  assert.equal(d.run('aggregations'), 2, 'labels are generated afresh without changing cached numeric data');
+});
+
+test('hover retains chart controls and focused bars, changing only selected classes and readout', () => {
+  const writes = [], classWrites = [];
+  const bars = ['2026-10-05', '2026-10-06', '2026-10-07'].map((date) => {
+    let cls = 'u-bar';
+    return { dataset: { usageDay: date }, get className() { return cls; }, set className(value) { cls = value; classWrites.push(date); } };
+  });
+  let readoutHTML = '';
+  const readout = { get innerHTML() { return readoutHTML; }, set innerHTML(value) { readoutHTML = value; writes.push('readout'); } };
+  const chart = { querySelector: () => readout, querySelectorAll: () => bars, set innerHTML(_) { assert.fail('hover must preserve the chart DOM'); } };
+  const cost = {};
+  const document = { documentElement: { dataset: {} }, activeElement: bars[1], addEventListener() {}, getElementById: (id) => ({ 'usage-chart': chart, 'usage-part-cost': cost })[id] || null };
+  const d = dashboard({ document, addEventListener() {}, setInterval() {} });
+  d.seed({ range: { start: '2026-10-05', end: '2026-10-08', through: '2026-10-07' }, summary: { combined: { trend: [{ date: '2026-10-05', group: 'anthropic', observations: 4, estimated_cost_nanos: 3e9 }] } } });
+  d.context.cost = cost;
+  d.run('S.route = "usage"; usagePainted.set(cost, "initial"); usageHover("2026-10-05")');
+  assert.deepEqual(bars.map((b) => b.className), ['u-bar on', 'u-bar dim', 'u-bar dim']);
+  assert.match(readout.innerHTML, /Day · Mon Oct 5/);
+  assert.match(readout.innerHTML, /4 calls/);
+  assert.equal(d.run('usagePainted.has(cost)'), false);
+  d.run('usageHover("2026-10-06")');
+  assert.deepEqual(bars.map((b) => b.className), ['u-bar dim', 'u-bar on', 'u-bar dim']);
+  assert.match(readout.innerHTML, /Day · Tue Oct 6/);
+  assert.equal(classWrites.length, 5, 'moving between bars changes only the previous and next selection');
+  d.run('usageHover("2026-10-06")');
+  assert.equal(writes.length, 2, 'repeated events on one day do no work');
+  d.run('usageHover(null)');
+  assert.deepEqual(bars.map((b) => b.className), ['u-bar', 'u-bar', 'u-bar']);
+  assert.match(readout.innerHTML, /Peak day · Mon Oct 5/);
+  assert.equal(document.activeElement, bars[1], 'the focused bar is the same element throughout');
+  d.run('S.route = "overview"; usageHover("2026-10-05")');
+  assert.equal(writes.length, 3, 'events outside the Usage page are ignored');
 });
 
 test('daily priced subset is distinct from the range breakdown and Fable is visible initially', () => {
@@ -301,25 +466,26 @@ test('full refresh and filter changes abort superseded reads without exposing ca
   const pending = pendingApi();
   const d = dashboard({ api: pending.api });
   const first = d.run('usageLoad()');
-  assert.deepEqual(pending.calls.map((call) => call.endpoint.split('?')[0]), ['/usage/dashboard', '/usage/status'], 'no records are read');
+  assert.deepEqual(pending.calls.map((call) => call.endpoint.split('?')[0]), ['/usage/dashboard', '/usage/entrypoints', '/usage/status'], 'no records are read');
   const refresh = d.run('usageLoad()');
-  assert.ok(pending.calls.slice(0, 2).every((call) => call.signal.aborted));
-  assert.ok(pending.calls.slice(2).every((call) => !call.signal.aborted));
+  assert.ok(pending.calls.slice(0, 3).every((call) => call.signal.aborted));
+  assert.ok(pending.calls.slice(3).every((call) => !call.signal.aborted));
   await first;
   assert.equal(d.run('Usage.loading'), true);
   assert.equal(d.run('Usage.error'), '');
   d.run('Usage.filters.model = "new-model"');
   const filtered = d.run('usageReload()');
-  assert.ok(pending.calls.slice(0, 4).every((call) => call.signal.aborted));
+  assert.ok(pending.calls.slice(0, 6).every((call) => call.signal.aborted));
   await refresh;
   assert.equal(d.run('Usage.loading'), true);
   assert.equal(d.run('Usage.error'), '');
-  const active = pending.calls.slice(4);
-  assert.equal(active.length, 2);
+  const active = pending.calls.slice(6);
+  assert.equal(active.length, 3);
   assert.match(active[0].endpoint, /model=new-model/);
+  assert.match(active[1].endpoint, /^\/usage\/entrypoints\?.*model=new-model/, 'entrypoints use the same filters');
   active.forEach((call) => call.resolve({ marker: 'filtered' }));
   await filtered;
-  for (const field of ['summary', 'status']) assert.equal(d.run(`Usage.${field}.marker`), 'filtered');
+  for (const field of ['summary', 'entrypoints', 'status']) assert.equal(d.run(`Usage.${field}.marker`), 'filtered');
   assert.equal(d.run('Usage.loading'), false);
   assert.equal(d.run('Usage.error'), '');
   assert.equal(d.run('usageReads.size'), 0);
@@ -359,20 +525,20 @@ test('route exit and pagehide cancel reads, and re-entry and restored pages resu
   assert.equal(d.run('Usage.loaded'), false);
   d.context.location.hash = '#/usage';
   d.run('bindUsage()');
-  assert.equal(pending.calls.length, 4);
-  pending.calls.slice(0, 2).forEach((call) => call.resolve({ marker: 'stale-route' }));
+  assert.equal(pending.calls.length, 6);
+  pending.calls.slice(0, 3).forEach((call) => call.resolve({ marker: 'stale-route' }));
   await first;
   assert.equal(d.run('Usage.summary'), null);
   assert.equal(d.run('Usage.loading'), true);
   listeners.get('pagehide')();
   assert.ok(pending.calls.every((call) => call.signal.aborted));
   listeners.get('pageshow')({ persisted: true });
-  assert.equal(pending.calls.length, 6);
-  pending.calls.slice(2, 4).forEach((call) => call.reject(new Error('late failure')));
+  assert.equal(pending.calls.length, 9);
+  pending.calls.slice(3, 6).forEach((call) => call.reject(new Error('late failure')));
   await new Promise(setImmediate);
   assert.equal(d.run('Usage.error'), '');
   assert.equal(d.run('Usage.loading'), true);
-  pending.calls.slice(4).forEach((call) => call.resolve({ marker: 'restored' }));
+  pending.calls.slice(6).forEach((call) => call.resolve({ marker: 'restored' }));
   await new Promise(setImmediate);
   assert.equal(d.run('Usage.summary.marker'), 'restored');
   assert.equal(d.run('Usage.status.marker'), 'restored');
@@ -422,7 +588,7 @@ test('chart stacking uses the loaded snapshot without another request, including
   assert.equal(d.run('Usage.summary.combined.stack'), 'model');
   d.run('Usage.stack = "provider"; usageLoadStack()');
   assert.equal(d.run('Usage.summary.combined.trend[0].marker'), 'provider');
-  assert.equal(calls, 2);
+  assert.equal(calls, 3, 'dashboard, entrypoints and status, once each');
 });
 
 test('the page is drawn once; a read or an account change repaints only the sections that changed', () => {
@@ -509,4 +675,59 @@ test('the prices block shows what a models.dev sync would add, and applies it', 
   assert.match(html, /Saved 2 prices; 7 earlier unpriced calls now have an estimate\. Catalogue 2026-10-27\.2\+models\.dev-2026-10-29\./);
   assert.match(html, /synced from models\.dev 2026-10-29 · 2 rates/);
   assert.match(html, /data-usage-act="sync-check"/, 'ready for the next check');
+});
+
+test('Claude Code entrypoints: SDK share by day, an Entrypoint tab once one is named, and a filter', () => {
+  const d = dashboard();
+  const trend = [
+    { date: '2026-10-28', group: 'sdk-ts', observations: 60 }, { date: '2026-10-28', group: 'cli', observations: 40 },
+    { date: '2026-10-30', group: 't3-code', observations: 95 }, { date: '2026-10-30', group: 'sdk-cli', observations: 5 },
+  ];
+  const breakdown = [
+    { id: 'sdk-ts', observations: 60, estimated_cost_nanos: 6e9, tokens: { input: 100, output: 10 } },
+    { id: 't3-code', observations: 95, estimated_cost_nanos: 5e9, tokens: { input: 200, output: 20 } },
+  ];
+  d.seed({ loaded: true, preset: 'custom', range: { start: '2026-10-28', end: '2026-10-31', through: '2026-10-30' },
+    summary: { combined: { totals: { observations: 167, estimated_cost_nanos: 12e9, tokens: { input: 1000, output: 50 } }, trend: [], breakdowns: { model: [] } } },
+    entrypoints: { breakdown, trend } });
+  let html = d.run('usageEntrypointsHTML()');
+  assert.match(html, /CLAUDE CODE ENTRYPOINTS/);
+  assert.match(html, /<b>33%<\/b><span>of 200 calls had an SDK label/, '65 of 200 calls');
+  assert.match(html, /<b>5%<\/b><span>on Fri Oct 30/, 'the latest day with calls');
+  assert.equal((html.match(/class="u-bar u-ep-bar"/g) || []).length, 3, 'one bar a day, empty days included');
+  assert.match(html, /Wed Oct 28: 60 with an SDK label, 40 with another, 60% SDK/);
+  assert.match(html, /SDK share 5%/);
+  html = d.run('Usage.dim = "entrypoint"; usageBreakdownHTML()');
+  assert.match(html, /Entrypoint <span class="mono dim">3<\/span>/);
+  assert.match(html, /sdk-ts<\/span><span class="u-ep-tag"/);
+  assert.match(html, /Agent SDK · TypeScript/);
+  assert.match(html, /T3 Code/);
+  assert.match(html, /No entrypoint/);
+  assert.equal((html.match(/u-ep-tag/g) || []).length, 1, 'only SDK labels carry the tag');
+  const rest = d.run('usageEntrypointRows()').find((r) => r.id === null);
+  assert.deepEqual([rest.observations, rest.estimated_cost_nanos, rest.tokens.input, rest.tokens.output], [12, 1e9, 700, 20], 'the rest of the summary');
+  const q = new URLSearchParams(helpers.query({ start: '2026-10-28', end: '2026-10-31' }, { entrypoint: 'sdk-ts' }, 'UTC'));
+  assert.equal(q.get('entrypoint'), 'sdk-ts');
+  d.run('Usage.filters.entrypoint = "sdk-ts"');
+  assert.match(d.run('usageHeadHTML()'), /Entrypoint<\/span><span class="mono">sdk-ts/);
+  // Nothing named an entrypoint: no card, no tab, and the breakdown falls back to models.
+  d.seed({ filters: { provider: '', model: '', account: '', client: '', entrypoint: '' }, dim: 'entrypoint',
+    summary: { combined: { totals: { observations: 4 }, trend: [], breakdowns: { model: [] } } }, entrypoints: { breakdown: [], trend: [] } });
+  assert.equal(d.run('usageEntrypointsHTML()'), '');
+  html = d.run('usageBreakdownHTML()');
+  assert.doesNotMatch(html, />Entrypoint </);
+  assert.equal(d.run('Usage.dim'), 'model');
+});
+
+test('a failed entrypoints read only leaves out their card and tab', async () => {
+  const d = dashboard({ api: (endpoint) => (endpoint.startsWith('/usage/entrypoints')
+    ? Promise.reject(new Error('Usage analytics is busy; retry shortly'))
+    : Promise.resolve(endpoint.startsWith('/usage/dashboard') ? { combined: { totals: { observations: 3 }, trend: [], breakdowns: { model: [] } } } : { health: {} })) });
+  d.run('usageRender = () => {}');
+  await d.run('usageLoad()');
+  assert.equal(d.run('Usage.error'), '');
+  assert.equal(d.run('Usage.entrypoints'), null);
+  assert.equal(d.run('Usage.summary.combined.totals.observations'), 3);
+  assert.equal(d.run('USAGE_PARTS.entrypoints()'), '');
+  assert.doesNotMatch(d.run('usageBreakdownHTML()'), />Entrypoint </);
 });

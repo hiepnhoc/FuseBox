@@ -51,6 +51,24 @@ under the same filename, invalidates old identity state and rotates provider
 sessions and account connection/TLS reuse. Claude replacement device identity is
 rebound as well.
 
+Signing in again to an account Fusebox already has saves into that account's
+existing credential file, whatever it is named (older releases used other names,
+such as `claude-d204ac98-<email>.json`). The account keeps its ID, priority,
+window-starter selection and sessions, and no stale copy is left retrying a
+revoked refresh token. The same account means the same provider and account ID;
+a Claude file without one is matched by email, a ChatGPT one only by its
+workspace's account ID. A new sign-in never overwrites another account's file:
+when its usual name is taken (`a+b@x` and `a_b@x` share one, as do two ChatGPT
+workspaces of one email on the same plan), it is saved as
+`<name>-<8 hex digits of its identity>.json` instead. Existing files keep their
+names, because the account ID is the file name. A Claude file with the same email
+is the same account and is signed in again. A refresh of the old tokens that is
+still running finishes first, then the new tokens take effect at once and an error
+from the old sign-in (such as `invalid_grant`) is cleared, as is the hold on a
+refresh token the provider refused. Any Claude or ChatGPT sign-in, new or
+repeated, then reads its usage and plan straight away, so its meters fill in
+without waiting for the next minute's poll.
+
 ## Trusted identity learning
 
 Native-client recognition controls how a request is prepared; it does not
@@ -69,8 +87,8 @@ named-clients:
 
 # Optional operator-selected versions for generated requests:
 client-identities:
-  claude-code: 2.1.310
-  codex: 0.164.0
+  claude-code: 2.1.319
+  codex: 0.167.0
 ```
 
 **Config → Clients → More → Allow identity learning** enables trust;

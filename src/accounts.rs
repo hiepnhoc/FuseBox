@@ -1,7 +1,7 @@
 //! Accounts: OAuth credential files + API keys from config, with selection,
 //! cooldowns and usage counters.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -402,6 +402,97 @@ struct ErrorPause {
     model: String,
 }
 
+/// A refusal only the owner can fix, such as a used-up API credit balance. It pauses the
+/// whole account until `until`, and requests meanwhile get the provider's answer again.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct Refusal {
+    pub until: DateTime<Utc>,
+    pub status: u16,
+    pub message: String,
+    /// The account error shown for it.
+    pub reason: String,
+}
+
+/// A refresh token the token endpoint refused for good (`invalid_grant`, revoked, ...).
+/// Fusebox stops renewing with it and serves while the access token lasts. After that
+/// the account is out of rotation, as a disabled one is, until a different refresh token
+/// arrives: a sign-in, a new credential file, or a newer copy on disk.
+#[derive(Debug, Clone)]
+pub struct RefreshHold {
+    /// SHA-256 of the refused refresh token, never the token itself.
+    refresh: [u8; 32],
+    /// SHA-256 of an access token the provider refused too, which ends serving early.
+    access_refused: Option<[u8; 32]>,
+    /// The token endpoint's answer, as safe to show as `OAuthResponseFailure`'s text.
+    pub reason: String,
+    /// The account error that says to sign in again; lifting the hold clears only that one.
+    pub error_id: Option<String>,
+    /// That error was shown again when the account went out of rotation.
+    out_reported: bool,
+}
+
+pub(crate) fn token_digest(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).into()
+}
+
+impl RefreshHold {
+    pub fn new(refresh_token: &str, reason: String) -> Self {
+        Self { refresh: token_digest(refresh_token), access_refused: None, reason, error_id: None, out_reported: false }
+    }
+
+    /// The hold is for this credential's refresh token; any other token lifts it.
+    pub fn applies(&self, o: &OAuth) -> bool {
+        self.refresh == token_digest(&o.refresh_token)
+    }
+
+    /// The access token can't serve either: missing, expired or refused.
+    pub fn out(&self, o: &OAuth, now: DateTime<Utc>) -> bool {
+        o.access_token.is_empty()
+            || o.expires_at.is_some_and(|t| t <= now)
+            || self.access_refused == Some(token_digest(&o.access_token))
+    }
+
+    /// The account error. "sign in again" is what the dashboard, notifications and the
+    /// app read as an expired sign-in.
+    pub fn error_text(&self) -> String {
+        format!("refresh failed: {}; sign in again", self.reason)
+    }
+
+    /// What `.cooldowns.state` keeps of it: digests, never tokens.
+    fn saved(&self) -> SavedHold {
+        SavedHold {
+            refresh: hex::encode(self.refresh),
+            access_refused: self.access_refused.map(hex::encode),
+            reason: self.reason.clone(),
+        }
+    }
+
+    /// A hold saved before a restart, for the same refresh token.
+    fn restored(saved: &SavedHold, o: &OAuth) -> Option<Self> {
+        let digest = |hex_digest: &str| -> Option<[u8; 32]> { hex::decode(hex_digest).ok()?.try_into().ok() };
+        let refresh = digest(&saved.refresh)?;
+        (refresh == token_digest(&o.refresh_token)).then(|| Self {
+            refresh,
+            access_refused: saved.access_refused.as_deref().and_then(digest),
+            reason: saved.reason.clone(),
+            error_id: None,
+            out_reported: false,
+        })
+    }
+}
+
+/// A refresh hold as `.cooldowns.state` keeps it, so a restart doesn't ask the token
+/// endpoint again with a token it refused for good.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+struct SavedHold {
+    /// SHA-256 of the refused refresh token, in hex.
+    refresh: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_refused: Option<String>,
+    reason: String,
+}
+
 #[derive(Debug, Default)]
 pub struct AccountState {
     pub latency: HashMap<(String, crate::latency::Context), crate::latency::Sample>,
@@ -412,6 +503,14 @@ pub struct AccountState {
     pub disabled: bool,
     /// Cooldowns keyed by model ("*" = whole account).
     pub cooldowns: HashMap<String, DateTime<Utc>>,
+    /// The `cooldowns` deadlines a rate limit set: waits a client may be told. `cool` and
+    /// `refuse` share the map, so a deadline counts only while it is the one recorded here.
+    pub limit_pauses: HashMap<String, DateTime<Utc>>,
+    /// The `cooldowns` deadlines a stalled upstream set (`stall`), kept like `limit_pauses`:
+    /// a deadline counts only while it is the one recorded here.
+    pub stall_pauses: HashMap<String, DateTime<Utc>>,
+    /// The refusal pausing the whole account, if one does (see [`Refusal`]).
+    pub refusal: Option<Refusal>,
     /// Confirmed subscription exhaustion, distinct from temporary rate limits. A
     /// banked reset or a fresh usage poll clears it; sessions move off it.
     pub quota_cooldowns: HashMap<String, DateTime<Utc>>,
@@ -426,10 +525,19 @@ pub struct AccountState {
     pub identity_epoch: u64,
     pub quota_refreshing: bool,
     pub banked_resets: Option<crate::banked_resets::View>,
+    /// Unexpired banked resets at the last good inventory read (ID, expiry, count), so
+    /// one that expires unused is noticed once.
+    pub reset_watch: Vec<(String, DateTime<Utc>, u64)>,
     pub window_starter: Option<crate::window_starter::View>,
     /// Foreground attempts cancel an idle-window preflight or pending send.
     pub window_starter_cancel: Option<Arc<tokio_util::sync::CancellationToken>>,
     pub strikes: u32,
+    /// A refresh token the token endpoint refused for good.
+    pub refresh_hold: Option<RefreshHold>,
+    /// After `invalid_client`, no refresh before this time; and how many came in a row.
+    pub refresh_backoff: Option<(DateTime<Utc>, u32)>,
+    /// The access token (SHA-256) whose missing refresh token was already reported.
+    pub no_refresh_reported: Option<[u8; 32]>,
     last_error: Option<AccountError>,
     pub last_used: Option<DateTime<Utc>>,
     pub counters: Counters,
@@ -456,6 +564,7 @@ impl AccountState {
         self.quota_cooldowns.clear();
         self.models_etag = None;
         self.banked_resets = None;
+        self.reset_watch.clear();
         self.window_starter = None;
         if let Some(cancel) = self.window_starter_cancel.take() {
             cancel.cancel();
@@ -463,13 +572,16 @@ impl AccountState {
         self.attribution = Default::default();
         self.attribution.dirty = true;
         self.strikes = 0;
+        self.refresh_hold = None;
+        self.refresh_backoff = None;
+        self.no_refresh_reported = None;
         self.clear_error();
         true
     }
 
     /// A quota reading: the windows, and the attribution of whatever rose since the last one.
     pub fn set_quota(&mut self, windows: Vec<crate::quota::Window>, plan: Option<String>) {
-        if plan.as_ref().zip(self.quota.plan.as_ref()).is_some_and(|(new, old)| new != old) {
+        if plan.as_ref().zip(self.quota.plan.as_ref()).is_some_and(|(new, old)| !crate::quota::same_plan(new, old)) {
             self.attribution.history.clear();
             self.attribution.dirty = true;
         }
@@ -512,6 +624,25 @@ impl AccountState {
         self.last_error = None;
     }
 
+    /// A held account just went out of rotation: show its sign-in error again, once, in
+    /// case a request or the user cleared it while the account still served.
+    pub fn report_held_out(&mut self) {
+        let now = Utc::now();
+        let Some(hold) = &self.refresh_hold else { return };
+        if hold.out_reported {
+            return;
+        }
+        if hold.error_id.is_none() || hold.error_id.as_deref() != self.last_error_id(now) {
+            let text = hold.error_text();
+            self.set_error(text);
+        }
+        let id = self.last_error_id(now).map(String::from);
+        if let Some(hold) = self.refresh_hold.as_mut() {
+            hold.error_id = id;
+            hold.out_reported = true;
+        }
+    }
+
     /// Dismiss the displayed occurrence without losing a newer failure, including
     /// a repeated failure with the same message. An already-cleared error is OK.
     pub fn clear_error_if(&mut self, id: &str) -> bool {
@@ -520,6 +651,11 @@ impl AccountState {
         }
         self.clear_error();
         true
+    }
+
+    /// The refusal pausing the whole account now: still running, and still the account-wide pause.
+    fn live_refusal(&self, now: DateTime<Utc>) -> Option<&Refusal> {
+        self.refusal.as_ref().filter(|r| r.until > now && self.cooldowns.get("*") == Some(&r.until))
     }
 
     fn pause_error(&mut self, message: &str, quota: bool, model: &str, until: DateTime<Utc>) {
@@ -544,7 +680,8 @@ impl AccountState {
     }
 
     /// What pauses the account, per model ("*" = every model): until when, and why
-    /// (`rate_limit`, spent subscription `quota`, or a quota check, `checking`).
+    /// (`rate_limit`, spent subscription `quota`, a quota check, `checking`, or `credit`,
+    /// an API key whose prepaid credit ran out).
     pub fn pauses(&self, now: DateTime<Utc>) -> BTreeMap<String, (DateTime<Utc>, &'static str)> {
         let mut pauses: BTreeMap<String, (DateTime<Utc>, &'static str)> =
             self.cooldowns.iter().filter(|(_, t)| **t > now).map(|(k, t)| (k.clone(), (*t, "rate_limit"))).collect();
@@ -552,6 +689,11 @@ impl AccountState {
             if *deadline > now && pauses.get(model).is_none_or(|(t, _)| deadline > t) {
                 pauses.insert(model.clone(), (*deadline, "quota"));
             }
+        }
+        if let Some(r) = self.live_refusal(now)
+            && pauses.get("*").is_some_and(|(t, _)| *t == r.until)
+        {
+            pauses.insert("*".into(), (r.until, "credit"));
         }
         if self.quota_refreshing {
             pauses.insert("*".into(), (now + chrono::Duration::seconds(30), "checking"));
@@ -627,6 +769,9 @@ pub struct Account {
     pub aliases: Vec<OAuthAlias>,
     /// Higher goes first; lower priorities only take over (the file's or key's `priority`).
     pub priority: i32,
+    /// The billing day set by hand (the file's `billing`), for subscriptions whose
+    /// provider gives no date.
+    pub billing: Option<crate::quota::Billing>,
 }
 
 /// `gemini-3-8-flash` -> `gemini-3.8-flash`, `gpt-6-1-sol` -> `gpt-6.1-sol`
@@ -649,23 +794,30 @@ fn dot_versions(m: &str) -> String {
 
 /// `*` wildcard match, case-insensitive (`gemini-2.5-*`, `*-preview`, `*flash*`).
 pub fn wildcard(pattern: &str, s: &str) -> bool {
-    let (p, s) = (pattern.trim().to_ascii_lowercase(), s.to_ascii_lowercase());
-    let parts: Vec<&str> = p.split('*').collect();
-    if parts.len() == 1 {
-        return p == s;
+    let pattern = pattern.trim();
+    if !pattern.contains('*') {
+        return pattern.eq_ignore_ascii_case(s);
     }
-    let mut rest = s.as_str();
-    for (i, part) in parts.iter().enumerate() {
+    let mut rest = s.as_bytes();
+    let mut parts = pattern.split('*').enumerate().peekable();
+    while let Some((i, part)) = parts.next() {
+        let part = part.as_bytes();
         if part.is_empty() {
             continue;
         }
         if i == 0 {
-            let Some(r) = rest.strip_prefix(part) else { return false };
-            rest = r;
-        } else if i == parts.len() - 1 {
-            return rest.ends_with(part);
+            if !rest.get(..part.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(part)) {
+                return false;
+            }
+            rest = &rest[part.len()..];
+        } else if parts.peek().is_none() {
+            return rest
+                .get(rest.len().saturating_sub(part.len())..)
+                .is_some_and(|suffix| suffix.len() == part.len() && suffix.eq_ignore_ascii_case(part));
         } else {
-            let Some(at) = rest.find(part) else { return false };
+            let Some(at) = rest.windows(part.len()).position(|window| window.eq_ignore_ascii_case(part)) else {
+                return false;
+            };
             rest = &rest[at + part.len()..];
         }
     }
@@ -868,18 +1020,77 @@ impl Account {
     }
 
     /// Pauses the account (or one model) for a problem that stays shown until a
-    /// request succeeds: sign-in, permission, a stalled upstream.
+    /// request succeeds, such as a sign-in or permission problem (stalls use `stall`).
     pub fn cool(&self, model: Option<&str>, until: DateTime<Utc>, reason: &str) {
         let mut st = self.state.lock();
-        st.cooldowns.insert(model.unwrap_or("*").to_string(), until);
+        let key = model.unwrap_or("*");
+        st.cooldowns.insert(key.to_string(), until);
+        st.limit_pauses.remove(key);
+        st.set_error(reason);
+    }
+
+    /// Pauses a model whose upstream sent nothing before the first-token deadline, so its
+    /// next requests go to another account. The error stays until a request succeeds.
+    pub fn stall(&self, model: &str, until: DateTime<Utc>, reason: &str) {
+        let mut st = self.state.lock();
+        let now = Utc::now();
+        st.stall_pauses.retain(|_, t| *t > now);
+        st.cooldowns.insert(model.to_string(), until);
+        st.limit_pauses.remove(model);
+        st.stall_pauses.insert(model.to_string(), until);
         st.set_error(reason);
     }
 
     /// Pauses a model for a rate limit; the error ends with the pause.
     pub fn rate_limit(&self, model: &str, until: DateTime<Utc>, reason: &str) {
         let mut st = self.state.lock();
+        let now = Utc::now();
+        st.limit_pauses.retain(|_, t| *t > now);
         st.cooldowns.insert(model.to_string(), until);
+        st.limit_pauses.insert(model.to_string(), until);
         st.pause_error(reason, false, model, until);
+    }
+
+    /// Pauses the whole account for a refusal only its owner can fix, such as a used-up
+    /// API credit balance. Requests meanwhile get the provider's answer (`refusal`); the
+    /// error ends with the pause.
+    pub fn refuse(&self, until: DateTime<Utc>, reason: &str, status: u16, message: &str) {
+        let mut st = self.state.lock();
+        st.cooldowns.insert("*".into(), until);
+        st.limit_pauses.remove("*");
+        st.refusal = Some(Refusal { until, status, message: message.to_string(), reason: reason.to_string() });
+        st.pause_error(reason, false, "*", until);
+    }
+
+    /// The refusal pausing the whole account, while it does: status and message. It is kept
+    /// apart from the account error, so clearing or replacing that changes no answer.
+    pub fn refusal(&self) -> Option<(u16, String)> {
+        let st = self.state.lock();
+        st.live_refusal(Utc::now()).map(|r| (r.status, r.message.clone()))
+    }
+
+    /// Whether only rate limits, spent quota or a quota check keep `model` off this account,
+    /// so its return is a wait a client may be told. A sign-in or permission pause (`cool`)
+    /// is not one, nor is a refusal or a stalled upstream (`stall`). All share `cooldowns` with rate limits:
+    /// a rate limit is the deadline `rate_limit` recorded in `limit_pauses`.
+    pub fn paused_by_limit(&self, model: &str) -> bool {
+        let st = self.state.lock();
+        let now = Utc::now();
+        ["*", model]
+            .into_iter()
+            .all(|key| st.cooldowns.get(key).is_none_or(|t| *t <= now || st.limit_pauses.get(key) == Some(t)))
+    }
+
+    /// Whether a stalled upstream (`stall`) keeps `model` off this account, with nothing
+    /// but rate limits or spent quota besides: a short wait that is no rate limit.
+    pub fn paused_by_stall(&self, model: &str) -> bool {
+        let st = self.state.lock();
+        let now = Utc::now();
+        let live = |key: &str| st.cooldowns.get(key).filter(|t| **t > now);
+        let stalled = |key: &str| live(key).is_some_and(|t| st.stall_pauses.get(key) == Some(t));
+        let limited = |key: &str| live(key).is_some_and(|t| st.limit_pauses.get(key) == Some(t));
+        ["*", model].iter().any(|key| stalled(key))
+            && ["*", model].iter().all(|key| live(key).is_none() || stalled(key) || limited(key))
     }
 
     pub fn quota_epoch(&self) -> u64 {
@@ -898,7 +1109,40 @@ impl Account {
         let mut st = self.state.lock();
         st.strikes = 0;
         st.credit_until = None;
-        st.clear_error();
+        // Serving on until the access token expires doesn't end the need to sign in again.
+        let holding = st.refresh_hold.as_ref().filter(|hold| match &*self.cred.read() {
+            Credential::OAuth(o) => hold.applies(o),
+            Credential::ApiKey { .. } => false,
+        });
+        if holding.is_none_or(|hold| hold.error_id.as_deref() != st.last_error_id(Utc::now())) {
+            st.clear_error();
+        }
+    }
+
+    /// Out of rotation until a sign-in: its refresh token was refused for good and its
+    /// access token can't serve any more (see [`RefreshHold`]).
+    pub fn held_out(&self) -> bool {
+        let st = self.state.lock();
+        let Some(hold) = &st.refresh_hold else { return false };
+        match &*self.cred.read() {
+            Credential::OAuth(o) => hold.applies(o) && hold.out(o, Utc::now()),
+            Credential::ApiKey { .. } => false,
+        }
+    }
+
+    /// The provider refused the access token of an account whose refresh token it refused
+    /// too, so the account goes out of rotation now rather than when the token expires.
+    pub fn refuse_access(&self) -> bool {
+        let mut st = self.state.lock();
+        let cred = self.cred.read();
+        let (Some(hold), Credential::OAuth(o)) = (st.refresh_hold.as_mut(), &*cred) else { return false };
+        if !hold.applies(o) {
+            return false;
+        }
+        hold.access_refused = Some(token_digest(&o.access_token));
+        drop(cred);
+        st.report_held_out();
+        true
     }
 
     pub fn snapshot(&self) -> Value {
@@ -914,7 +1158,7 @@ impl Account {
             Credential::OAuth(o) => ("oauth", o.expires_at.map(|t| t.to_rfc3339()), o.email.clone(), None),
             Credential::ApiKey { base_url, .. } => ("api-key", None, None, base_url.clone()),
         };
-        serde_json::json!({
+        let mut out = serde_json::json!({
             "id": self.id,
             "provider": self.provider,
             "label": self.label,
@@ -940,7 +1184,56 @@ impl Account {
             // The configured upstream-name/alias pairs, for editing an API key's model list.
             "model_map": self.models,
             "base_url": base_url,
-        })
+            "takes_billing": self.takes_billing(),
+            "billing": self.billing.as_ref().map(|b| serde_json::json!({
+                "date": b.date,
+                "period": b.period,
+                "ends": b.ends,
+                "plan_changed": b.plan_changed(st.quota.plan.as_deref()),
+            })),
+        });
+        // A billing day set by hand shows as the renewal wherever the provider's would.
+        if st.quota.renewal.is_none()
+            && let Some(r) = self.renewal(&st.quota)
+        {
+            out["quota"]["renewal"] = serde_json::to_value(r).unwrap_or(Value::Null);
+        }
+        if self.provider == Provider::Meta
+            && let Some(name) = self.meta_plan_name(&st.quota)
+        {
+            out["quota"]["plan_name"] = name.into();
+        }
+        out
+    }
+
+    /// The Meta tier's name as the account file saved it from a mint, without Meta's
+    /// "Muse Code " product prefix ("Max Usage"). Meta's later mints name no tier, so
+    /// the saved name stands until a mint or stream frame reports a different tier id:
+    /// then it is hidden rather than shown for a tier the account left.
+    pub fn meta_plan_name(&self, quota: &crate::quota::Quota) -> Option<String> {
+        let cred = self.cred.read();
+        let Credential::OAuth(o) = &*cred else { return None };
+        let name = o.field("subs_tier_name")?;
+        if let (Some(saved), Some(seen)) = (o.field("subs_tier_id"), quota.meta_tier.as_deref())
+            && saved != seen
+        {
+            return None;
+        }
+        let short = name.strip_prefix("Muse Code ").map(str::trim).filter(|s| !s.is_empty());
+        Some(short.unwrap_or(name).to_string())
+    }
+
+    /// When the subscription charges next: the provider's date, else the day set by hand.
+    pub fn renewal(&self, quota: &crate::quota::Quota) -> Option<crate::quota::Renewal> {
+        quota.renewal.clone().or_else(|| self.billing.as_ref().map(|b| b.renewal(quota.plan.as_deref())))
+    }
+
+    /// Sign-ins whose provider gives no billing date, so one can be set by hand. ChatGPT
+    /// gives its own.
+    pub fn takes_billing(&self) -> bool {
+        self.path.is_some()
+            && matches!(self.provider, Provider::Claude | Provider::Meta)
+            && matches!(&*self.cred.read(), Credential::OAuth(o) if !o.raw.contains_key("service_account"))
     }
 }
 
@@ -999,12 +1292,12 @@ pub fn read_oauth_file(path: &Path) -> Option<(Provider, OAuth, bool, Map<String
 
 /// Writes refreshed tokens back into the credential file, keeping unknown fields.
 pub fn write_oauth_file(path: &Path, provider: Provider, o: &OAuth, extra: &[(&str, Value)]) -> std::io::Result<()> {
-    let mut map = o.raw.clone();
-    if let Some(disk) =
-        std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Map<String, Value>>(&t).ok())
-    {
-        map.extend(disk);
-    }
+    // The file owns operator settings, including their removal. Overlaying it on
+    // stale raw metadata would resurrect fields such as `disabled` or `priority`.
+    let mut map = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Map<String, Value>>(&t).ok())
+        .unwrap_or_else(|| o.raw.clone());
     map.insert("type".into(), provider.as_str().into());
     map.insert("access_token".into(), o.access_token.clone().into());
     map.insert("refresh_token".into(), o.refresh_token.clone().into());
@@ -1107,6 +1400,7 @@ struct Spec {
     aliases: Vec<OAuthAlias>,
     extra: Vec<String>,
     priority: i32,
+    billing: Option<crate::quota::Billing>,
     /// Why this account can't be used as it is (a credential file's invalid proxy).
     problem: Option<String>,
 }
@@ -1123,11 +1417,22 @@ fn nonempty(s: &Option<String>) -> Option<String> {
     s.as_ref().map(|s| s.trim().trim_matches('/').to_string()).filter(|s| !s.is_empty())
 }
 
-fn collect(cfg: &Config) -> Vec<Spec> {
+/// The accounts the config and the auth directory describe, and the error when that
+/// directory exists but can't be read (no files are collected then). A missing directory
+/// simply has no files.
+fn collect(cfg: &Config) -> (Vec<Spec>, Option<std::io::Error>) {
     let mut specs = Vec::new();
     let dir = cfg.auth_dir();
-    let mut files: Vec<PathBuf> =
-        std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect()).unwrap_or_default();
+    // Only a missing directory has no accounts. An error part-way through the listing is
+    // as unreadable as one at the start: the entries read so far are not all of them.
+    let (mut files, unreadable): (Vec<PathBuf>, _) = match std::fs::read_dir(&dir) {
+        Ok(rd) => match rd.map(|e| e.map(|e| e.path())).collect::<Result<Vec<_>, _>>() {
+            Ok(files) => (files, None),
+            Err(e) => (vec![], Some(e)),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (vec![], None),
+        Err(e) => (vec![], Some(e)),
+    };
     files.sort();
     for path in files {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -1168,6 +1473,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
             excluded,
             aliases,
             priority: priority.unwrap_or(0),
+            billing: map.get("billing").and_then(|v| serde_json::from_value(v.clone()).ok()),
             problem,
             extra: for_provider(&cfg.extra_models, provider),
             id: format!("file:{name}"),
@@ -1215,6 +1521,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
                 aliases: vec![],
                 extra: for_provider(&cfg.extra_models, provider),
                 priority: e.priority,
+                billing: None,
                 problem: None,
             });
         }
@@ -1238,6 +1545,7 @@ fn collect(cfg: &Config) -> Vec<Spec> {
                 aliases: vec![],
                 extra: vec![],
                 priority: c.priority,
+                billing: None,
                 problem: None,
             });
         }
@@ -1260,11 +1568,12 @@ fn collect(cfg: &Config) -> Vec<Spec> {
                 aliases: vec![],
                 extra: vec![],
                 priority: c.priority,
+                billing: None,
                 problem: None,
             });
         }
     }
-    specs
+    (specs, unreadable)
 }
 
 // ------------------------------------------------------------------------ pool
@@ -1273,8 +1582,37 @@ fn collect(cfg: &Config) -> Vec<Spec> {
 pub struct Pool {
     accounts: RwLock<Vec<Arc<Account>>>,
     cursor: Mutex<HashMap<String, usize>>,
+    /// Serializes reloads and API-key switches; these have no credential file in
+    /// which to store their disabled flag. Only account IDs go to disk, never keys.
+    disabled_keys: Mutex<Option<DisabledKeys>>,
     /// `force-model-prefix`: unprefixed names skip accounts that have a prefix.
     force_prefix: std::sync::atomic::AtomicBool,
+    /// The auth directory could not be read at the last reload (warned once).
+    auth_unreadable: std::sync::atomic::AtomicBool,
+}
+
+const DISABLED_KEYS_FILE: &str = ".disabled-api-keys.state";
+
+struct DisabledKeys {
+    path: PathBuf,
+    ids: BTreeSet<String>,
+}
+
+impl DisabledKeys {
+    fn load(path: PathBuf) -> Self {
+        let ids = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!("could not read disabled API-key accounts: {e}");
+                BTreeSet::new()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+            Err(e) => {
+                tracing::warn!("could not read disabled API-key accounts: {e}");
+                BTreeSet::new()
+            }
+        };
+        Self { path, ids }
+    }
 }
 
 /// Restricts a request to some accounts (`provider/model` or `prefix/model`).
@@ -1312,7 +1650,38 @@ impl SmartQuotaScore {
 }
 
 impl Pool {
+    pub fn set_key_disabled(&self, id: &str, disabled: bool) -> std::io::Result<()> {
+        let mut saved = self.disabled_keys.lock();
+        let saved = saved.as_mut().ok_or_else(|| std::io::Error::other("account state is not loaded"))?;
+        let account = self.get(id).ok_or_else(|| std::io::Error::other("unknown account"))?;
+        let mut ids = saved.ids.clone();
+        if disabled {
+            ids.insert(id.to_string());
+        } else {
+            ids.remove(id);
+        }
+        crate::files::write_private(&saved.path, &serde_json::to_vec(&ids)?).map_err(std::io::Error::other)?;
+        saved.ids = ids;
+        account.state.lock().disabled = disabled;
+        Ok(())
+    }
+
     /// Resolve a pinned account without replacing it with a different provider.
+    /// Whether an account other than `except` could take `model` now: switched on, not
+    /// held out for a sign-in, and not paused for it.
+    pub fn another_can_serve(&self, model: &str, except: &str, only: Option<&Only>) -> bool {
+        self.all().iter().any(|a| {
+            if a.id == except {
+                return false;
+            }
+            let disabled = a.state.lock().disabled;
+            !disabled
+                && !a.held_out()
+                && self.resolve_account(a, model, only).is_some()
+                && a.cooling_until(model).is_none()
+        })
+    }
+
     pub fn resolve_account(&self, a: &Account, model: &str, only: Option<&Only>) -> Option<String> {
         let allowed = match only {
             Some(Only::Provider(p)) => *p == a.provider,
@@ -1322,8 +1691,28 @@ impl Pool {
         allowed.then(|| a.resolve_with(model, matches!(only, Some(Only::Provider(_))))).flatten()
     }
     pub fn reload(&self, cfg: &Config) {
+        // Hold through publication so a switch cannot be overwritten by a reload
+        // that collected an older disabled flag. Concurrent reloads serialize too.
+        let mut disabled_keys = self.disabled_keys.lock();
+        let path = cfg.auth_dir().join(DISABLED_KEYS_FILE);
+        if disabled_keys.as_ref().is_none_or(|saved| saved.path != path) {
+            *disabled_keys = Some(DisabledKeys::load(path));
+        }
+        let disabled_keys = disabled_keys.as_ref().unwrap();
         self.force_prefix.store(cfg.force_model_prefix, std::sync::atomic::Ordering::Relaxed);
-        let specs = collect(cfg);
+        let (specs, unreadable) = collect(cfg);
+        // An unreadable directory says nothing about its files: keep their accounts, with
+        // their sessions, cooldowns and quota, until it can be read again.
+        let kept: Vec<Arc<Account>> = match &unreadable {
+            Some(_) => self.accounts.read().iter().filter(|a| a.path.is_some()).cloned().collect(),
+            None => vec![],
+        };
+        let was_unreadable = self.auth_unreadable.swap(unreadable.is_some(), std::sync::atomic::Ordering::Relaxed);
+        if let Some(e) = &unreadable
+            && !was_unreadable
+        {
+            tracing::warn!("cannot read the auth directory, so its accounts stay as they were: {e}");
+        }
         for s in &specs {
             // `claude/<model>` would otherwise pick any Claude account.
             if let Some(prefix) = s.prefix.as_deref().filter(|p| Provider::parse(p).is_some()) {
@@ -1335,8 +1724,12 @@ impl Pool {
         }
         let old: HashMap<String, Arc<Account>> =
             self.accounts.read().iter().map(|a| (a.id.clone(), a.clone())).collect();
-        let mut next = Vec::with_capacity(specs.len());
+        let mut next = kept;
+        next.reserve(specs.len());
         for mut s in specs {
+            if s.path.is_none() {
+                s.disabled |= disabled_keys.ids.contains(&s.id);
+            }
             let mut identity_changed = false;
             if let Some(prev) = old.get(&s.id) {
                 // Never replace a successfully rotated token with its older disk
@@ -1346,9 +1739,19 @@ impl Pool {
                 let pending = prev.pending_oauth_save.lock();
                 if let Some(path) = &s.path {
                     // Collection happened before taking the refresh lock; reread
-                    // here in case a refresh completed while files were scanned.
-                    if let Some((_, oauth, _, _)) = read_oauth_file(path) {
+                    // here in case a refresh or management edit completed while
+                    // files were scanned. A deleted file must not be republished,
+                    // which would also revalidate its stale request allocations.
+                    // Only a file missing from a directory that is still there was
+                    // deleted: `exists()` is also false when the directory can't be read,
+                    // and Windows reports NotFound when the directory is gone or isn't one.
+                    if let Some((_, oauth, disabled, _)) = read_oauth_file(path) {
                         s.cred = Credential::OAuth(oauth);
+                        s.disabled = disabled;
+                    } else if std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                        && path.parent().is_some_and(|dir| std::fs::metadata(dir).is_ok_and(|m| m.is_dir()))
+                    {
+                        continue;
                     }
                 }
                 let current = prev.cred.read().clone();
@@ -1400,7 +1803,8 @@ impl Pool {
                     && prev.excluded == s.excluded
                     && prev.aliases == s.aliases
                     && prev.extra == s.extra
-                    && prev.priority == s.priority;
+                    && prev.priority == s.priority
+                    && prev.billing == s.billing;
                 if same_shape {
                     let mut st = prev.state.lock();
                     st.disabled = s.disabled || s.problem.is_some();
@@ -1427,6 +1831,7 @@ impl Pool {
                         models_etag: st.models_etag.clone(),
                         quota_refreshing: st.quota_refreshing,
                         banked_resets: st.banked_resets.clone(),
+                        reset_watch: st.reset_watch.clone(),
                         strikes: st.strikes,
                         last_error: st.last_error.clone(),
                         last_used: st.last_used,
@@ -1501,6 +1906,7 @@ impl Pool {
                 excluded: s.excluded,
                 aliases: s.aliases,
                 priority: s.priority,
+                billing: s.billing,
             }));
         }
         // Another program (CLIProxyAPI itself) may be rewriting a credential file
@@ -1659,7 +2065,7 @@ impl Pool {
                 Some(Only::Prefix(x)) => a.prefix.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(x)),
                 None => !(force && a.prefix.is_some()),
             };
-            if !allowed || exclude.contains(&a.id) || a.state.lock().disabled {
+            if !allowed || exclude.contains(&a.id) || a.state.lock().disabled || a.held_out() {
                 continue;
             }
             let forced = matches!(only, Some(Only::Provider(_)));
@@ -1781,7 +2187,8 @@ impl Pool {
 
     /// Every account that can serve `model`, in the order new sessions would try them:
     /// the strategy's pick first, then the other ready accounts, aggregator fallbacks,
-    /// accounts cooling down, and disabled ones. Read-only: no turn is taken.
+    /// accounts cooling down, those waiting for a sign-in, and disabled ones. Read-only:
+    /// no turn is taken.
     pub fn route_order(
         &self,
         model: &str,
@@ -1796,6 +2203,8 @@ impl Pool {
             let Some(upstream) = self.resolve_account(a, model, only) else { continue };
             if a.state.lock().disabled {
                 rest.push(RouteStep::new(a, upstream, "disabled", None));
+            } else if a.held_out() {
+                rest.push(RouteStep::new(a, upstream, "signin", None));
             } else if let Some(until) = a.cooling_until(model) {
                 rest.push(RouteStep::new(a, upstream, "cooling", Some(until)));
             } else {
@@ -1852,7 +2261,7 @@ impl Pool {
             step.fallback = true;
             steps.push(step);
         }
-        rest.sort_by_key(|s| (s.state == "disabled", s.until));
+        rest.sort_by_key(|s| (s.state == "disabled", s.state == "signin", s.until));
         steps.extend(rest);
         steps
     }
@@ -1874,6 +2283,15 @@ struct AccountCooldowns {
     quota: BTreeMap<String, DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     credit: Option<DateTime<Utc>>,
+    /// Which `rate` entries rate limits set, so they stay waits a client may be told.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    limits: BTreeMap<String, DateTime<Utc>>,
+    /// A refusal pausing the whole account, given to requests again until it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<Refusal>,
+    /// A refresh token refused for good, kept until a sign-in replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hold: Option<SavedHold>,
 }
 
 impl Cooldowns {
@@ -1896,12 +2314,21 @@ impl Pool {
         let mut out = BTreeMap::new();
         for a in self.accounts.read().iter() {
             let st = a.state.lock();
-            let entry = AccountCooldowns {
-                rate: live(&st.cooldowns),
-                quota: live(&st.quota_cooldowns),
-                credit: st.credit_until.filter(|t| *t > now),
+            let rate = live(&st.cooldowns);
+            let limits = st
+                .limit_pauses
+                .iter()
+                .filter(|(k, t)| rate.get(*k) == Some(*t))
+                .map(|(k, t)| (k.clone(), *t))
+                .collect();
+            let refusal = st.live_refusal(now).cloned();
+            let hold = match (&st.refresh_hold, &*a.cred.read()) {
+                (Some(hold), Credential::OAuth(o)) if hold.applies(o) => Some(hold.saved()),
+                _ => None,
             };
-            if !entry.rate.is_empty() || !entry.quota.is_empty() || entry.credit.is_some() {
+            let credit = st.credit_until.filter(|t| *t > now);
+            let entry = AccountCooldowns { rate, quota: live(&st.quota_cooldowns), credit, limits, refusal, hold };
+            if !entry.rate.is_empty() || !entry.quota.is_empty() || entry.credit.is_some() || entry.hold.is_some() {
                 out.insert(a.id.clone(), entry);
             }
         }
@@ -1961,6 +2388,31 @@ impl Pool {
                 if let Some(t) = c.credit.filter(|t| *t > now) {
                     st.credit_until = Some(st.credit_until.map_or(t, |have| have.max(t)));
                 }
+                // Their kinds, while the merged deadline is still theirs.
+                for (model, until) in &c.limits {
+                    if *until > now && st.cooldowns.get(model) == Some(until) {
+                        st.limit_pauses.insert(model.clone(), *until);
+                    }
+                }
+                // A sign-in since then brought another refresh token, which lifts it.
+                let restored = match (&c.hold, &*a.cred.read()) {
+                    (Some(saved), Credential::OAuth(o)) => RefreshHold::restored(saved, o),
+                    _ => None,
+                };
+                if let Some(mut hold) = restored
+                    && st.refresh_hold.is_none()
+                {
+                    st.set_error(hold.error_text());
+                    hold.error_id = st.last_error_id(now).map(String::from);
+                    st.refresh_hold = Some(hold);
+                }
+                if let Some(r) = c.refusal.as_ref().filter(|r| r.until > now && st.cooldowns.get("*") == Some(&r.until))
+                {
+                    if st.last_error.is_none() {
+                        st.pause_error(&r.reason, false, "*", r.until);
+                    }
+                    st.refusal = Some(r.clone());
+                }
             }
         }
     }
@@ -1971,7 +2423,7 @@ impl Pool {
 pub struct RouteStep {
     pub account: String,
     pub upstream: String,
-    /// "ready", "cooling" or "disabled".
+    /// "ready", "cooling", "signin" (held out until a sign-in) or "disabled".
     pub state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until: Option<DateTime<Utc>>,
@@ -2059,6 +2511,147 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn reload_during_account_file_edit(removed: bool) {
+        let directory = AuthDirectory::new();
+        directory.write("owner", "access", None);
+        let sentinel = directory.0.join("a-sentinel.json");
+        std::fs::write(&sentinel, r#"{"type":"codex","access_token":"sentinel"}"#).unwrap();
+        let cfg = Config { auth_dir: directory.0.to_string_lossy().into(), ..Default::default() };
+        let pool = Arc::new(Pool::default());
+        pool.reload(&cfg);
+        let original = pool.get("file:same-filename.json").unwrap();
+        let first = pool.get("file:a-sentinel.json").unwrap();
+        let pending = original.pending_oauth_save.lock();
+        set_file_disabled(&sentinel, true).unwrap();
+        let reloading = std::thread::spawn({
+            let pool = pool.clone();
+            move || pool.reload(&cfg)
+        });
+        // Applying the first account proves collection has finished. The reload
+        // then waits for this account's file writer before publishing its snapshot.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !first.state.lock().disabled && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let collected = first.state.lock().disabled;
+        let path = original.path.as_ref().unwrap();
+        if removed {
+            std::fs::remove_file(path).unwrap();
+            let mut state = original.state.lock();
+            state.disabled = true;
+            state.update_identity(String::new());
+        } else {
+            set_file_disabled(path, true).unwrap();
+            original.state.lock().disabled = true;
+        }
+        drop(pending);
+        reloading.join().unwrap();
+        assert!(collected, "reload must have collected the old file before its edit");
+        if removed {
+            assert!(pool.get(&original.id).is_none(), "a collected file that was deleted must not return");
+            let Credential::OAuth(credential) = original.cred.read().clone() else { unreachable!() };
+            assert!(!crate::oauth::publish_refreshed(&original, credential, vec![]));
+            assert!(!path.exists(), "a delayed reload must not revalidate the removed allocation");
+        } else {
+            assert!(pool.get(&original.id).unwrap().state.lock().disabled, "reload must keep the newer switch setting");
+        }
+    }
+
+    #[test]
+    fn a_delayed_reload_does_not_restore_a_deleted_account() {
+        reload_during_account_file_edit(true);
+    }
+
+    /// The auth path replaced by a regular file: listing it fails with ENOTDIR, which
+    /// says nothing about the accounts' files. Only an empty or missing directory does.
+    #[test]
+    fn an_unreadable_auth_directory_keeps_its_accounts_until_they_are_removed() {
+        let directory = AuthDirectory::new();
+        directory.write("owner", "access", None);
+        std::fs::write(directory.0.join("codex.json"), r#"{"type":"codex","access_token":"FAKE_CODEX"}"#).unwrap();
+        let cfg = Config {
+            auth_dir: directory.0.to_string_lossy().into(),
+            claude_api_key: vec![crate::config::KeyEntry { api_key: "FAKE_KEY".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = Pool::default();
+        pool.reload(&cfg);
+        let ids = |pool: &Pool| pool.all().iter().map(|a| a.id.clone()).collect::<BTreeSet<_>>();
+        let before = ids(&pool);
+        assert_eq!(before.len(), 3);
+        let claude = pool.get("file:same-filename.json").unwrap();
+        claude.rate_limit("claude-opus-5-5", Utc::now() + chrono::Duration::hours(1), "429: limited");
+        let moved = directory.0.with_extension("moved");
+        std::fs::rename(&directory.0, &moved).unwrap();
+        std::fs::write(&directory.0, "not a directory").unwrap();
+        pool.reload(&cfg);
+        assert_eq!(ids(&pool), before);
+        assert!(Arc::ptr_eq(&claude, &pool.get(&claude.id).unwrap()), "same account, sessions and state");
+        assert!(claude.cooling_until("claude-opus-5-5").is_some());
+        assert!(pool.cooldowns().0.contains_key(&claude.id), "saved cooldowns keep it too");
+        std::fs::remove_file(&directory.0).unwrap();
+        std::fs::rename(&moved, &directory.0).unwrap();
+        pool.reload(&cfg);
+        assert_eq!(ids(&pool), before);
+        assert!(claude.cooling_until("claude-opus-5-5").is_some());
+        // `rm *.json`: an empty directory has no file accounts.
+        for name in ["same-filename.json", "codex.json"] {
+            std::fs::remove_file(directory.0.join(name)).unwrap();
+        }
+        pool.reload(&cfg);
+        assert_eq!(pool.all().iter().filter(|a| a.path.is_some()).count(), 0);
+        assert_eq!(pool.all().len(), 1, "the configured key stays");
+        // `rm -rf`: neither has a missing one.
+        directory.write("owner", "access", None);
+        pool.reload(&cfg);
+        assert_eq!(pool.all().len(), 2);
+        std::fs::remove_dir_all(&directory.0).unwrap();
+        pool.reload(&cfg);
+        assert_eq!(pool.all().iter().filter(|a| a.path.is_some()).count(), 0);
+    }
+
+    /// Collection read the file; then the directory became unreadable. `exists()` is
+    /// false then, but the file was not deleted.
+    #[test]
+    fn a_reload_keeps_an_account_whose_directory_turns_unreadable_meanwhile() {
+        let directory = AuthDirectory::new();
+        directory.write("owner", "access", None);
+        let sentinel = directory.0.join("a-sentinel.json");
+        std::fs::write(&sentinel, r#"{"type":"codex","access_token":"sentinel"}"#).unwrap();
+        let cfg = Config { auth_dir: directory.0.to_string_lossy().into(), ..Default::default() };
+        let pool = Arc::new(Pool::default());
+        pool.reload(&cfg);
+        let original = pool.get("file:same-filename.json").unwrap();
+        let first = pool.get("file:a-sentinel.json").unwrap();
+        let pending = original.pending_oauth_save.lock();
+        set_file_disabled(&sentinel, true).unwrap();
+        let reloading = std::thread::spawn({
+            let pool = pool.clone();
+            move || pool.reload(&cfg)
+        });
+        // As in `reload_during_account_file_edit`: the reload has collected both files
+        // and now waits for this account's writer.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !first.state.lock().disabled && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(first.state.lock().disabled);
+        let moved = directory.0.with_extension("moved");
+        std::fs::rename(&directory.0, &moved).unwrap();
+        std::fs::write(&directory.0, "not a directory").unwrap();
+        drop(pending);
+        reloading.join().unwrap();
+        let kept = pool.get(&original.id).is_some();
+        std::fs::remove_file(&directory.0).unwrap();
+        std::fs::rename(&moved, &directory.0).unwrap();
+        assert!(kept, "only NotFound means the file was deleted");
+    }
+
+    #[test]
+    fn a_delayed_reload_does_not_undo_a_file_account_switch() {
+        reload_during_account_file_edit(false);
     }
 
     #[test]
@@ -2697,6 +3290,73 @@ oauth-model-alias:
     }
 
     #[test]
+    fn wildcard_boundaries_preserve_ascii_case_and_unicode() {
+        for (pattern, value, expected) in [
+            ("", "", true),
+            ("  ", "", true),
+            ("*", "", true),
+            ("***", "anything", true),
+            ("abc*", "ab", false),
+            ("*abc", "bc", false),
+            ("a*b", "ab", true),
+            ("a*a", "a", false),
+            ("a**B*", "aB", true),
+            ("*ab*ab", "ab", false),
+            ("*ab*ab", "abab", true),
+            ("  GPT-*SOL  ", "gpt-6.1-sol", true),
+            ("gpt-*", " gpt-sol", false),
+            ("*é*B", "AéB", true),
+            ("*É*", "aéb", false),
+            ("*🦀b", "a🦀B", true),
+        ] {
+            assert_eq!(wildcard(pattern, value), expected, "{pattern:?} vs {value:?}");
+        }
+    }
+
+    #[test]
+    fn wildcard_matches_reference_for_small_patterns() {
+        fn reference(pattern: &str, value: &str) -> bool {
+            let (pattern, value) = (pattern.trim().to_ascii_lowercase(), value.to_ascii_lowercase());
+            let parts: Vec<_> = pattern.split('*').collect();
+            if parts.len() == 1 {
+                return pattern == value;
+            }
+            let mut rest = value.as_str();
+            for (i, part) in parts.iter().enumerate() {
+                if part.is_empty() {
+                    continue;
+                }
+                if i == 0 {
+                    let Some(next) = rest.strip_prefix(part) else { return false };
+                    rest = next;
+                } else if i + 1 == parts.len() {
+                    return rest.ends_with(part);
+                } else {
+                    let Some(at) = rest.find(part) else { return false };
+                    rest = &rest[at + part.len()..];
+                }
+            }
+            true
+        }
+        fn words(depth: usize) -> Vec<String> {
+            let mut result = vec![String::new()];
+            let mut level = vec![String::new()];
+            for _ in 0..depth {
+                level =
+                    level.iter().flat_map(|prefix| ["a", "B", "é", "*", " "].map(|c| format!("{prefix}{c}"))).collect();
+                result.extend(level.iter().cloned());
+            }
+            result
+        }
+        let values = words(3);
+        for pattern in words(4) {
+            for value in &values {
+                assert_eq!(wildcard(&pattern, value), reference(&pattern, value), "{pattern:?} vs {value:?}");
+            }
+        }
+    }
+
+    #[test]
     fn prefixes_exclusions_and_aliases() {
         assert!(wildcard("gemini-2.5-*", "gemini-2.5-pro"));
         assert!(wildcard("*-preview", "gemini-3-pro-preview"));
@@ -2754,6 +3414,7 @@ claude-api-key:
             excluded: vec![],
             aliases,
             priority: 0,
+            billing: None,
         };
         let renamed = acct(vec![a(false)]);
         assert_eq!(renamed.resolve("opus").as_deref(), Some("claude-opus-5-5"));

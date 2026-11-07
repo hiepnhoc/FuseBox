@@ -1,20 +1,28 @@
-//! Subscription quota: how much of each usage window (Claude's 5-hour and
-//! weekly limits, ChatGPT's Codex windows) an account has used. Read from
-//! response headers on every request and from the providers' usage endpoints
-//! in the background, so routing can prefer the account with most headroom.
+//! Subscription quota: how much of each usage window (Claude's, ChatGPT's and
+//! Meta's 5-hour and weekly limits) an account has used. Read from response
+//! headers and stream frames on every request, and from the providers' usage
+//! endpoints — or, for Meta, a key mint — in the background, so routing can
+//! prefer the account with most headroom.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::accounts::{Account, Credential, Provider};
 use crate::state::App;
 
 mod readings;
+mod renewal;
+mod saved;
+
+pub use renewal::{Billing, Next as NextRenewal, Period as BillingPeriod, Renewal};
+
+pub use readings::{FiveHour, claude_five_hour};
+pub use saved::{FILE as SAVED_FILE, Saved};
 
 const CLAUDE_USAGE: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -30,8 +38,12 @@ const RESET_POLL_EVERY: i64 = 30 * 60;
 /// Subscription plans change only with an upgrade or a downgrade.
 const PLAN_EVERY: i64 = 6 * 3600;
 const POLL_CONCURRENCY: usize = 4;
+/// After a usage endpoint answers 429, every caller of it waits at least this long, or
+/// what its Retry-After asks for, up to the longest wait.
+const USAGE_WAIT_MIN: i64 = 60;
+const USAGE_WAIT_MAX: i64 = 30 * 60;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Window {
     /// "5h", "week", ...
     pub name: String,
@@ -94,6 +106,14 @@ struct Reading {
     windows: Vec<Window>,
     limits: Vec<Limit>,
     plan: Option<String>,
+    /// The plan's display name when the reading itself carries one (Claude profiles).
+    plan_name: Option<String>,
+    /// Meta's opaque subscription tier id, from a mint or a stream frame.
+    tier: Option<String>,
+    /// Whether Meta's mint says the subscription is active.
+    subscription_active: Option<bool>,
+    /// The provider confirms the account has no 5-hour limit.
+    no_five_hour: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -107,9 +127,21 @@ pub struct Quota {
     pub refreshed_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// The plan's name as the provider shows it ("Ultra"); `plan` keeps the stable identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_name: Option<String>,
+    /// The provider confirmed this account has no 5-hour limit (verified Claude Ultra,
+    /// ChatGPT Pro).
+    /// Any later reading that carries a 5-hour window clears it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_five_hour_limit: bool,
     /// The active ChatGPT subscription SKU; `plan` alone does not distinguish Pro tiers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_plan: Option<String>,
+    /// When a ChatGPT subscription next charges, or ends when cancelled. Claude gives no
+    /// date (see `renewal`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal: Option<Renewal>,
     /// Usage-endpoint checks in a row that brought no data, and when the last one ran.
     #[serde(skip)]
     pub(crate) check_failures: u32,
@@ -120,12 +152,82 @@ pub struct Quota {
     pub(crate) plan_failures: u32,
     #[serde(skip)]
     pub(crate) plan_checked_at: Option<DateTime<Utc>>,
+    /// Usage reads the provider refused with 401/403 in a row (with a freshly
+    /// refreshed token), since when, and the latest status. A sustained run means the
+    /// account is likely suspended while its sign-in still refreshes fine.
+    #[serde(skip)]
+    pub(crate) refused_checks: u32,
+    #[serde(skip)]
+    pub(crate) refused_since: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub(crate) refused_status: Option<u16>,
+    /// The usage endpoint answered 429: the quota poll, banked resets and the window
+    /// starter all leave it alone until then, so their retries don't keep it limited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_wait_until: Option<DateTime<Utc>>,
+    /// The Meta tier id the last mint or stream frame named. It is an opaque number,
+    /// so it only tells whether the tier name saved at sign-in still applies.
+    #[serde(skip)]
+    pub meta_tier: Option<String>,
+    /// Meta's mint said the subscription is not active (lapsed or cancelled): the
+    /// windows shown are the last ones reported and no new ones come until it renews.
+    /// Only a mint sets or clears it; stream frames kept coming while it was lapsed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub subscription_inactive: bool,
+}
+
+/// A usage-endpoint call skipped because the provider asked to wait.
+#[derive(Debug)]
+pub struct UsageWait(pub DateTime<Utc>);
+
+impl std::fmt::Display for UsageWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Provider usage is rate limited (HTTP 429); next check after {} UTC", self.0.format("%H:%M"))
+    }
+}
+
+impl std::error::Error for UsageWait {}
+
+/// Seconds a response's Retry-After asks for, as delta seconds or an HTTP date.
+fn retry_after_seconds(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) -> Option<i64> {
+    let v = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    v.parse::<i64>()
+        .ok()
+        .or_else(|| DateTime::parse_from_rfc2822(v).ok().map(|at| (at.with_timezone(&Utc) - now).num_seconds()))
+}
+
+/// Fails without a request while the account's usage endpoint asked to wait.
+pub(crate) fn usage_gate(acct: &Account) -> anyhow::Result<()> {
+    match acct.state.lock().quota.usage_wait(Utc::now()) {
+        Some(until) => Err(UsageWait(until).into()),
+        None => Ok(()),
+    }
+}
+
+/// Notes a usage-endpoint answer: a 429 makes every caller wait.
+pub(crate) fn usage_answered(acct: &Account, status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let now = Utc::now();
+        let until = acct.state.lock().quota.usage_limited(now, retry_after_seconds(headers, now));
+        tracing::info!(account = %acct.label, until = %until, "usage endpoint rate limited; waiting");
+    }
+}
+
+/// Whether two plan identifiers name the same plan: Claude's Ultra may one day be
+/// `ultra` rather than its `max_20x` tier, and that is no change of plan.
+pub fn same_plan(a: &str, b: &str) -> bool {
+    fn canonical(p: &str) -> &str {
+        if p == "ultra" { "max_20x" } else { p }
+    }
+    canonical(a) == canonical(b)
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum PlanDetails {
-    Claude(Option<String>),
-    Codex(Option<String>),
+    /// The plan identifier and the provider's display name.
+    Claude(Option<String>, Option<String>),
+    /// The subscription SKU and the renewal.
+    Codex(Option<String>, Option<Renewal>),
 }
 
 impl Quota {
@@ -143,6 +245,14 @@ impl Quota {
             .iter()
             .filter(move |w| w.model.as_ref().is_none_or(|m| model.contains(m.as_str())))
             .filter(move |w| w.resets_at.is_none_or(|r| r > now))
+    }
+
+    /// On Claude Ultra (formerly Max 20x) by its plan, or already confirmed to have no
+    /// 5-hour limit: either way a bare null may mean there is no window, not an idle one.
+    pub fn may_lack_five_hour(&self) -> bool {
+        self.no_five_hour_limit
+            || matches!(self.plan.as_deref(), Some("max_20x" | "ultra"))
+            || self.plan_name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case("ultra"))
     }
 
     /// Use of the tightest window that applies to `model` (None = no data).
@@ -198,8 +308,24 @@ impl Quota {
         Some(100.0 - used.clamp(0.0, 100.0))
     }
 
+    /// When the usage endpoint's 429 wait ends, if it hasn't yet.
+    pub fn usage_wait(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.usage_wait_until.filter(|t| *t > now)
+    }
+
+    /// A 429 from the usage endpoint; returns when callers may ask again.
+    pub(crate) fn usage_limited(&mut self, now: DateTime<Utc>, retry_after: Option<i64>) -> DateTime<Utc> {
+        let until = now + chrono::Duration::seconds(retry_after.unwrap_or(0).clamp(USAGE_WAIT_MIN, USAGE_WAIT_MAX));
+        let until = self.usage_wait(now).map_or(until, |t| t.max(until));
+        self.usage_wait_until = Some(until);
+        until
+    }
+
     /// `pauses`: when the account's quota pauses end.
     fn needs_refresh(&self, now: DateTime<Utc>, pauses: impl IntoIterator<Item = DateTime<Utc>>) -> bool {
+        if self.usage_wait(now).is_some() {
+            return false;
+        }
         // A check that brought no data waits 2, 4, 8 ... up to 30 minutes before the next.
         if self.check_failures > 0
             && let Some(at) = self.checked_at
@@ -228,6 +354,30 @@ impl Quota {
     fn checked(&mut self, now: DateTime<Utc>, refreshed: bool) {
         self.checked_at = Some(now);
         self.check_failures = if refreshed { 0 } else { self.check_failures.saturating_add(1) };
+        if refreshed {
+            self.refused_checks = 0;
+            self.refused_since = None;
+            self.refused_status = None;
+        }
+    }
+
+    /// A usage read the provider refused with 401/403 after a successful
+    /// refresh. Other failures (429, 5xx, timeouts) neither count nor clear:
+    /// they only mark the reading stale.
+    pub(crate) fn usage_refused(&mut self, now: DateTime<Utc>, status: u16) {
+        if self.refused_checks == 0 {
+            self.refused_since = Some(now);
+        }
+        self.refused_checks = self.refused_checks.saturating_add(1);
+        self.refused_status = Some(status);
+    }
+
+    /// The sustained refusal worth a fault: at least three refused reads
+    /// spanning at least half an hour. Returns (status, since).
+    pub fn refusal_fault(&self, now: DateTime<Utc>) -> Option<(u16, DateTime<Utc>)> {
+        let since = self.refused_since?;
+        (self.refused_checks >= 3 && now - since >= chrono::Duration::minutes(30))
+            .then(|| (self.refused_status.unwrap_or(403), since))
     }
 
     /// The plan is read every 6 hours; after a failed read, again after 5, 10, 20 ...
@@ -246,10 +396,16 @@ impl Quota {
         match details {
             Some(details) => {
                 match details {
-                    PlanDetails::Claude(plan) => self.plan = plan,
+                    PlanDetails::Claude(plan, name) => {
+                        self.plan = plan;
+                        self.plan_name = name;
+                    }
                     // Usage remains the source of the broad Codex plan. The web
                     // subscription API can use different names for the same tier.
-                    PlanDetails::Codex(plan) => self.subscription_plan = plan,
+                    PlanDetails::Codex(plan, renewal) => {
+                        self.subscription_plan = plan;
+                        self.renewal = renewal;
+                    }
                 }
                 self.plan_failures = 0;
             }
@@ -273,9 +429,11 @@ impl Quota {
 
     pub(crate) fn set(&mut self, windows: Vec<Window>, plan: Option<String>) {
         if plan.is_some() {
-            if self.plan.is_some() && self.plan != plan {
+            if self.plan.as_deref().zip(plan.as_deref()).is_some_and(|(old, new)| !same_plan(old, new)) {
                 // A usage response can reveal a downgrade before the next plan check.
                 self.subscription_plan = None;
+                self.plan_name = None;
+                self.renewal = None;
                 self.plan_checked_at = None;
                 self.plan_failures = 0;
             }
@@ -283,6 +441,9 @@ impl Quota {
         }
         if windows.is_empty() {
             return;
+        }
+        if windows.iter().any(|w| w.name == "5h" && w.model.is_none()) {
+            self.no_five_hour_limit = false;
         }
         // Observations can omit any window. Only replace the same window and model scope;
         // missing data must not erase exhaustion or renewal dates learned earlier.
@@ -398,27 +559,55 @@ fn codex_windows(v: &Value) -> Vec<Window> {
     readings::codex(v).windows
 }
 
+/// Meta has no usage endpoint. Its key mint is free, hands back the account's
+/// same key, and may carry the subscription snapshot; stream frames are the
+/// reliable source. A mint without one counts as a check that brought no data,
+/// so idle polling backs off to every 30 minutes.
+async fn poll_meta(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
+    if !matches!(&*acct.cred.read(), Credential::OAuth(o) if o.field("dca_token").is_some()) {
+        return Ok(());
+    }
+    // No epoch is captured before the mint: publishing the rotated key may bump
+    // it (a changed base URL is a changed identity), and the reading belongs to
+    // the credential just published either way.
+    let minted = crate::oauth::meta_mint_refresh(app, acct).await?;
+    let mut st = acct.state.lock();
+    if !st.quota_refreshing {
+        st.quota_epoch += 1;
+        apply_reading(&mut st, readings::meta(&minted));
+    }
+    Ok(())
+}
+
 /// Asks the provider's usage endpoint (free, no tokens) for current quota.
 pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
+    if acct.provider == Provider::Meta {
+        return poll_meta(app, acct).await;
+    }
     let epoch = acct.quota_epoch();
     let (token, account_id) = match &*acct.cred.read() {
         Credential::OAuth(o) if o.base_url.is_none() => (o.access_token.clone(), o.account_id.clone()),
         _ => return Ok(()),
     };
     let http = app.http.control_for_account(acct);
+    if matches!(acct.provider, Provider::Claude | Provider::Codex) {
+        usage_gate(acct)?;
+    }
+    let answered = |resp: reqwest::Response| {
+        usage_answered(acct, resp.status(), resp.headers());
+        resp.error_for_status()
+    };
     let reading = match acct.provider {
         Provider::Claude => {
-            let v: Value = http
+            let resp = http
                 .get(CLAUDE_USAGE)
                 .bearer_auth(&token)
                 .header("anthropic-beta", "oauth-2025-04-20")
                 .header("user-agent", crate::clients::claude_user_agent())
                 .timeout(Duration::from_secs(15))
                 .send()
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            let v: Value = answered(resp)?.json().await?;
             readings::claude(&v)
         }
         Provider::Codex => {
@@ -431,7 +620,7 @@ pub async fn poll(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
             if let Some(id) = &account_id {
                 rb = rb.header("chatgpt-account-id", id);
             }
-            let v: Value = rb.send().await?.error_for_status()?.json().await?;
+            let v: Value = answered(rb.send().await?)?.json().await?;
             readings::codex(&v)
         }
         Provider::Antigravity => {
@@ -479,7 +668,7 @@ fn codex_plan(value: &Value) -> anyhow::Result<PlanDetails> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
-    Ok(PlanDetails::Codex(subscription_plan))
+    Ok(PlanDetails::Codex(subscription_plan, Renewal::from_codex(value)))
 }
 
 /// Reads Claude plan names and ChatGPT subscription SKUs without using model tokens.
@@ -494,9 +683,9 @@ pub async fn poll_plan(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
     };
     let http = app.http.control_for_account(acct);
     let details = match acct.provider {
-        Provider::Claude => crate::oauth::claude_profile(&http, &token)
-            .await
-            .map(|profile| PlanDetails::Claude(crate::oauth::claude_plan(&profile))),
+        Provider::Claude => crate::oauth::claude_profile(&http, &token).await.map(|profile| {
+            PlanDetails::Claude(crate::oauth::claude_plan(&profile), crate::oauth::claude_plan_name(&profile))
+        }),
         Provider::Codex => {
             async {
                 let Some(id) = account_id.as_deref().filter(|id| !id.is_empty()) else {
@@ -526,7 +715,7 @@ pub async fn poll_plan(app: &App, acct: &Arc<Account>) -> anyhow::Result<()> {
     if st.quota_epoch == epoch {
         let before = (st.quota.plan.clone(), st.quota.subscription_plan.clone());
         st.quota.plan_read(Utc::now(), details.as_ref().ok().cloned());
-        if before.0.as_ref().zip(st.quota.plan.as_ref()).is_some_and(|(old, new)| old != new)
+        if before.0.as_ref().zip(st.quota.plan.as_ref()).is_some_and(|(old, new)| !same_plan(old, new))
             || before.1.as_ref().zip(st.quota.subscription_plan.as_ref()).is_some_and(|(old, new)| old != new)
         {
             st.attribution.history.clear();
@@ -543,9 +732,20 @@ pub fn authoritative(st: &mut crate::accounts::AccountState, windows: Vec<Window
 }
 
 fn apply_reading(st: &mut crate::accounts::AccountState, reading: Reading) {
-    let Reading { windows, limits, plan } = reading;
+    let Reading { windows, limits, plan, plan_name, tier, subscription_active, no_five_hour } = reading;
+    if tier.is_some() {
+        st.quota.meta_tier = tier;
+    }
+    if let Some(active) = subscription_active {
+        st.quota.subscription_inactive = !active;
+    }
+    // Only a provider-confirmed absence retires a retained 5-hour window; an omitted one stays.
+    let retired = |w: &Window| no_five_hour && w.name == "5h" && w.model.is_none();
     if windows.is_empty() && limits.is_empty() {
         st.quota.set(windows, plan);
+        if plan_name.is_some() {
+            st.quota.plan_name = plan_name;
+        }
         return;
     }
     let covered: Vec<String> = st
@@ -557,7 +757,7 @@ fn apply_reading(st: &mut crate::accounts::AccountState, reading: Reading) {
                 .windows
                 .iter()
                 .filter(|old| old.model.as_ref().is_none_or(|m| model.contains(m)))
-                .all(|old| windows.iter().any(|new| new.name == old.name && new.model == old.model))
+                .all(|old| retired(old) || windows.iter().any(|new| new.name == old.name && new.model == old.model))
                 && st
                     .quota
                     .limits
@@ -568,6 +768,15 @@ fn apply_reading(st: &mut crate::accounts::AccountState, reading: Reading) {
         .cloned()
         .collect();
     st.set_quota(windows, plan);
+    // After `set`, so a plan change (which clears the old name) still ends named.
+    if plan_name.is_some() {
+        st.quota.plan_name = plan_name;
+    }
+    if no_five_hour {
+        st.quota.windows.retain(|w| !retired(w));
+        st.quota.no_five_hour_limit = true;
+        st.attribution.retire("5h");
+    }
     // An omitted scope cannot erase a spending cap learned on an earlier read.
     for limit in limits {
         st.quota.limits.retain(|old| old.id != limit.id || old.scope != limit.scope);
@@ -586,7 +795,7 @@ fn apply_reading(st: &mut crate::accounts::AccountState, reading: Reading) {
 /// reading also carries the credits as absolute amounts, for display.
 fn kiro_reading(value: &Value) -> Reading {
     let (windows, plan) = crate::kiro::windows(value);
-    Reading { windows, limits: crate::kiro::limits(value), plan }
+    Reading { windows, limits: crate::kiro::limits(value), plan, ..Default::default() }
 }
 
 pub fn usage(st: &mut crate::accounts::AccountState, provider: Provider, value: &Value) {
@@ -595,12 +804,34 @@ pub fn usage(st: &mut crate::accounts::AccountState, provider: Provider, value: 
         Provider::Codex => readings::codex(value),
         Provider::Antigravity => readings::antigravity(value),
         Provider::Kiro => kiro_reading(value),
+        Provider::Meta => readings::meta(value),
         _ => return,
     };
     apply_reading(st, reading);
 }
 
-/// Keeps quota and model lists fresh for signed-in Claude and ChatGPT accounts.
+/// Meta streams report subscription use as a `response.subscription_usage`
+/// frame: a partial observation like Claude's headers, so it updates the
+/// windows without claiming a usage-endpoint refresh.
+pub fn observe_meta_frame(acct: &Account, v: &Value) {
+    if v["type"] != "response.subscription_usage" {
+        return;
+    }
+    let reading = readings::meta(v);
+    let mut st = acct.state.lock();
+    if reading.tier.is_some() {
+        st.quota.meta_tier = reading.tier;
+    }
+    let windows = reading.windows;
+    if windows.is_empty() {
+        return;
+    }
+    if !st.quota_refreshing {
+        st.set_quota(windows, None);
+    }
+}
+
+/// Keeps quota and model lists fresh for signed-in Claude, ChatGPT and Meta accounts.
 pub async fn poller(app: Arc<App>) {
     tokio::time::sleep(Duration::from_secs(2)).await;
     loop {
@@ -656,20 +887,30 @@ async fn poll_account(app: &Arc<App>, acct: Arc<Account>) -> bool {
         }
         return changed | poll_usage(app, &acct).await;
     }
-    if !matches!(acct.provider, Provider::Claude | Provider::Codex | Provider::Antigravity) || !acct.is_oauth() {
+    if !matches!(acct.provider, Provider::Claude | Provider::Codex | Provider::Antigravity | Provider::Meta)
+        || !acct.is_oauth()
+    {
         return changed;
     }
-    let reset_stale = acct.provider != Provider::Antigravity && app.cfg().banked_resets && {
+    // Banked resets and separate plan reads are Claude/Codex features; Meta's
+    // tier comes with its mints and stream frames.
+    let reset_stale = matches!(acct.provider, Provider::Claude | Provider::Codex) && app.cfg().banked_resets && {
         let st = acct.state.lock();
         !st.disabled
-            && st.banked_resets.as_ref().is_none_or(|v| (Utc::now() - v.checked_at).num_seconds() >= RESET_POLL_EVERY)
+            && st.quota.usage_wait(Utc::now()).is_none()
+            && st.banked_resets.as_ref().is_none_or(|v| {
+                (Utc::now() - v.checked_at).num_seconds() >= RESET_POLL_EVERY
+                    || crate::banked_resets::expiry_passed(v, Utc::now())
+            })
     };
     if reset_stale {
         let _ = crate::banked_resets::refresh(app, &acct).await;
         changed = true;
     }
-    changed |= crate::banked_resets::automatic_check(app, &acct).await;
-    let plan_due = acct.provider != Provider::Antigravity
+    if matches!(acct.provider, Provider::Claude | Provider::Codex) {
+        changed |= crate::banked_resets::automatic_check(app, &acct).await;
+    }
+    let plan_due = matches!(acct.provider, Provider::Claude | Provider::Codex)
         && matches!(&*acct.cred.read(), Credential::OAuth(o) if o.base_url.is_none()
         && (acct.provider != Provider::Codex || o.account_id.as_ref().is_some_and(|id| !id.is_empty())))
         && {
@@ -700,11 +941,35 @@ async fn poll_usage(app: &Arc<App>, acct: &Arc<Account>) -> bool {
         return false;
     }
     let before = acct.state.lock().quota.refreshed_at;
-    let result = poll(app, acct).await;
+    let mut result = poll(app, acct).await;
+    // A refused read says little while the token may simply be stale: the token
+    // above was refreshed only if it was near expiry. So the first refusal of a
+    // run refreshes the token and reads again, and only a refused read with a
+    // freshly refreshed token counts. A failed refresh counts nothing; its own
+    // fault reports it.
+    let mut countable = true;
+    if refused(&result).is_some() && acct.state.lock().quota.refused_checks == 0 {
+        match crate::oauth::ensure_fresh(app, acct, chrono::Duration::minutes(5), true).await {
+            Ok(()) => result = poll(app, acct).await,
+            Err(e) => {
+                countable = false;
+                tracing::debug!(account = %acct.label, "refresh after a refused usage read failed: {e:#}");
+            }
+        }
+    }
     {
         let mut st = acct.state.lock();
         let refreshed = st.quota.refreshed_at.is_some() && st.quota.refreshed_at != before;
+        if countable && let Some(status) = refused(&result) {
+            st.quota.usage_refused(Utc::now(), status);
+        }
         st.quota.checked(Utc::now(), refreshed);
+        // An answered read ends a refusal run, even one with nothing to report.
+        if result.is_ok() {
+            st.quota.refused_checks = 0;
+            st.quota.refused_since = None;
+            st.quota.refused_status = None;
+        }
     }
     match result {
         Ok(()) => true,
@@ -715,10 +980,38 @@ async fn poll_usage(app: &Arc<App>, acct: &Arc<Account>) -> bool {
     }
 }
 
+/// The status of a usage read the provider refused with 401 or 403.
+fn refused(result: &anyhow::Result<()>) -> Option<u16> {
+    // Anywhere in the chain, so added context can't hide it.
+    let status = result.as_ref().err()?.chain().find_map(|e| e.downcast_ref::<reqwest::Error>())?.status()?.as_u16();
+    matches!(status, 401 | 403).then_some(status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_a_sustained_run_of_refused_usage_reads_is_a_fault() {
+        let now = Utc::now();
+        let mut q = Quota::default();
+        // One or two refusals, and a brief run, stay quiet.
+        q.usage_refused(now, 403);
+        q.usage_refused(now + chrono::Duration::minutes(20), 403);
+        assert_eq!(q.refusal_fault(now + chrono::Duration::hours(2)), None);
+        q.usage_refused(now + chrono::Duration::minutes(25), 401);
+        assert_eq!(q.refusal_fault(now + chrono::Duration::minutes(29)), None, "spans under half an hour stay quiet");
+        assert_eq!(
+            q.refusal_fault(now + chrono::Duration::minutes(31)),
+            Some((401, now)),
+            "three refusals over half an hour"
+        );
+        // The next good read clears the run.
+        q.checked(now + chrono::Duration::minutes(32), true);
+        assert_eq!(q.refusal_fault(now + chrono::Duration::hours(3)), None);
+        assert_eq!(q.refused_checks, 0);
+    }
 
     #[tokio::test]
     async fn quota_refreshes_are_bounded_and_a_stalled_account_does_not_stop_others() {
@@ -797,6 +1090,40 @@ mod tests {
     }
 
     #[test]
+    fn meta_stream_frames_update_windows_without_claiming_a_refresh() {
+        let cfg = crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            meta_api_key: vec![crate::config::KeyEntry { api_key: "a".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = &pool.all()[0];
+        assert_eq!(acct.provider, Provider::Meta);
+        observe_meta_frame(
+            acct,
+            &json!({"type": "response.subscription_usage", "subscription": {
+                "tier": "tier-9",
+                "weekly": { "resets_at": 4102444800i64, "used_percent": 1 },
+                "window": { "resets_at": 4102444800i64, "used_percent": 3, "window_duration_mins": 300 },
+            }}),
+        );
+        {
+            let st = acct.state.lock();
+            assert_eq!(st.quota.five_hour_remaining("muse-wonder-1.0"), Some(97.0));
+            assert_eq!(st.quota.weekly_remaining("muse-wonder-1.0"), Some(99.0));
+            assert!(st.quota.updated_at.is_some());
+            assert!(st.quota.refreshed_at.is_none(), "a frame is an observation, not a mint");
+            assert!(st.quota.needs_refresh(Utc::now(), []), "the first mint poll is still due");
+        }
+        // Other frames and payload-less usage frames change nothing.
+        observe_meta_frame(acct, &json!({"type": "response.created", "response": {"id": "r1"}}));
+        observe_meta_frame(acct, &json!({"type": "response.subscription_usage", "subscription": {}}));
+        let st = acct.state.lock();
+        assert_eq!(st.quota.five_hour_remaining("muse-wonder-1.0"), Some(97.0));
+    }
+
+    #[test]
     fn partial_observations_only_slow_the_usage_refresh() {
         let cfg = crate::config::Config {
             auth_dir: "/nonexistent".into(),
@@ -867,6 +1194,274 @@ mod tests {
         assert_eq!(st.last_error(Utc::now()), Some("500: upstream exploded"));
     }
 
+    /// Usage as a verified Ultra account reported it on 2026-10-31 (trimmed).
+    fn ultra_usage() -> Value {
+        json!({
+            "five_hour": null,
+            "seven_day": { "utilization": 58.0, "resets_at": "2099-11-02T13:00:00.176119+00:00" },
+            "iguana_necktie": null,
+            "limits": [
+                { "kind": "weekly_all", "group": "weekly", "percent": 58, "resets_at": "2099-11-02T13:00:00.176119+00:00",
+                  "scope": null, "is_active": true },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "2099-11-02T13:00:00+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null }, "is_active": false },
+            ],
+        })
+    }
+
+    #[test]
+    fn only_a_typed_list_without_a_session_proves_there_is_no_five_hour_limit() {
+        assert!(readings::claude_no_five_hour(&ultra_usage()));
+        let reading = readings::claude(&ultra_usage());
+        assert!(reading.no_five_hour);
+        assert!(reading.windows.iter().all(|w| w.name != "5h"));
+        assert!(reading.limits.iter().all(|l| !l.name.is_empty()), "account-wide entries make no nameless limits");
+        // An idle window on a plan that has one, as Max reported it the same night.
+        let mut idle = ultra_usage();
+        idle["limits"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "kind": "session", "group": "session", "percent": 0, "resets_at": null, "is_active": true }),
+        );
+        assert!(!readings::claude_no_five_hour(&idle));
+        let reading = readings::claude(&idle);
+        assert!(!reading.no_five_hour);
+        let five = reading.windows.iter().find(|w| w.name == "5h").expect("the session entry stands in");
+        assert_eq!((five.used, five.resets_at), (0.0, None));
+        assert_eq!(reading.windows.iter().filter(|w| w.name == "week").count(), 1, "seven_day wins over weekly_all");
+        // Without a typed list, a null is only an idle or unknown window.
+        for v in [
+            json!({ "five_hour": null, "seven_day": { "utilization": 1.0 } }),
+            json!({ "five_hour": null, "limits": [] }),
+            json!({ "limits": [{ "kind": "weekly_all", "percent": 1 }] }),
+            json!({ "five_hour": { "utilization": 3.0 }, "limits": [{ "kind": "weekly_all", "percent": 1 }] }),
+            // A malformed weekly entry proves nothing either, nor does a list with an entry
+            // it can't classify, or one that names a session in any way.
+            json!({ "five_hour": null, "limits": [{ "kind": "weekly_all" }] }),
+            json!({ "five_hour": null, "limits": [{ "kind": "weekly_all", "percent": 140 }] }),
+            json!({ "five_hour": null, "limits": [{ "kind": "weekly_all", "percent": 1 }, { "kind": null, "group": "session" }] }),
+            json!({ "five_hour": null, "limits": [{ "kind": "weekly_all", "percent": 1 }, { "kind": " " }] }),
+            json!({ "five_hour": null, "limits": [{ "kind": "weekly_all", "percent": 1 }, 5] }),
+            json!({ "five_hour": null, "limits": [{ "kind": "weekly_all", "percent": 1 }, { "kind": "x", "group": "session" }] }),
+        ] {
+            assert!(!readings::claude_no_five_hour(&v), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_session_entry_is_no_proof_of_absence() {
+        let mut st = crate::accounts::AccountState::default();
+        st.quota.plan = Some("max_20x".into());
+        let reset = Utc::now() + chrono::Duration::hours(2);
+        let week = json!({ "utilization": 20, "resets_at": Utc::now() + chrono::Duration::days(2) });
+        usage(
+            &mut st,
+            Provider::Claude,
+            &json!({ "five_hour": { "utilization": 100, "resets_at": reset }, "seven_day": week }),
+        );
+        usage(
+            &mut st,
+            Provider::Claude,
+            &json!({ "five_hour": null, "seven_day": week, "limits": [
+                { "kind": "weekly_all", "group": "weekly", "percent": 20, "resets_at": Utc::now() + chrono::Duration::days(2), "is_active": true },
+                { "kind": null, "group": "session", "percent": 100, "resets_at": reset, "is_active": true },
+            ] }),
+        );
+        assert!(!st.quota.no_five_hour_limit);
+        assert!(st.quota.exhausted("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn ultra_and_max_20x_are_the_same_plan() {
+        assert!(same_plan("ultra", "max_20x") && same_plan("max_20x", "ultra") && same_plan("pro", "pro"));
+        assert!(!same_plan("max_5x", "max_20x") && !same_plan("max", "ultra"));
+        let mut st = crate::accounts::AccountState::default();
+        let week = |used| Window {
+            name: "week".into(),
+            used,
+            resets_at: Some(Utc::now() + chrono::Duration::days(2)),
+            model: None,
+        };
+        st.set_quota(vec![week(10.0)], Some("max_20x".into()));
+        st.set_quota(vec![week(11.0)], Some("max_20x".into()));
+        st.quota.plan_name = Some("Ultra".into());
+        assert!(!st.attribution.history.is_empty());
+        st.set_quota(vec![week(12.0)], Some("ultra".into()));
+        assert!(!st.attribution.history.is_empty(), "a new identifier for the same plan keeps the history");
+        assert_eq!(st.quota.plan_name.as_deref(), Some("Ultra"));
+        st.set_quota(vec![week(13.0)], Some("max_5x".into()));
+        assert!(st.attribution.history.len() <= 1, "a real change of plan starts over");
+        assert_eq!(st.quota.plan_name, None);
+    }
+
+    #[test]
+    fn malformed_typed_limits_never_retire_a_spent_five_hour_window() {
+        let mut st = crate::accounts::AccountState::default();
+        let reset = Utc::now() + chrono::Duration::hours(2);
+        let week = json!({ "utilization": 20, "resets_at": Utc::now() + chrono::Duration::days(2) });
+        usage(
+            &mut st,
+            Provider::Claude,
+            &json!({ "five_hour": { "utilization": 100, "resets_at": reset }, "seven_day": week }),
+        );
+        usage(
+            &mut st,
+            Provider::Claude,
+            &json!({ "five_hour": null, "seven_day": week, "limits": [{ "kind": "weekly_all" }] }),
+        );
+        assert!(!st.quota.no_five_hour_limit);
+        assert!(st.quota.exhausted("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn a_confirmed_missing_five_hour_limit_retires_the_window_and_its_cooldown() {
+        let cfg = crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            claude_api_key: vec![crate::config::KeyEntry { api_key: "a".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = &pool.all()[0];
+        let model = "claude-sonnet-5-5";
+        let renews = Utc::now() + chrono::Duration::hours(2);
+        acct.exhaust(model, renews, "subscription quota exhausted: x");
+        let mut st = acct.state.lock();
+        usage(
+            &mut st,
+            Provider::Claude,
+            &json!({
+                "five_hour": { "utilization": 100.0, "resets_at": renews },
+                "seven_day": { "utilization": 50.0, "resets_at": "2099-11-02T13:00:00Z" },
+            }),
+        );
+        assert!(st.quota.exhausted(model) && !st.quota_cooldowns.is_empty());
+        // The 5-hour limit goes away: a weekly reading alone keeps it, the Ultra one retires it.
+        usage(&mut st, Provider::Claude, &json!({ "seven_day": { "utilization": 51.0 } }));
+        assert!(st.quota.exhausted(model), "an omitted window stays");
+        usage(&mut st, Provider::Claude, &ultra_usage());
+        assert!(st.quota.no_five_hour_limit);
+        assert!(st.quota.windows.iter().all(|w| w.name != "5h"));
+        assert_eq!(st.quota.five_hour_remaining(model), None);
+        assert!(!st.quota.exhausted(model));
+        assert!(st.quota_cooldowns.is_empty());
+        assert_eq!(st.last_error(Utc::now()), None);
+        assert!(st.attribution.current.iter().all(|s| s.name != "5h"));
+        assert!(st.attribution.previous.iter().any(|s| s.name == "5h"), "its last instance is kept as finished");
+        let shown = serde_json::to_value(&st.quota).unwrap();
+        assert_eq!(shown["no_five_hour_limit"], true);
+        // A spent week still blocks.
+        let mut spent = ultra_usage();
+        spent["seven_day"]["utilization"] = json!(100.0);
+        usage(&mut st, Provider::Claude, &spent);
+        assert!(st.quota.exhausted(model));
+        // A limit that comes back, from usage or from headers, is followed again.
+        drop(st);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("anthropic-ratelimit-unified-5h-utilization", "0.25".parse().unwrap());
+        observe(acct, &headers, acct.quota_epoch());
+        let st = acct.state.lock();
+        assert!(!st.quota.no_five_hour_limit);
+        assert_eq!(st.quota.five_hour_remaining(model), Some(75.0));
+    }
+
+    /// A ChatGPT Pro usage reading as production saw it on 31 October 2026: one weekly
+    /// window and an explicit null where plans with a 5-hour limit report it.
+    fn pro_usage() -> Value {
+        json!({
+            "plan_type": "pro",
+            "rate_limit": { "allowed": true, "limit_reached": false,
+                "primary_window": { "limit_window_seconds": 604800, "reset_after_seconds": 464551,
+                    "reset_at": 4102444800i64, "used_percent": 17 },
+                "secondary_window": null },
+            "code_review_rate_limit": null,
+            "additional_rate_limits": null,
+            "credits": { "balance": "61840.9086050000", "has_credits": true, "unlimited": false },
+        })
+    }
+
+    #[test]
+    fn only_a_complete_codex_reading_without_a_short_window_proves_there_is_no_five_hour_limit() {
+        assert!(readings::codex_no_five_hour(&pro_usage()));
+        let reading = readings::codex(&pro_usage());
+        assert!(reading.no_five_hour);
+        assert_eq!(reading.windows.len(), 1);
+        assert_eq!((reading.windows[0].name.as_str(), reading.windows[0].used), ("week", 17.0));
+        let window = |secs: i64, used: i64| json!({ "limit_window_seconds": secs, "used_percent": used });
+        let rate = |primary: Value, secondary: Value| {
+            json!({ "rate_limit": { "allowed": true,
+            "limit_reached": false, "primary_window": primary, "secondary_window": secondary } })
+        };
+        // Camel case and a week in the second slot count too.
+        assert!(readings::codex_no_five_hour(
+            &json!({ "rateLimit": { "primaryWindow": window(604800, 3), "secondaryWindow": null } })
+        ));
+        assert!(readings::codex_no_five_hour(&rate(Value::Null, window(604800, 3))));
+        for v in [
+            // Plus, used or idle: a 5-hour window of its own.
+            rate(window(18000, 40), window(604800, 3)),
+            rate(window(18000, 0), window(604800, 0)),
+            // Any window shorter than a day.
+            rate(window(43200, 0), Value::Null),
+            rate(window(604800, 3), window(3600, 0)),
+            // Incomplete or unclassifiable readings prove nothing.
+            json!({ "rate_limit": { "primary_window": window(604800, 3) } }),
+            rate(Value::Null, Value::Null),
+            rate(json!({ "used_percent": 3 }), Value::Null),
+            rate(json!({ "limit_window_seconds": "a week", "used_percent": 3 }), Value::Null),
+            rate(window(604800, 3), json!(5)),
+            json!({ "rate_limit": null }),
+            json!({ "plan_type": "pro" }),
+        ] {
+            assert!(!readings::codex_no_five_hour(&v), "{v}");
+            assert!(!readings::codex(&v).no_five_hour, "{v}");
+        }
+    }
+
+    #[test]
+    fn a_codex_account_without_a_five_hour_limit_retires_the_window_until_one_comes_back() {
+        let cfg = crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "a".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = &pool.all()[0];
+        assert_eq!(acct.provider, Provider::Codex);
+        let model = "gpt-6.1-sol";
+        let renews = Utc::now() + chrono::Duration::hours(2);
+        acct.exhaust(model, renews, "subscription quota exhausted: x");
+        let mut st = acct.state.lock();
+        let plus = json!({ "plan_type": "plus", "rate_limit": { "allowed": false, "limit_reached": true,
+            "primary_window": { "limit_window_seconds": 18000, "used_percent": 100, "reset_at": renews.timestamp() },
+            "secondary_window": { "limit_window_seconds": 604800, "used_percent": 40, "reset_at": 4102444800i64 } } });
+        usage(&mut st, Provider::Codex, &plus);
+        assert!(st.quota.exhausted(model) && !st.quota_cooldowns.is_empty());
+        assert!(!st.quota.no_five_hour_limit);
+        usage(&mut st, Provider::Codex, &pro_usage());
+        assert!(st.quota.no_five_hour_limit);
+        assert!(st.quota.windows.iter().all(|w| w.name != "5h"));
+        assert_eq!(st.quota.five_hour_remaining(model), None);
+        assert!(!st.quota.exhausted(model));
+        assert!(st.quota_cooldowns.is_empty());
+        assert_eq!(serde_json::to_value(&st.quota).unwrap()["no_five_hour_limit"], true);
+        // Headers with only the week keep the flag; a 5-hour window from headers clears it.
+        drop(st);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-codex-primary-window-minutes", "10080".parse().unwrap());
+        headers.insert("x-codex-primary-used-percent", "18".parse().unwrap());
+        observe(acct, &headers, acct.quota_epoch());
+        assert!(acct.state.lock().quota.no_five_hour_limit);
+        headers.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        headers.insert("x-codex-primary-used-percent", "25".parse().unwrap());
+        headers.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        headers.insert("x-codex-secondary-used-percent", "18".parse().unwrap());
+        observe(acct, &headers, acct.quota_epoch());
+        let st = acct.state.lock();
+        assert!(!st.quota.no_five_hour_limit);
+        assert_eq!(st.quota.five_hour_remaining(model), Some(75.0));
+    }
+
     #[test]
     fn a_renewed_window_or_an_ended_pause_is_read_at_the_next_round() {
         let now = Utc::now();
@@ -927,13 +1522,13 @@ mod tests {
         assert!(!q.plan_due(now + secs(PLAN_EVERY - 1)));
         assert!(q.plan_due(now + secs(PLAN_EVERY)));
         // A good read ends the backoff, and its plan replaces the last one, even with none.
-        q.plan_read(now, Some(PlanDetails::Claude(Some("max_20x".into()))));
-        assert_eq!((q.plan.as_deref(), q.plan_failures), (Some("max_20x"), 0));
+        q.plan_read(now, Some(PlanDetails::Claude(Some("max_20x".into()), Some("Ultra".into()))));
+        assert_eq!((q.plan.as_deref(), q.plan_name.as_deref(), q.plan_failures), (Some("max_20x"), Some("Ultra"), 0));
         assert!(!q.plan_due(now + secs(PLAN_EVERY - 1)));
         q.plan_read(now, None);
         assert_eq!(q.plan.as_deref(), Some("max_20x"), "a failed read keeps the plan");
-        q.plan_read(now, Some(PlanDetails::Claude(None)));
-        assert_eq!(q.plan, None);
+        q.plan_read(now, Some(PlanDetails::Claude(None, None)));
+        assert_eq!((q.plan.as_deref(), q.plan_name.as_deref()), (None, None));
         // Usage readings without a plan (Claude's) leave it alone.
         q.plan = Some("max_5x".into());
         q.set(vec![Window { name: "week".into(), used: 10.0, resets_at: None, model: None }], None);
@@ -941,6 +1536,10 @@ mod tests {
         let shown = serde_json::to_value(&q).unwrap();
         assert_eq!(shown["plan"], "max_5x");
         assert!(shown.get("plan_checked_at").is_none() && shown.get("plan_failures").is_none());
+        assert!(shown.get("plan_name").is_none() && shown.get("no_five_hour_limit").is_none());
+        q.plan_name = Some("Max".into());
+        q.set(vec![], Some("pro".into()));
+        assert_eq!((q.plan.as_deref(), q.plan_name), (Some("pro"), None), "a changed plan drops the old name");
     }
 
     #[test]
@@ -955,16 +1554,16 @@ mod tests {
                 },
                 "last_active_subscription": { "subscription_plan": "chatgptprolite" }
             });
-            assert_eq!(codex_plan(&value).unwrap(), PlanDetails::Codex(Some(sku.into())));
+            assert_eq!(codex_plan(&value).unwrap(), PlanDetails::Codex(Some(sku.into()), None));
             value["entitlement"]["has_active_subscription"] = false.into();
-            assert_eq!(codex_plan(&value).unwrap(), PlanDetails::Codex(None));
+            assert_eq!(codex_plan(&value).unwrap(), PlanDetails::Codex(None, None));
         }
         for value in [
             json!({ "plan_type": "free" }),
             json!({ "plan_type": "pro", "entitlement": { "subscription_plan": "chatgptpro" } }),
             json!({ "plan_type": "pro", "entitlement": { "has_active_subscription": true, "subscription_plan": " " } }),
         ] {
-            assert_eq!(codex_plan(&value).unwrap(), PlanDetails::Codex(None));
+            assert_eq!(codex_plan(&value).unwrap(), PlanDetails::Codex(None, None));
         }
         assert!(codex_plan(&json!({})).is_err());
         assert!(codex_plan(&json!({ "plan_type": " " })).is_err());
@@ -999,6 +1598,33 @@ mod tests {
         assert_eq!(q.subscription_plan, None);
         assert_eq!(q.windows, vec![window], "plan reads do not change quota windows");
         assert!(serde_json::to_value(&q).unwrap().get("subscription_plan").is_none());
+    }
+
+    #[test]
+    fn plan_reads_keep_the_renewal_until_a_good_read_or_a_plan_change() {
+        let now = Utc::now();
+        let soon = now + chrono::Duration::days(4);
+        let mut q = Quota::default();
+        let details = codex_plan(&json!({
+            "plan_type": "pro",
+            "entitlement": {
+                "has_active_subscription": true, "subscription_plan": "chatgptpro",
+                "renews_at": soon.to_rfc3339(), "billing_period": "monthly"
+            }
+        }))
+        .unwrap();
+        q.plan_read(now, Some(details));
+        let shown = serde_json::to_value(&q).unwrap()["renewal"].clone();
+        assert_eq!(DateTime::parse_from_rfc3339(shown["at"].as_str().unwrap()).unwrap(), soon);
+        assert_eq!((shown["estimated"].clone(), shown["ends"].clone()), (json!(false), json!(false)));
+        q.plan_read(now, None);
+        assert!(q.renewal.is_some(), "a failed read keeps the date");
+        q.set(vec![], Some("pro".into()));
+        q.set(vec![], Some("plus".into()));
+        assert_eq!(q.renewal, None, "a changed plan drops the date until the next read");
+        q.plan_read(now, Some(codex_plan(&json!({ "plan_type": "pro" })).unwrap()));
+        assert_eq!(q.renewal, None, "a good read without an active subscription clears it");
+        assert!(serde_json::to_value(&q).unwrap().get("renewal").is_none());
     }
 
     #[test]
@@ -1107,5 +1733,33 @@ mod tests {
         assert_eq!(q.pressure("claude-opus-5-5"), Some(100.0));
         assert_eq!(q.exhausted_until("claude-opus-5-5"), Some(future));
         assert_eq!(q.exhausted_until("claude-sonnet-5-5"), None);
+    }
+
+    #[test]
+    fn a_rate_limited_usage_endpoint_waits_for_its_retry_after_within_bounds() {
+        let now = Utc::now();
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_seconds(&headers, now), None);
+        headers.insert("retry-after", "318".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, now), Some(318));
+        let date = (now + chrono::Duration::seconds(600)).to_rfc2822();
+        headers.insert("retry-after", date.parse().unwrap());
+        assert!(retry_after_seconds(&headers, now).is_some_and(|s| (599..=600).contains(&s)));
+
+        let mut q = Quota { refreshed_at: Some(now - chrono::Duration::hours(1)), ..Default::default() };
+        assert!(q.needs_refresh(now, []));
+        let until = q.usage_limited(now, Some(318));
+        assert_eq!(until, now + chrono::Duration::seconds(318));
+        assert_eq!(q.usage_wait(now), Some(until));
+        assert!(!q.needs_refresh(now, []), "no poll while the provider asked to wait");
+        // A shorter answer does not cut a longer wait short; a missing one waits a minute.
+        assert_eq!(q.usage_limited(now, None), until);
+        assert_eq!(Quota::default().usage_limited(now, None), now + chrono::Duration::seconds(USAGE_WAIT_MIN));
+        assert_eq!(Quota::default().usage_limited(now, Some(86_400)), now + chrono::Duration::seconds(USAGE_WAIT_MAX));
+        let later = until + chrono::Duration::seconds(1);
+        assert_eq!(q.usage_wait(later), None);
+        assert!(q.needs_refresh(later, []));
+        assert_eq!(serde_json::to_value(&q).unwrap()["usage_wait_until"], serde_json::json!(until));
+        assert!(serde_json::to_value(Quota::default()).unwrap().get("usage_wait_until").is_none());
     }
 }

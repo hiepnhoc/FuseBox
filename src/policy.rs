@@ -4,7 +4,7 @@
 //! Request rates are counted here. Tokens and spend come from the usage database every
 //! 30 seconds, plus what finished since, so a burst can't run far past a limit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,49 @@ use crate::usage::{store::Store, types::Observation};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 const MAX_AGE: Duration = Duration::from_secs(90);
+
+/// Whole UTC hours come from transactionally maintained raw-observation totals.
+/// At fractional-hour local midnights, scan only the two short boundary fragments.
+/// The day fragment excludes the month fragment so a month's first day counts once.
+/// Naming the raw time index also avoids the historical source-index planner trap.
+const RECONCILE_TOTALS: &str = "WITH bounds AS (
+    SELECT (?1+3599999)/3600000*3600000 AS day_ceil,(?2+3599999)/3600000*3600000 AS month_ceil
+  ), fragments AS (
+    SELECT client_id,
+       CASE WHEN bucket_ms >= day_ceil THEN tokens ELSE 0 END AS tokens_today,
+       cost_nanos,
+       CASE WHEN bucket_ms >= day_ceil THEN unknown_tokens ELSE 0 END AS unknown_tokens,
+       unpriced
+    FROM usage_client_totals,bounds WHERE bucket_ms >= month_ceil
+    UNION ALL
+    SELECT client_id,
+       CASE WHEN event_at_ms >= ?1 THEN COALESCE(input,0)+COALESCE(cache_write,0)+COALESCE(output,0) ELSE 0 END,
+       COALESCE(cost_nanos,0),
+       CASE WHEN event_at_ms >= ?1 AND (input IS NULL OR cache_write IS NULL OR output IS NULL)
+           AND (COALESCE(input,0)+COALESCE(cache_read,0)+COALESCE(cache_write,0)+COALESCE(output,0)>0 OR json_extract(usage_document(payload),'$.status') < 400) THEN 1 ELSE 0 END,
+       CASE WHEN cost_nanos IS NULL AND (COALESCE(input,0)+COALESCE(cache_read,0)+COALESCE(cache_write,0)+COALESCE(output,0)>0 OR json_extract(usage_document(payload),'$.status') < 400) THEN 1 ELSE 0 END
+    FROM usage_observations INDEXED BY usage_event_time
+    WHERE source='proxy' AND client_id IS NOT NULL AND event_at_ms >= ?2 AND event_at_ms < (SELECT month_ceil FROM bounds)
+    UNION ALL
+    SELECT client_id,COALESCE(input,0)+COALESCE(cache_write,0)+COALESCE(output,0),0,
+       CASE WHEN (input IS NULL OR cache_write IS NULL OR output IS NULL)
+           AND (COALESCE(input,0)+COALESCE(cache_read,0)+COALESCE(cache_write,0)+COALESCE(output,0)>0 OR json_extract(usage_document(payload),'$.status') < 400) THEN 1 ELSE 0 END,
+       0
+    FROM usage_observations INDEXED BY usage_event_time
+    WHERE source='proxy' AND client_id IS NOT NULL
+       AND event_at_ms >= MAX(?1,(SELECT month_ceil FROM bounds)) AND event_at_ms < (SELECT day_ceil FROM bounds)
+  ) SELECT client_id,SUM(tokens_today),SUM(cost_nanos),SUM(unknown_tokens),SUM(unpriced) FROM fragments GROUP BY client_id";
+
+#[cfg(test)]
+const RAW_RECONCILE_TOTALS: &str = "SELECT client_id,
+       SUM(CASE WHEN event_at_ms >= ?1 THEN COALESCE(input,0)+COALESCE(cache_write,0)+COALESCE(output,0) ELSE 0 END),
+       SUM(COALESCE(cost_nanos,0)),
+       SUM(CASE WHEN event_at_ms >= ?1 AND (input IS NULL OR cache_write IS NULL OR output IS NULL)
+           AND (COALESCE(input,0)+COALESCE(cache_read,0)+COALESCE(cache_write,0)+COALESCE(output,0)>0 OR json_extract(usage_document(payload),'$.status') < 400) THEN 1 ELSE 0 END),
+       SUM(CASE WHEN cost_nanos IS NULL AND (COALESCE(input,0)+COALESCE(cache_read,0)+COALESCE(cache_write,0)+COALESCE(output,0)>0 OR json_extract(usage_document(payload),'$.status') < 400) THEN 1 ELSE 0 END)
+     FROM usage_observations INDEXED BY usage_event_time
+     WHERE source = 'proxy' AND client_id IS NOT NULL AND event_at_ms >= ?2
+     GROUP BY client_id";
 
 #[derive(Clone, Default)]
 pub struct Clients {
@@ -74,7 +117,10 @@ struct Pending {
 impl Spends {
     /// A period change requires a fresh database snapshot before budget admission.
     fn roll(&mut self) {
-        let today = Local::now().date_naive();
+        self.roll_at(Local::now().date_naive());
+    }
+
+    fn roll_at(&mut self, today: NaiveDate) {
         match self.day {
             Some(day) if day == today => {}
             Some(day) => {
@@ -143,6 +189,21 @@ pub fn address_allowed(client: &NamedClient, headers: &HeaderMap) -> bool {
 impl Clients {
     pub fn new(store: Option<Store>) -> Self {
         Self { store, ..Default::default() }
+    }
+
+    /// For the read-only status endpoint: identity-level checks only (expiry
+    /// and the address list). Programs, models, rate and budgets are about
+    /// inference, and a status read is not a request.
+    pub fn admit_status(&self, client: &NamedClient, headers: &HeaderMap) -> Result<(), Denied> {
+        if let Some(last) = client.expires
+            && Local::now().date_naive() > last
+        {
+            return Err(denied(401, format!("this key expired on {last}")));
+        }
+        if !address_allowed(client, headers) {
+            return Err(denied(403, "this key doesn't work from here".into()));
+        }
+        Ok(())
     }
     /// Checks made before the request body is read: expiry, programs, rate and budgets.
     /// `count` is false for a WebSocket's opening request, whose turns count instead.
@@ -241,16 +302,19 @@ impl Clients {
         let Some(id) = &o.client_id else { return };
         // A WebSocket is admitted once; each turn that finishes shows it is still in use.
         self.touch(id);
-        let now = Local::now();
-        let (day_ms, month_ms) = period_starts(now);
-        if o.event_at_ms < month_ms {
-            return;
-        }
         let t = &o.tokens;
         let tokens =
             counted_tokens(t.input.unwrap_or(0).saturating_add(t.cache_write.unwrap_or(0)), t.output.unwrap_or(0));
         let chargeable = o.status.is_some_and(|s| s < 400) || tokens > 0 || t.cache_read.unwrap_or(0) > 0;
         let price = store.and_then(|s| s.price(o).cost_nanos).map(|n| n.max(0) as u64);
+        // Read the period after acquiring the mutex: a completion can cross
+        // midnight while waiting for another short publication/record.
+        let mut s = self.spend.lock();
+        let now = Local::now();
+        let (day_ms, month_ms) = period_starts(now);
+        if o.event_at_ms < month_ms {
+            return;
+        }
         let totals = Totals {
             tokens_today: if o.event_at_ms >= day_ms { tokens } else { 0 },
             cost_nanos: price.unwrap_or(0),
@@ -261,8 +325,7 @@ impl Clients {
             ),
             unpriced: u64::from(chargeable && price.is_none()),
         };
-        let mut s = self.spend.lock();
-        s.roll();
+        s.roll_at(now.date_naive());
         s.by_client.entry(id.clone()).or_default().add(totals);
         if store.is_some_and(Store::accounting_available) {
             s.pending.insert(
@@ -276,25 +339,37 @@ impl Clients {
         self.spend.lock().available = false;
     }
 
-    /// Runs on the database worker. The lock covers both queries and replacement;
-    /// record-before-enqueue prevents concurrent completions from being lost or doubled.
+    /// Runs on the database worker. The snapshot query holds no request mutex.
+    /// Record-before-enqueue means every row in the snapshot was registered first;
+    /// merging *current* pending records while publishing also preserves completions
+    /// registered during the query. Acknowledgments use that same SQLite snapshot;
+    /// no SQL or transaction completion runs under the request mutex.
+    #[cfg(test)]
     fn reconcile(&self, conn: &mut rusqlite::Connection) -> anyhow::Result<()> {
-        let mut s = self.spend.lock();
-        let now = Local::now();
+        self.reconcile_before(conn, Instant::now() + Duration::from_secs(10))
+    }
+
+    fn reconcile_before(&self, conn: &mut rusqlite::Connection, deadline: Instant) -> anyhow::Result<()> {
+        self.reconcile_with_clock(conn, Local::now, deadline)
+    }
+
+    fn reconcile_with_clock(
+        &self,
+        conn: &mut rusqlite::Connection,
+        mut clock: impl FnMut() -> DateTime<Local>,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(Instant::now() < deadline, "client usage refresh expired");
+        let started = Instant::now();
+        let now = clock();
         let (day_ms, month_ms) = period_starts(now);
         let tx = conn.transaction()?;
+        // Whole-hour totals exist only from where the table starts; never read a
+        // month before it as if it were empty.
+        let from = crate::usage::store::client_totals_start(&tx)?;
+        anyhow::ensure!(month_ms >= from, "client usage totals start after this month began");
         let mut totals = {
-            let mut stmt = tx.prepare(
-                "SELECT client_id,
-                   SUM(CASE WHEN event_at_ms >= ?1 THEN COALESCE(input,0)+COALESCE(cache_write,0)+COALESCE(output,0) ELSE 0 END),
-                   SUM(COALESCE(cost_nanos,0)),
-                   SUM(CASE WHEN event_at_ms >= ?1 AND (input IS NULL OR cache_write IS NULL OR output IS NULL)
-                       AND (COALESCE(input,0)+COALESCE(cache_read,0)+COALESCE(cache_write,0)+COALESCE(output,0)>0 OR json_extract(usage_document(payload),'$.status') < 400) THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN cost_nanos IS NULL AND (COALESCE(input,0)+COALESCE(cache_read,0)+COALESCE(cache_write,0)+COALESCE(output,0)>0 OR json_extract(usage_document(payload),'$.status') < 400) THEN 1 ELSE 0 END)
-                 FROM usage_observations
-                 WHERE source = 'proxy' AND client_id IS NOT NULL AND event_at_ms >= ?2
-                 GROUP BY client_id",
-            )?;
+            let mut stmt = tx.prepare(RECONCILE_TOTALS)?;
             let rows = stmt.query_map([day_ms, month_ms], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -308,29 +383,49 @@ impl Clients {
             })?;
             rows.collect::<Result<HashMap<_, _>, _>>()?
         };
-        let mut acknowledged = Vec::new();
+        // The SQL above has already established the snapshot. Any completion
+        // registered after this copy cannot be in it: registration precedes
+        // enqueue. The writer also cannot execute another queued job mid-call.
+        let pending: Vec<_> = self
+            .spend
+            .lock()
+            .pending
+            .iter()
+            .map(|(event, p)| (event.clone(), p.origin.clone(), p.event_at_ms))
+            .collect();
+        let mut acknowledged = HashSet::new();
         {
             let mut stmt = tx.prepare("SELECT EXISTS(SELECT 1 FROM usage_observations WHERE source='proxy' AND origin_id=?1 AND source_event_id=?2)")?;
-            for (event, p) in &s.pending {
-                if p.event_at_ms < month_ms || stmt.query_row([&p.origin, event], |r| r.get::<_, bool>(0))? {
-                    acknowledged.push(event.clone());
-                } else {
-                    let mut delta = p.totals;
-                    if p.event_at_ms < day_ms {
-                        delta.tokens_today = 0;
-                        delta.unknown_tokens = 0;
-                    }
-                    totals.entry(p.client.clone()).or_default().add(delta);
+            for (event, origin, at) in pending {
+                if at < month_ms || stmt.query_row([&origin, &event], |r| r.get::<_, bool>(0))? {
+                    acknowledged.insert(event);
                 }
             }
         }
         tx.commit()?;
-        for event in acknowledged {
-            s.pending.remove(&event);
-        }
+        let mut s = self.spend.lock();
+        // Store::call does not cancel queued/running jobs when its caller times
+        // out. Such a job must never re-enable budget admission afterward.
+        anyhow::ensure!(Instant::now() < deadline, "client usage refresh expired");
+        // Never publish an old period over records that rolled while SQL ran.
+        anyhow::ensure!(clock().date_naive() == now.date_naive(), "client usage period changed during refresh");
+        // Merge the live map, including records registered while acknowledgments
+        // ran. Keep unacknowledged completions until a later durable snapshot.
+        s.pending.retain(|event, p| {
+            if p.event_at_ms < month_ms || acknowledged.contains(event) {
+                return false;
+            }
+            let mut delta = p.totals;
+            if p.event_at_ms < day_ms {
+                delta.tokens_today = 0;
+                delta.unknown_tokens = 0;
+            }
+            totals.entry(p.client.clone()).or_default().add(delta);
+            true
+        });
         s.day = Some(now.date_naive());
         s.by_client = totals;
-        s.refreshed = Some(Instant::now());
+        s.refreshed = Some(started);
         s.available = true;
         Ok(())
     }
@@ -352,15 +447,137 @@ pub fn trusted_identity_source<'a>(cfg: &'a crate::config::Config, headers: &Hea
     named_client(cfg, headers).filter(|client| client.trust_client_identity).map(|client| client.id.as_str())
 }
 
-/// Refuses a model the client's key may not use.
-pub fn check_model(app: &App, headers: &HeaderMap, model: &str) -> Result<(), Denied> {
-    let cfg = app.cfg();
-    match named_client(&cfg, headers) {
-        Some(c) if !model_allowed(c, model) => {
-            Err(denied(403, format!("this key can't use {model}; it may use {}", c.models.join(", "))))
+/// Literal (non-`*`) characters in a model-map pattern; more is more specific.
+fn literal_len(pattern: &str) -> usize {
+    pattern.chars().filter(|c| *c != '*').count()
+}
+
+/// Whether some model name matches both `*`-patterns (case-insensitively).
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.to_lowercase().chars().collect(), b.to_lowercase().chars().collect());
+    // reach[i][j]: some prefix of a name matches a[..i] and b[..j].
+    let mut reach = vec![vec![false; b.len() + 1]; a.len() + 1];
+    reach[0][0] = true;
+    for i in 0..=a.len() {
+        for j in 0..=b.len() {
+            if !reach[i][j] {
+                continue;
+            }
+            // A star may match nothing, or take the other pattern's next symbol.
+            if i < a.len() && a[i] == '*' {
+                reach[i + 1][j] = true;
+                if j < b.len() {
+                    reach[i][j + 1] = true;
+                }
+            }
+            if j < b.len() && b[j] == '*' {
+                reach[i][j + 1] = true;
+                if i < a.len() {
+                    reach[i + 1][j] = true;
+                }
+            }
+            if i < a.len() && j < b.len() && a[i] != '*' && b[j] != '*' && a[i] == b[j] {
+                reach[i + 1][j + 1] = true;
+            }
         }
-        _ => Ok(()),
     }
+    reach[a.len()][b.len()]
+}
+
+/// The model a client's `model-map` sends `requested` to, if any: matched
+/// case-insensitively (through [`wildcard`]) on the suffix-stripped base
+/// model. An exact pattern beats a wildcard; among wildcards the longest
+/// literal wins. Two wildcards of equal length that can match the same model
+/// are refused at load ([`validate_model_map`]), so no tie is left to break;
+/// pattern text still orders them, so the result never depends on map order.
+/// A target's own reasoning suffix replaces the request's; without one, the
+/// request's suffix is kept. The result is never mapped again (no chaining).
+pub fn mapped_model(client: &NamedClient, requested: &str) -> Option<String> {
+    if client.model_map.is_empty() {
+        return None;
+    }
+    let (base, _) = crate::ir::split_model_suffix(requested);
+    // No model is no model: a catch-all `*` doesn't make one up.
+    if base.trim().is_empty() {
+        return None;
+    }
+    let suffix = requested.trim().strip_prefix(base.as_str()).unwrap_or_default();
+    let mut best: Option<((bool, usize, &str), &str)> = None;
+    for (pattern, target) in &client.model_map {
+        if !wildcard(pattern, &base) {
+            continue;
+        }
+        let rank = (!pattern.contains('*'), literal_len(pattern), pattern.as_str());
+        if best.is_none_or(|(r, _)| rank > r) {
+            best = Some((rank, target));
+        }
+    }
+    let target = best?.1;
+    let (_, own) = crate::ir::split_model_suffix(target);
+    Some(if own.is_some() { target.to_string() } else { format!("{target}{suffix}") })
+}
+
+/// Whether a named client's `model-map` is usable. Checked at config load.
+pub fn validate_model_map(client: &NamedClient) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    for (pattern, target) in &client.model_map {
+        if pattern.trim().is_empty() || target.trim().is_empty() {
+            return Err("model-map needs a pattern and a target model".into());
+        }
+        if target.contains('*') {
+            return Err(format!("model-map target \"{target}\" must name one model or group, without `*`"));
+        }
+        if !seen.insert(pattern.trim().to_ascii_lowercase()) {
+            return Err(format!("model-map pattern \"{pattern}\" is used twice"));
+        }
+        if let Some(other) = client.model_map.keys().find(|other| {
+            *other < pattern
+                && pattern.contains('*')
+                && other.contains('*')
+                && literal_len(other) == literal_len(pattern)
+                && patterns_overlap(other, pattern)
+        }) {
+            return Err(format!(
+                "model-map patterns \"{other}\" and \"{pattern}\" are equally specific and can match the same model; make one more specific"
+            ));
+        }
+        let (target_base, _) = crate::ir::split_model_suffix(target);
+        // Matching its own pattern is a narrowing (`claude-*` to one Claude
+        // model) and safe because mapping runs once; matching another
+        // pattern would chain.
+        if client.model_map.keys().any(|p| p != pattern && wildcard(p, &target_base)) {
+            return Err(format!(
+                "model-map target \"{target}\" matches another pattern; mapped models are not mapped again"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The outcome of admitting a requested model for a client.
+pub struct Admitted {
+    /// The model to serve: the requested one, or the `model-map` target.
+    pub model: String,
+    /// `(client id, requested model)` when a `model-map` rewrote the request.
+    pub mapped: Option<(String, String)>,
+}
+
+/// The one place a requested model is checked for a client, so no path can
+/// check a model without also mapping it: applies the client's `model-map`
+/// first, then checks its `models` allowlist against the mapped model.
+/// Returns the requested model untouched when no client has a map.
+pub fn admit_model(app: &App, headers: &HeaderMap, model: &str) -> Result<Admitted, Denied> {
+    let cfg = app.cfg();
+    let Some(client) = named_client(&cfg, headers) else {
+        return Ok(Admitted { model: model.to_string(), mapped: None });
+    };
+    let mapped = mapped_model(client, model);
+    let effective = mapped.clone().unwrap_or_else(|| model.to_string());
+    let (base, _) = crate::ir::split_model_suffix(&effective);
+    if !model_allowed(client, &base) {
+        return Err(denied(403, format!("this key can't use {base}; it may use {}", client.models.join(", "))));
+    }
+    Ok(Admitted { model: effective, mapped: mapped.map(|_| (client.id.clone(), model.to_string())) })
 }
 
 /// Keeps token and spend totals current for clients that have such limits.
@@ -373,7 +590,10 @@ pub async fn refresh(app: &App) {
         return;
     };
     let clients = app.clients.clone();
-    let result = tokio::time::timeout(Duration::from_secs(10), store.call(move |conn| clients.reconcile(conn))).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let result =
+        tokio::time::timeout(Duration::from_secs(10), store.call(move |conn| clients.reconcile_before(conn, deadline)))
+            .await;
     if !matches!(result, Ok(Ok(()))) || !store.accounting_available() {
         app.clients.unavailable();
         tracing::warn!("could not establish client usage totals; budget-limited keys are unavailable");
@@ -388,6 +608,10 @@ pub async fn refresher(app: Arc<App>) {
         refresh(&app).await;
     }
 }
+
+#[cfg(test)]
+#[path = "policy/reconcile_tests.rs"]
+mod reconcile_tests;
 
 #[cfg(test)]
 mod tests {
@@ -549,6 +773,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_reads_hourly_totals_and_only_time_indexed_edges() {
+        let dir = std::env::temp_dir().join(format!("fusebox-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("usage.sqlite3"), 64, 90, None).unwrap();
+        let plan = store
+            .call(|conn| {
+                let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {RECONCILE_TOTALS}"))?;
+                let rows = stmt.query_map([0i64, 0], |r| r.get::<_, String>(3))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?.join("; "))
+            })
+            .await
+            .unwrap();
+        assert!(plan.contains("USING PRIMARY KEY (bucket_ms>?)"), "{plan}");
+        assert!(plan.contains("USING INDEX usage_event_time (event_at_ms>? AND event_at_ms<?)"), "{plan}");
+        store.shutdown().await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn budget_totals_read_compressed_records() {
         let dir = std::env::temp_dir().join(format!("fusebox-policy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -607,6 +850,82 @@ mod tests {
         assert!(model_allowed(&c, "claude-sonnet-5-5"));
         assert!(model_allowed(&c, "GPT-6-ASTRA"));
         assert!(!model_allowed(&c, "gpt-6.1-sol"));
+    }
+
+    fn mapped_client(pairs: &[(&str, &str)]) -> NamedClient {
+        NamedClient { model_map: pairs.iter().map(|(p, t)| (p.to_string(), t.to_string())).collect(), ..client() }
+    }
+
+    #[test]
+    fn model_map_matches_the_base_model_and_keeps_the_request_suffix() {
+        let c = mapped_client(&[("claude-opus-*", "claude-sonnet-5-5")]);
+        assert_eq!(mapped_model(&c, "claude-opus-5-5").as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(mapped_model(&c, "Claude-Opus-5-5(max)").as_deref(), Some("claude-sonnet-5-5(max)"));
+        assert_eq!(mapped_model(&c, "gpt-6-astra"), None);
+        assert_eq!(mapped_model(&client(), "claude-opus-5-5"), None, "no map, no rewrite");
+    }
+
+    #[test]
+    fn model_map_target_suffix_replaces_the_request_suffix() {
+        let c = mapped_client(&[("gpt-6-astra", "gpt-6-astra-mini(low)")]);
+        assert_eq!(mapped_model(&c, "gpt-6-astra(high)").as_deref(), Some("gpt-6-astra-mini(low)"));
+        assert_eq!(mapped_model(&c, "gpt-6-astra").as_deref(), Some("gpt-6-astra-mini(low)"));
+    }
+
+    #[test]
+    fn model_map_prefers_exact_then_the_longest_literal_whatever_the_order() {
+        let forward = mapped_client(&[("claude-*", "any"), ("claude-opus-*", "opus"), ("claude-opus-5-5", "exact")]);
+        let mut reversed = mapped_client(&[]);
+        reversed.model_map = forward.model_map.iter().rev().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for c in [&forward, &reversed] {
+            assert_eq!(mapped_model(c, "claude-opus-5-5").as_deref(), Some("exact"));
+            assert_eq!(mapped_model(c, "claude-opus-4").as_deref(), Some("opus"));
+            assert_eq!(mapped_model(c, "claude-haiku-4").as_deref(), Some("any"));
+        }
+        let catchall = mapped_client(&[("*", "cheap"), ("gpt-*", "gpt")]);
+        assert_eq!(mapped_model(&catchall, "anything-else").as_deref(), Some("cheap"));
+        assert_eq!(mapped_model(&catchall, "gpt-6").as_deref(), Some("gpt"));
+    }
+
+    #[test]
+    fn model_map_validation_refuses_chains_wildcard_targets_and_duplicates() {
+        assert!(validate_model_map(&mapped_client(&[("claude-*", "claude-sonnet-5-5")])).is_ok(), "narrowing is fine");
+        assert!(
+            validate_model_map(&mapped_client(&[("gpt-*", "claude-sonnet-5-5"), ("claude-*", "gemini-3")])).is_err(),
+            "chains"
+        );
+        assert!(validate_model_map(&mapped_client(&[("gpt-*", "gpt-*-mini")])).is_err(), "wildcard target");
+        assert!(
+            validate_model_map(&mapped_client(&[("GPT-*", "a"), ("gpt-*", "b")])).is_err(),
+            "case-insensitive duplicate"
+        );
+        let tie = validate_model_map(&mapped_client(&[("a*", "cheap"), ("*a", "costly")])).unwrap_err();
+        assert!(tie.contains("equally specific"), "{tie}");
+        assert!(
+            validate_model_map(&mapped_client(&[("Claude-*-mini", "x"), ("claude-*", "y")])).is_ok(),
+            "different lengths rank, no tie"
+        );
+        assert!(
+            validate_model_map(&mapped_client(&[("Claude-*-mini", "x"), ("claude-opus-*", "y")])).is_err(),
+            "claude-opus-mini matches both, 12 literal characters each"
+        );
+        assert!(validate_model_map(&mapped_client(&[("gpt-*", "x"), ("glm-*", "y")])).is_ok(), "can't both match");
+        assert!(validate_model_map(&mapped_client(&[("x-*z", "p"), ("x*-z", "q")])).is_err(), "x-z matches both");
+        assert!(validate_model_map(&mapped_client(&[("x-*-z", "p"), ("x-*z", "q")])).is_ok(), "the longer one wins");
+        for (a, b, overlap) in [
+            ("a*", "*a", true),
+            ("gpt-*", "glm-*", false),
+            ("*-mini", "*-nano", false),
+            ("ab*cd", "a*bcd", true),
+            ("claude-*", "CLAUDE-*", true),
+            ("x*", "y*", false),
+        ] {
+            assert_eq!(patterns_overlap(a, b), overlap, "{a} vs {b}");
+            assert_eq!(patterns_overlap(b, a), overlap, "{b} vs {a}");
+        }
+        assert!(validate_model_map(&mapped_client(&[("", "b")])).is_err(), "empty pattern");
+        assert!(validate_model_map(&mapped_client(&[("a-*", "")])).is_err(), "empty target");
+        assert!(validate_model_map(&client()).is_ok(), "no map");
     }
 
     #[test]

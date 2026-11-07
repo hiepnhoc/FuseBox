@@ -110,6 +110,9 @@ pub(super) fn decision(cfg: &Config, quota: &Quota, inv: &Inventory, now: DateTi
     inv.grants
         .iter()
         .filter(|g| g.usable && within_horizon(cfg, g, now))
+        // A grant for a limit the account no longer has (the 5-hour one on Claude Ultra
+        // or ChatGPT Pro) restores nothing, even just before it expires.
+        .filter(|g| !(quota.no_five_hour_limit && !g.clears.is_empty() && g.clears.iter().all(|s| s == "5h")))
         .filter(|g| {
             // The expiry deadline takes precedence over consumption and natural
             // renewal: redeem even at zero usage or with no quota observations.
@@ -223,7 +226,9 @@ pub struct Plan {
     pub message: &'static str,
 }
 
-pub fn plan(acct: &Account, cfg: &Config) -> Option<Plan> {
+/// `shared`: another enabled subscription of the same provider exists. With none, being
+/// first for new work means nothing, so the plan does not say so.
+pub fn plan(acct: &Account, cfg: &Config, shared: bool) -> Option<Plan> {
     if !cfg.banked_resets || account_id(acct).is_err() {
         return None;
     }
@@ -236,7 +241,7 @@ pub fn plan(acct: &Account, cfg: &Config) -> Option<Plan> {
     Some(Plan {
         expires_at,
         expiry_redeem_at: expires_at - chrono::Duration::hours(EXPIRY_REDEEM_HOURS),
-        prioritized: prioritized && !st.disabled,
+        prioritized: prioritized && shared && !st.disabled,
         auto_redeem: auto,
         due: auto && decision(cfg, &st.quota, inv, now).is_some(),
         message: if auto {

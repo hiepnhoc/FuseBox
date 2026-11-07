@@ -52,13 +52,13 @@ lấy release (ví dụ sang fork của mình khi có sửa code riêng),
 ## Ra bản mới
 
 Release được GitHub Actions build khi push một tag trùng với `version` trong
-`Cargo.toml` của branch `kiro`, ví dụ `0.10.1-hibox.1` → tag `v0.10.1-hibox.1`:
+`Cargo.toml` của branch `kiro`, ví dụ `0.14.0-hibox.1` → tag `v0.14.0-hibox.1`:
 
 ```sh
 git checkout kiro
 # sửa version trong Cargo.toml và dòng version của package fusebox trong Cargo.lock
-git commit -am "Prepare v0.10.1-hibox.2"
-git tag v0.10.1-hibox.2 && git push origin kiro v0.10.1-hibox.2
+git commit -am "Prepare v0.14.0-hibox.2"
+git tag v0.14.0-hibox.2 && git push origin kiro v0.14.0-hibox.2
 ```
 
 Workflow build Mac ARM, Mac Intel, Windows x64, Linux x64 và Linux ARM, rồi tạo

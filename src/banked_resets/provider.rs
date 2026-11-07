@@ -14,6 +14,10 @@ pub struct Grant {
     pub id: String,
     pub label: String,
     pub remaining: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub granted_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub starts_at: Option<DateTime<Utc>>,
     pub clears: Vec<String>,
@@ -63,7 +67,7 @@ pub fn codex(usage: &Value, details: &Value, now: DateTime<Utc>) -> Result<Inven
     let applicable = count(&counts["applicable_available_count"])?.or(count(&details["applicable_available_count"])?);
     let mut grants = Vec::new();
     let mut seen = HashSet::new();
-    if let Some(credits) = details.get("credits") {
+    if let Some(credits) = details.get("credits").filter(|v| !v.is_null()) {
         for credit in credits.as_array().filter(|v| v.len() <= 1000).ok_or_else(|| anyhow!("Invalid reset grants"))? {
             if credit["reset_type"] != "codex_rate_limits" || credit["status"] != "available" {
                 continue;
@@ -76,6 +80,9 @@ pub fn codex(usage: &Value, details: &Value, now: DateTime<Utc>) -> Result<Inven
                 id: id.into(),
                 label: "Codex reset".into(),
                 remaining: 1,
+                total: 1,
+                // Receipt metadata must not disable otherwise valid redemption.
+                granted_at: timestamp(&credit["granted_at"]).ok().flatten(),
                 expires_at: expires,
                 starts_at: None,
                 clears: vec!["subscription limits".into()],
@@ -103,7 +110,13 @@ pub fn codex(usage: &Value, details: &Value, now: DateTime<Utc>) -> Result<Inven
     } else {
         None
     };
-    Ok(Inventory { available, applicable, eligible, grants, reason, selected_grant: None })
+    // Name the credit that expires first. Without an ID, Codex picks one itself.
+    let selected_grant = grants
+        .iter()
+        .filter(|g| g.usable && !g.id.is_empty())
+        .min_by_key(|g| (g.expires_at.is_none(), g.expires_at, &g.id))
+        .map(|g| g.id.clone());
+    Ok(Inventory { available, applicable, eligible, grants, reason, selected_grant })
 }
 
 pub fn claude(v: &Value, now: DateTime<Utc>) -> Result<Inventory> {
@@ -189,6 +202,8 @@ pub fn claude(v: &Value, now: DateTime<Utc>) -> Result<Inventory> {
             id: id.into(),
             label,
             remaining,
+            total,
+            granted_at: None,
             expires_at: expires,
             starts_at: starts,
             clears,
@@ -232,6 +247,8 @@ pub struct HttpProvider {
     pub client: reqwest::Client,
     pub token: String,
     pub account_id: String,
+    /// The account whose usage endpoint this reads, to share its 429 wait.
+    pub acct: Option<std::sync::Arc<crate::accounts::Account>>,
     #[cfg(test)]
     pub origin: Option<String>,
 }
@@ -289,6 +306,23 @@ impl HttpProvider {
         ensure!(resp.status().is_success(), "Provider reset status unavailable (HTTP {})", resp.status().as_u16());
         json_body(resp).await
     }
+    /// The usage endpoint, which the quota poll and the window starter read too: wait
+    /// with them after a 429.
+    async fn usage(&self, path: &str) -> Result<Value> {
+        if let Some(acct) = &self.acct {
+            crate::quota::usage_gate(acct)?;
+        }
+        let resp = self
+            .request(reqwest::Method::GET, path)
+            .send()
+            .await
+            .map_err(|_| anyhow!("Could not read provider reset status"))?;
+        if let Some(acct) = &self.acct {
+            crate::quota::usage_answered(acct, resp.status(), resp.headers());
+        }
+        ensure!(resp.status().is_success(), "Provider reset status unavailable (HTTP {})", resp.status().as_u16());
+        json_body(resp).await
+    }
 }
 
 async fn json_body(mut response: reqwest::Response) -> Result<Value> {
@@ -304,12 +338,12 @@ impl Api for HttpProvider {
     async fn read(&self) -> Result<(Inventory, Value)> {
         match self.provider {
             Provider::Codex => {
-                let usage = self.get("/backend-api/wham/usage").await?;
+                let usage = self.usage("/backend-api/wham/usage").await?;
                 let details = self.get("/backend-api/wham/rate-limit-reset-credits").await?;
                 Ok((codex(&usage, &details, Utc::now())?, usage))
             }
             Provider::Claude => {
-                let usage = self.get("/api/oauth/usage?cedar_ember=1&skip_spend=1").await?;
+                let usage = self.usage("/api/oauth/usage?cedar_ember=1&skip_spend=1").await?;
                 Ok((claude(&usage, Utc::now())?, usage))
             }
             _ => Err(anyhow!("Banked resets are not supported by this provider")),
@@ -330,7 +364,11 @@ impl Api for HttpProvider {
     }
     async fn redeem(&self, organization: &str, grant: &str, request: &str) -> Result<Outcome> {
         let (path, body) = if self.provider == Provider::Codex {
-            ("/backend-api/wham/rate-limit-reset-credits/consume".to_string(), json!({"redeem_request_id":request}))
+            let mut body = json!({"redeem_request_id":request});
+            if !grant.is_empty() {
+                body["credit_id"] = json!(grant);
+            }
+            ("/backend-api/wham/rate-limit-reset-credits/consume".to_string(), body)
         } else {
             ensure!(uuid::Uuid::parse_str(organization).is_ok(), "Invalid provider identity");
             (
@@ -352,13 +390,20 @@ impl Api for HttpProvider {
         if !(200..300).contains(&status) {
             return Ok(Outcome::Unknown);
         }
-        if self.provider == Provider::Codex {
-            return Ok(Outcome::Applied);
-        }
         let v = match json_body(response).await {
             Ok(v) => v,
             Err(_) => return Ok(Outcome::Unknown),
         };
+        if self.provider == Provider::Codex {
+            // Codex answers 200 even when nothing was spent (openai/codex backend-client).
+            return Ok(match v["code"].as_str() {
+                Some("reset") => Outcome::Applied,
+                Some("already_redeemed") => Outcome::AlreadyUsed,
+                Some("nothing_to_reset") => Outcome::Refused("Codex reports nothing to reset right now"),
+                Some("no_credit") => Outcome::Refused("Codex reports this reset is no longer available"),
+                _ => Outcome::Unknown,
+            });
+        }
         Ok(match v["result"].as_str() {
             Some("reset") => Outcome::Applied,
             Some("already_used") => Outcome::AlreadyUsed,

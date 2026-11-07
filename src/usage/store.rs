@@ -1,15 +1,19 @@
 //! Durable metadata-only usage journal and deterministic, conservative accounting.
 use super::{pricing::Catalogue, types::Observation};
+use crate::zone::{LocalDates, Zone};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use chrono::{DateTime, LocalResult, NaiveDate, TimeZone, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, LocalResult, NaiveDate, Utc};
+#[cfg(test)]
+pub(crate) use client_totals::build as build_client_totals;
+pub(crate) use client_totals::start as client_totals_start;
+pub(crate) use codec::register as register_functions;
 pub(crate) use codec::{Documents, decode as decode_document};
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -17,6 +21,7 @@ use std::{
     },
 };
 use tokio::sync::{OnceCell, Semaphore, mpsc, oneshot};
+mod client_totals;
 mod codec;
 mod compact;
 mod dashboard;
@@ -88,6 +93,8 @@ pub struct Query {
     pub model: Option<String>,
     pub account: Option<String>,
     pub client: Option<String>,
+    /// A Claude Code entrypoint (`sdk-ts`, `cli`, …): only proxy calls that reported it.
+    pub entrypoint: Option<String>,
     pub source: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -136,9 +143,37 @@ fn register_aggregates(conn: &Connection) -> Result<()> {
 }
 const WRITER_SESSIONS_SCHEMA: &str = "CREATE TABLE usage_writer_sessions(id TEXT PRIMARY KEY,started_at_ms INTEGER NOT NULL,ended_at_ms INTEGER,clean INTEGER NOT NULL DEFAULT 0,dropped INTEGER NOT NULL DEFAULT 0,rejected INTEGER NOT NULL DEFAULT 0,writer_errors INTEGER NOT NULL DEFAULT 0,written INTEGER NOT NULL DEFAULT 0,last_commit_at_ms INTEGER NOT NULL DEFAULT 0);";
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-fn persist_health(conn: &Connection, id: &str, health: &Health) -> Result<()> {
-    conn.execute("UPDATE usage_writer_sessions SET dropped=?2,rejected=?3,writer_errors=?4,written=?5,last_commit_at_ms=?6 WHERE id=?1",params![id,health.dropped.load(Ordering::Relaxed),health.rejected.load(Ordering::Relaxed),health.errors.load(Ordering::Relaxed),health.written.load(Ordering::Relaxed),health.last_commit.load(Ordering::Relaxed)])?;
-    Ok(())
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HealthCounters {
+    dropped: u64,
+    rejected: u64,
+    errors: u64,
+    written: u64,
+    last_commit: i64,
+}
+
+/// Idle writers still check for losses reported by producers, but an unchanged
+/// checkpoint needs neither a SQL statement nor a WAL write/sync every second.
+#[derive(Default)]
+struct HealthCheckpoint(Option<HealthCounters>);
+impl HealthCheckpoint {
+    fn persist(&mut self, conn: &Connection, id: &str, health: &Health) -> Result<()> {
+        let counters = HealthCounters {
+            dropped: health.dropped.load(Ordering::Relaxed),
+            rejected: health.rejected.load(Ordering::Relaxed),
+            errors: health.errors.load(Ordering::Relaxed),
+            written: health.written.load(Ordering::Relaxed),
+            last_commit: health.last_commit.load(Ordering::Relaxed),
+        };
+        if self.0 == Some(counters) {
+            return Ok(());
+        }
+        conn.prepare_cached("UPDATE usage_writer_sessions SET dropped=?2,rejected=?3,writer_errors=?4,written=?5,last_commit_at_ms=?6 WHERE id=?1")?.execute(params![id,counters.dropped,counters.rejected,counters.errors,counters.written,counters.last_commit])?;
+        // A failed write must remain dirty so the next timer/barrier retries it.
+        self.0 = Some(counters);
+        Ok(())
+    }
 }
 fn database_failure(error: &anyhow::Error) -> bool {
     error
@@ -265,6 +300,9 @@ impl Store {
             // Bounded collector outboxes never serve dashboards. Keep their
             // compact timestamp index and allocation budget unchanged.
             upgrade_dashboard_index(&mut conn)?;
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS usage_entries_unpriced_time ON usage_entries(event_at_ms) WHERE cost_nanos IS NULL;",
+            )?;
         }
         conn.execute("INSERT INTO usage_meta(key,value) VALUES('catalogue',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&catalogue)?])?;
         conn.execute("INSERT INTO usage_meta(key,value) VALUES('retention_days',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[retention_days.to_string()])?;
@@ -274,6 +312,9 @@ impl Store {
         let startup_repriced = if byte_limit.is_none() { reprice(&mut conn)? } else { 0 };
         if startup_repriced > 0 {
             tracing::info!(repriced = startup_repriced, "repaired usage price estimates; previous snapshots retained");
+        }
+        if byte_limit.is_none() {
+            client_totals::ensure(&mut conn)?;
         }
         let (tx, mut rx) = mpsc::channel(queue_capacity);
         let (historical_dropped,historical_rejected,historical_errors,prior_unclosed):(u64,u64,u64,u64)=conn.query_row("SELECT COALESCE(SUM(dropped),0),COALESCE(SUM(rejected),0),COALESCE(SUM(writer_errors),0),COALESCE(SUM(clean=0),0) FROM usage_writer_sessions",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
@@ -316,6 +357,7 @@ impl Store {
                     }
                 };
                 let mut last_health = std::time::Instant::now();
+                let mut health_checkpoint = HealthCheckpoint::default();
                 let stop = loop {
                     // Wake sooner while the compactor has work, so it keeps its pace.
                     let wait =
@@ -324,7 +366,7 @@ impl Store {
                     let command = match received {
                         Ok(Some(command)) => Some(command),
                         Ok(None) => {
-                            let _ = persist_health(&conn, &worker_session, &worker_health);
+                            let _ = health_checkpoint.persist(&conn, &worker_session, &worker_health);
                             break None;
                         }
                         Err(_) => None,
@@ -351,7 +393,7 @@ impl Store {
                     }
                     if last_health.elapsed() >= std::time::Duration::from_secs(1) {
                         last_health = std::time::Instant::now();
-                        if let Err(e) = persist_health(&conn, &worker_session, &worker_health) {
+                        if let Err(e) = health_checkpoint.persist(&conn, &worker_session, &worker_health) {
                             worker_health.fail(&e);
                         }
                     }
@@ -390,7 +432,7 @@ impl Store {
                                     worker_health.fail(&e);
                                 }
                             }
-                            if let Err(e) = persist_health(&conn, &worker_session, &worker_health) {
+                            if let Err(e) = health_checkpoint.persist(&conn, &worker_session, &worker_health) {
                                 worker_health.fail(&e);
                             }
                             match pending {
@@ -554,7 +596,7 @@ impl Store {
                 let health = self.health.clone();
                 let clean = self
                     .call_internal(move |conn| {
-                        persist_health(conn, &id, &health)?;
+                        HealthCheckpoint::default().persist(conn, &id, &health)?;
                         conn.execute(
                             "UPDATE usage_writer_sessions SET clean=1,ended_at_ms=?2 WHERE id=?1",
                             params![id.as_str(), Utc::now().timestamp_millis()],
@@ -606,6 +648,14 @@ impl Store {
     pub async fn dashboard(&self, q: Query) -> Result<Value> {
         self.read(move |conn| dashboard::summary(conn, &q)).await
     }
+    /// Claude Code entrypoints for the Usage page, read beside the dashboard.
+    pub async fn entrypoints(&self, q: Query) -> Result<Value> {
+        self.read(move |conn| dashboard::entrypoints(conn, &q)).await
+    }
+    #[cfg(test)]
+    pub async fn entrypoints_scan(&self, q: Query) -> Result<Value> {
+        self.read(move |conn| dashboard::entrypoints_scan(conn, &q)).await
+    }
     #[cfg(test)]
     pub async fn dashboard_scan(&self, q: Query) -> Result<Value> {
         self.read(move |conn| dashboard::summary_scan(conn, &q)).await
@@ -630,7 +680,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         bail!("usage database schema {version} is newer than supported {VERSION}");
     }
     if version == VERSION {
-        return Ok(());
+        return rollup::ensure_entrypoints(conn);
     }
     if version < 0 {
         bail!("unsupported usage database migration");
@@ -695,7 +745,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
-    Ok(())
+    rollup::ensure_entrypoints(conn)
 }
 
 /// Schema 4: compressed documents (see `codec`), the pricing flag lifted out of the
@@ -781,6 +831,9 @@ mod compact_tests;
 #[cfg(test)]
 #[path = "store/index_tests.rs"]
 mod index_tests;
+#[cfg(test)]
+#[path = "store/optimization_tests.rs"]
+mod optimization_tests;
 
 fn association_key(o: &Observation) -> String {
     if let Some(id) = o.response_id.as_ref().filter(|s| !s.is_empty()) {
@@ -852,6 +905,15 @@ fn backup_file(database: &Path, to: &Path) -> Result<u64> {
 /// Cache writes are corrected only when the stored observation proves its TTL.
 /// Every revision preserves its previous snapshot in the same transaction as rollups.
 pub fn reprice(conn: &mut Connection) -> Result<u64> {
+    reprice_mode(conn, false)
+}
+
+/// Explicitly refresh saved estimates; ordinary startup preserves established prices.
+pub fn reprice_all(conn: &mut Connection) -> Result<u64> {
+    reprice_mode(conn, true)
+}
+
+fn reprice_mode(conn: &mut Connection, all: bool) -> Result<u64> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_price_revisions(
         id INTEGER PRIMARY KEY,observation_id INTEGER NOT NULL REFERENCES usage_observations(id) ON DELETE CASCADE,
@@ -871,28 +933,33 @@ pub fn reprice(conn: &mut Connection) -> Result<u64> {
             FROM usage_observations WHERE id>?1 AND (
               (cost_nanos IS NULL AND REPLACE(pricing_basis,'local_override:','') IN
                 ('outside_effective_period','unsupported_inference_region','unknown_model','unsupported_service_tier',
-                 'unsupported_service_tier_context','unsupported_regional_model','unsupported_rate_or_overflow'))
+                 'unsupported_service_tier_context','unsupported_regional_model','unsupported_rate_or_overflow',
+                 'unknown_cache_write_ttl'))
               OR (model='claude-sonnet-5-5' AND catalogue_version='2026-10-07.3' AND cache_read>0 AND cost_nanos IS NOT NULL)
               OR (provider='openai' AND cache_write>0 AND (write_30m IS NOT NULL OR write_12h IS NOT NULL)
-                AND (cost_nanos IS NULL OR catalogue_version='2026-10-18.1')))
-            ORDER BY id LIMIT 2000")?.query_map([cursor], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, rusqlite::types::Value>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?,r.get::<_,Option<i64>>(4)?,r.get::<_,rusqlite::types::Value>(5)?,r.get::<_,String>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                AND (cost_nanos IS NULL OR catalogue_version='2026-10-18.1'))
+              OR (?2 AND catalogue_version<>?3))
+            ORDER BY id LIMIT 2000")?.query_map(params![cursor, all, catalogue.version], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, rusqlite::types::Value>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?,r.get::<_,Option<i64>>(4)?,r.get::<_,rusqlite::types::Value>(5)?,r.get::<_,String>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let Some(last) = rows.last() else { break };
         cursor = last.0;
         let mut documents = Documents::new(&tx)?;
+        let mut decoder = codec::Decoder::new(&tx);
         let mut groups = BTreeSet::new();
         for (id, payload, key, basis, old_cost, old_snapshot, old_catalogue) in rows {
             // Payloads written by an incompatible build stay as stored rather than guessed.
-            let Ok(payload) = codec::decode(&tx, (&payload).into()) else { continue };
+            let Ok(payload) = decoder.decode((&payload).into()) else { continue };
             let Ok(o) = serde_json::from_str::<Observation>(&payload) else { continue };
-            let old_snapshot = codec::decode(&tx, (&old_snapshot).into())?;
+            let old_snapshot = decoder.decode((&old_snapshot).into())?;
             let mut correction = "recoverable_unpriced_estimate";
             if old_cost.is_some() {
                 let old: super::pricing::Snapshot = serde_json::from_str(&old_snapshot)?;
                 if catalogue.local_override || old.local_override {
                     continue;
                 }
-                let Some(rate) = old.rate else { continue };
-                if o.provider == "openai" {
+                if all && old_catalogue != catalogue.version {
+                    correction = "catalogue_refresh";
+                } else if o.provider == "openai" {
+                    let Some(rate) = old.rate else { continue };
                     // Old observations without TTL counts are not repairable.
                     if old_catalogue != "2026-10-18.1"
                         || rate.cache_write_nanos_per_token.is_none()
@@ -905,6 +972,7 @@ pub fn reprice(conn: &mut Connection) -> Result<u64> {
                     }
                     correction = "openai_cache_write_lifetime_correction";
                 } else {
+                    let Some(rate) = old.rate else { continue };
                     if rate.cache_read_nanos_per_token != Some(200) {
                         continue;
                     }
@@ -912,7 +980,10 @@ pub fn reprice(conn: &mut Connection) -> Result<u64> {
                 }
             }
             let snapshot = catalogue.price(&o);
-            if snapshot.cost_nanos == old_cost && (old_cost.is_some() || snapshot.basis == basis) {
+            if snapshot.cost_nanos == old_cost
+                && (old_cost.is_some() || snapshot.basis == basis)
+                && !(all && old_cost.is_some() && old_catalogue != catalogue.version)
+            {
                 continue;
             }
             // A catalogue change must never remove an established price.
@@ -925,6 +996,7 @@ pub fn reprice(conn: &mut Connection) -> Result<u64> {
             groups.insert(key);
             repriced += 1;
         }
+        drop(decoder);
         for key in groups {
             rebuild_entries(&tx, &key)?;
         }
@@ -974,6 +1046,11 @@ pub fn insert_batch(conn: &mut Connection, observations: &[Observation]) -> Resu
         };
         let changed=tx.prepare_cached("INSERT OR IGNORE INTO usage_observations(source,origin_id,source_event_id,fingerprint,canonical_key,association_key,trust_rank,event_at_ms,ingested_at_ms,provider,model,account_id,client_id,logical_request_id,attempt_id,response_id,completeness,known_fields,input,cache_read,cache_write,write_5m,write_1h,output,reasoning,cost_nanos,pricing_basis,catalogue_version,snapshot_json,payload,pricing_partial,write_30m,write_12h) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)")?.execute(params![o.source,o.origin_id,o.source_event_id,fingerprint,canonical_key(o),association_key(o),rank,o.event_at_ms,Utc::now().timestamp_millis(),o.provider,o.actual_model.as_ref(),o.account_id,o.client_id,o.logical_request_id,o.attempt_id,o.response_id,o.completeness,known as i64,tokens.input,tokens.cache_read,tokens.cache_write,tokens.write_5m,tokens.write_1h,tokens.output,tokens.reasoning,snapshot.cost_nanos,snapshot.basis,snapshot.catalogue_version,documents.store(&serde_json::to_string(&snapshot)?)?,documents.store(&serde_json::to_string(o)?)?,i64::from(snapshot.partial),tokens.write_30m,tokens.write_12h])?;
         if changed > 0 {
+            // Before the entry is chosen: its triggers read the label to roll it up.
+            if let Some(entrypoint) = &o.entrypoint {
+                tx.prepare_cached("INSERT INTO usage_entrypoints(id,entrypoint) VALUES(?1,?2)")?
+                    .execute(params![tx.last_insert_rowid(), entrypoint])?;
+            }
             changed_groups.insert(canonical_key(o));
             inserted += 1;
         } else {
@@ -1043,8 +1120,13 @@ fn purge_conn(conn: &mut Connection, before_ms: i64) -> Result<Value> {
             affected.push(row?);
         }
     }
-    let deleted = tx.execute("DELETE FROM usage_observations WHERE event_at_ms<?1", [before_ms])?;
+    // Entries go first, while their entrypoints are still there for the rollup triggers.
     tx.execute("DELETE FROM usage_entries WHERE event_at_ms<?1", [before_ms])?;
+    tx.execute(
+        "DELETE FROM usage_entrypoints WHERE id IN (SELECT id FROM usage_observations INDEXED BY usage_event_time WHERE event_at_ms<?1)",
+        [before_ms],
+    )?;
+    let deleted = tx.execute("DELETE FROM usage_observations WHERE event_at_ms<?1", [before_ms])?;
     tx.execute("DELETE FROM usage_suppressed WHERE NOT EXISTS(SELECT 1 FROM usage_observations o WHERE o.source=usage_suppressed.source AND o.source_event_id=usage_suppressed.source_event_id)",[])?;
     for key in affected {
         rebuild_entries(&tx, &key)?;
@@ -1062,34 +1144,34 @@ fn purge_conn(conn: &mut Connection, before_ms: i64) -> Result<Value> {
 struct Range {
     start: i64,
     end: i64,
-    tz: Tz,
+    tz: Zone,
 }
-fn boundary(value: &str, tz: Tz) -> Result<i64> {
+fn boundary(value: &str, tz: &Zone) -> Result<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
         return Ok(dt.timestamp_millis());
     }
     let date = NaiveDate::parse_from_str(value, "%Y-%m-%d").context("range must be RFC3339 or local YYYY-MM-DD")?;
-    match tz.from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap()) {
-        LocalResult::Single(v) => Ok(v.timestamp_millis()),
-        LocalResult::Ambiguous(a, b) => Ok(a.min(b).timestamp_millis()),
+    match tz.midnight(date) {
+        LocalResult::Single(v) => Ok(v),
+        LocalResult::Ambiguous(a, b) => Ok(a.min(b)),
         LocalResult::None => bail!("local midnight does not exist in selected timezone; use RFC3339"),
     }
 }
 fn range(q: &Query) -> Result<Range> {
-    let tz: Tz = q.timezone.as_deref().unwrap_or("UTC").parse().context("invalid IANA timezone")?;
-    let today = Utc::now().with_timezone(&tz).date_naive();
+    let tz = Zone::parse(q.timezone.as_deref().unwrap_or("UTC")).context("invalid IANA timezone")?;
+    let today = tz.local(Utc::now()).context("invalid IANA timezone")?.date();
     let start = q
         .start
         .as_deref()
-        .map(|v| boundary(v, tz))
+        .map(|v| boundary(v, &tz))
         .transpose()?
-        .unwrap_or(boundary(&(today - chrono::Duration::days(29)).to_string(), tz)?);
+        .unwrap_or(boundary(&(today - chrono::Duration::days(29)).to_string(), &tz)?);
     let end = q
         .end
         .as_deref()
-        .map(|v| boundary(v, tz))
+        .map(|v| boundary(v, &tz))
         .transpose()?
-        .unwrap_or(boundary(&(today + chrono::Duration::days(1)).to_string(), tz)?);
+        .unwrap_or(boundary(&(today + chrono::Duration::days(1)).to_string(), &tz)?);
     if end <= start || end.saturating_sub(start) > MAX_QUERY_DAYS * 86_400_000 {
         bail!("range must be positive and no longer than 3660 days");
     }
@@ -1105,7 +1187,7 @@ fn range(q: &Query) -> Result<Range> {
     if q.stack.as_deref().is_some_and(|s| !matches!(s, "provider" | "model")) {
         bail!("unsupported stack");
     }
-    for s in [&q.provider, &q.model, &q.account, &q.client, &q.source].into_iter().flatten() {
+    for s in [&q.provider, &q.model, &q.account, &q.client, &q.entrypoint, &q.source].into_iter().flatten() {
         super::types::valid_label(s).map_err(|e| anyhow!(e))?;
     }
     Ok(Range { start, end, tz })
@@ -1125,6 +1207,42 @@ fn combined(where_sql: &str) -> String {
         "{where_sql} AND (o.source='proxy' OR NOT EXISTS(SELECT 1 FROM usage_entries p INDEXED BY usage_entries_association WHERE p.association_key=o.association_key AND p.source='proxy'))"
     )
 }
+/// Labels belong to one reader's SQLite snapshot. Cache missing collectors too,
+/// but retain nothing between requests so enrollment and renames stay visible.
+#[derive(Default)]
+struct CollectorLabels {
+    table_exists: Option<bool>,
+    labels: HashMap<String, Option<String>>,
+}
+impl CollectorLabels {
+    fn get(&mut self, conn: &Connection, origin: &str) -> Result<Option<&str>> {
+        let Some(id) = origin.strip_prefix("collector:") else { return Ok(None) };
+        let exists = match self.table_exists {
+            Some(exists) => exists,
+            None => {
+                let exists = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='usage_collectors')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                self.table_exists = Some(exists);
+                exists
+            }
+        };
+        if !exists {
+            return Ok(None);
+        }
+        if !self.labels.contains_key(id) {
+            let label =
+                conn.query_row("SELECT label FROM usage_collectors WHERE id=?1", [id], |r| r.get(0)).optional()?;
+            self.labels.insert(id.into(), label);
+        }
+        Ok(self.labels.get(id).and_then(Option::as_deref))
+    }
+}
+
+// The previous implementation remains an independent test/reference oracle.
+#[cfg(test)]
 fn collector_label(conn: &Connection, origin: &str) -> Result<Option<String>> {
     let Some(id) = origin.strip_prefix("collector:") else { return Ok(None) };
     let exists: bool = conn.query_row(
@@ -1151,6 +1269,13 @@ fn filter(q: &Query, r: &Range, alias: &str) -> (String, Vec<SqlValue>) {
             sql.push_str(&format!(" AND {}=?", dimension(column, alias)));
             values.push(value.clone().into());
         }
+    }
+    // Entries and observations share the observation id the label is kept under.
+    if let Some(entrypoint) = &q.entrypoint {
+        sql.push_str(&format!(
+            " AND EXISTS(SELECT 1 FROM usage_entrypoints x WHERE x.id={alias}.id AND x.entrypoint=?)"
+        ));
+        values.push(entrypoint.clone().into());
     }
     (sql, values)
 }
@@ -1201,15 +1326,17 @@ fn details(conn: &mut Connection, q: &Query) -> Result<Value> {
         [],
         |r| r.get(0),
     )?;
+    let mut decoder = codec::Decoder::new(conn);
+    let mut collector_labels = CollectorLabels::default();
     for row in rows {
         read::check()?;
         let (id, payload, cost, basis, snapshot, key, ingested, suppressed, association) = row?;
-        let mut value: Value = serde_json::from_str(&codec::decode(conn, (&payload).into())?)?;
+        let mut value: Value = serde_json::from_str(&decoder.decode((&payload).into())?)?;
         value["id"] = json!(id);
         value["ingested_at_ms"] = json!(ingested);
         value["estimated_cost_nanos"] = json!(cost);
         value["pricing_basis"] = json!(basis);
-        value["pricing_snapshot"] = serde_json::from_str(&codec::decode(conn, (&snapshot).into())?)?;
+        value["pricing_snapshot"] = serde_json::from_str(&decoder.decode((&snapshot).into())?)?;
         if has_revisions {
             let mut revisions = conn.prepare_cached("SELECT changed_at_ms,reason,previous_cost_nanos,previous_catalogue_version,previous_snapshot,catalogue_version,cost_nanos FROM usage_price_revisions WHERE observation_id=?1 ORDER BY id")?;
             let records = revisions
@@ -1236,7 +1363,7 @@ fn details(conn: &mut Connection, q: &Query) -> Result<Value> {
         value["canonical_key"] = json!(key);
         value["superseded"] = json!(suppressed);
         if let Some(origin) = value["origin_id"].as_str()
-            && let Some(label) = collector_label(conn, origin)?
+            && let Some(label) = collector_labels.get(conn, origin)?
         {
             value["collector_label"] = json!(label);
         }
@@ -1271,3 +1398,15 @@ mod tests;
 #[cfg(test)]
 #[path = "store/lifetime_tests.rs"]
 mod lifetime_tests;
+
+#[cfg(test)]
+#[path = "store/labels_tests.rs"]
+mod labels_tests;
+
+#[cfg(test)]
+#[path = "store/entrypoint_tests.rs"]
+mod entrypoint_tests;
+
+#[cfg(test)]
+#[path = "store/entrypoint_bench.rs"]
+mod entrypoint_bench;

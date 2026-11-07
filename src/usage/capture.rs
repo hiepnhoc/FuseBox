@@ -16,6 +16,19 @@ pub const CLIENT_HEADER: &str = "x-fusebox-usage-client";
 pub fn client_id(h: &axum::http::HeaderMap) -> Option<&str> {
     h.get(CLIENT_HEADER).and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
 }
+/// The entrypoint Claude Code names in its User-Agent, the second field in
+/// `claude-cli/2.1.304 (external, sdk-ts, agent-sdk/0.3.276)`: `cli` in a terminal,
+/// `sdk-ts` or `sdk-cli` through the Agent SDK or `claude -p`, or whatever
+/// `CLAUDE_CODE_ENTRYPOINT` says. Anything that doesn't look like one is ignored.
+pub fn claude_code_entrypoint(h: &axum::http::HeaderMap) -> Option<String> {
+    let agent = h.get(axum::http::header::USER_AGENT)?.to_str().ok()?;
+    let (_, details) = agent.strip_prefix("claude-cli/")?.split_once(" (")?;
+    let entrypoint = details.split([',', ')']).nth(1)?.trim();
+    (!entrypoint.is_empty()
+        && entrypoint.len() <= 64
+        && entrypoint.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+    .then(|| entrypoint.to_ascii_lowercase())
+}
 struct Captured {
     observation: Observation,
     failure: Option<crate::diagnostics::Failure>,
@@ -97,7 +110,10 @@ pub struct RequestUsage {
     store: Option<Store>,
     logical_id: String,
     requested_model: Option<String>,
+    requested_speed: Option<u64>,
     client: Option<String>,
+    /// The Claude Code entrypoint from the User-Agent, for Claude attempts.
+    entrypoint: Option<String>,
     session: Option<String>,
     current: Option<Capture>,
     clients: Option<crate::policy::Clients>,
@@ -113,7 +129,9 @@ impl RequestUsage {
             store: self.store.clone(),
             logical_id: self.logical_id.clone(),
             requested_model: self.requested_model.clone(),
+            requested_speed: self.requested_speed,
             client: self.client.clone(),
+            entrypoint: self.entrypoint.clone(),
             session: self.session.clone(),
             current: None,
             clients: self.clients.clone(),
@@ -126,7 +144,9 @@ impl RequestUsage {
             store,
             logical_id: uuid::Uuid::new_v4().to_string(),
             requested_model: safe(model),
+            requested_speed: None,
             client: None,
+            entrypoint: None,
             session: None,
             current: None,
             clients: None,
@@ -137,8 +157,15 @@ impl RequestUsage {
     pub fn program(&mut self, name: Option<&'static str>) {
         self.program = name;
     }
+    /// Capture before request translation or control downgrades. Never overwrite
+    /// the provider-returned tier when pricing the requested T3 speed.
+    pub fn requested_speed(&mut self, body: &Value) {
+        let tier = body["service_tier"].as_str().or_else(|| body["speed"].as_str());
+        self.requested_speed = Some(super::types::Speed::from_tier(tier) as u64);
+    }
     pub fn client(&mut self, h: &axum::http::HeaderMap) {
         self.client = client_id(h).and_then(safe);
+        self.entrypoint = claude_code_entrypoint(h);
         if let Some(id) = h.get(REQUEST_HEADER).and_then(|v| v.to_str().ok()).and_then(safe) {
             self.logical_id = id;
         }
@@ -161,9 +188,15 @@ impl RequestUsage {
         let mut o = Observation::new("proxy", id.clone(), provider, chrono::Utc::now().timestamp_millis());
         o.parser_version = "proxy-native-v1".into();
         o.requested_model = self.requested_model.clone();
+        if let Some(speed) = self.requested_speed {
+            o.numeric_metadata.insert("requested_speed".into(), speed);
+        }
         o.logical_request_id = Some(self.logical_id.clone());
         o.attempt_id = Some(id);
         o.client_id = self.client.clone();
+        if provider == "anthropic" {
+            o.entrypoint = self.entrypoint.clone();
+        }
         o.session_id = self.session.clone();
         o.account_id = Some(acct.id.clone());
         o.auth_type = Some(if acct.is_oauth() { "subscription" } else { "api_key" }.into());
@@ -177,9 +210,15 @@ impl RequestUsage {
         status: Option<u16>,
         fallback: Option<&Usage>,
         logical_final: bool,
-    ) -> Option<Observation> {
+    ) -> Option<Finished<'_>> {
         let c = self.current.take()?;
-        let o = c.snapshot(status, fallback, logical_final);
+        // The last holder of the capture takes its observation; while a stream still
+        // holds it, this takes a copy, as it always did.
+        let observation = match Arc::try_unwrap(c.0) {
+            Ok(captured) => captured.into_inner().observation,
+            Err(shared) => shared.lock().observation.clone(),
+        };
+        let o = finalized(observation, status, fallback, logical_final);
         // Register before enqueueing: reconciliation must never see a database row
         // whose in-memory completion has not been registered yet.
         if let Some(clients) = &self.clients {
@@ -199,10 +238,31 @@ impl RequestUsage {
                 }
             }
         }
-        if let Some(store) = &self.store {
-            store.enqueue(o.clone());
+        // Queued once the caller has read it, still after the registration above.
+        Some(Finished { observation: Some(o), store: self.store.as_ref() })
+    }
+}
+
+/// A finished attempt's observation, for the caller to read. It goes onto the store's
+/// queue when dropped, so it is never copied.
+pub struct Finished<'a> {
+    observation: Option<Observation>,
+    store: Option<&'a Store>,
+}
+
+impl std::ops::Deref for Finished<'_> {
+    type Target = Observation;
+
+    fn deref(&self) -> &Observation {
+        self.observation.as_ref().expect("taken only when dropped")
+    }
+}
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        if let (Some(store), Some(observation)) = (self.store, self.observation.take()) {
+            store.enqueue(observation);
         }
-        Some(o)
     }
 }
 
@@ -247,8 +307,48 @@ fn assign(dst: &mut Option<u64>, src: Option<u64>) {
     }
 }
 
+/// Server-tool calls (web search and fetch, code execution) are billed per
+/// call or by time, never in tokens, so their counts ride in numeric
+/// metadata. Claude reports them in `usage.server_tool_use`; Responses has
+/// no count, so `web_search_call` output items are counted: a whole
+/// response's `output` array is authoritative, and while streaming each
+/// item's `output_item.done` stands in until the final response replaces it.
+fn observe_server_tools(o: &mut Observation, v: &Value) {
+    // Usage rides at the top (a Claude delta), in `message` (Claude's
+    // message_start) or in `response` (a whole Responses answer).
+    let stu = [&v["usage"], &v["message"]["usage"], &v["response"]["usage"]]
+        .into_iter()
+        .map(|usage| &usage["server_tool_use"])
+        .find(|stu| stu.is_object())
+        .unwrap_or(&Value::Null);
+    if stu.is_object() {
+        for (field, key) in [
+            ("web_search_requests", "web_search_requests"),
+            ("web_fetch_requests", "web_fetch_requests"),
+            ("code_execution_requests", "code_execution_requests"),
+        ] {
+            if let Some(n) = stu.get(field).and_then(number) {
+                o.numeric_metadata.insert(key.into(), n);
+            }
+        }
+    }
+    let response = if v["response"].is_object() { &v["response"] } else { v };
+    if let Some(output) = response["output"].as_array() {
+        let searches = output.iter().filter(|item| item["type"].as_str() == Some("web_search_call")).count();
+        if searches > 0 || v["type"].as_str() == Some("response.completed") {
+            o.numeric_metadata.insert("web_search_requests".into(), searches as u64);
+        }
+    } else if v["type"].as_str() == Some("response.output_item.done")
+        && v["item"]["type"].as_str() == Some("web_search_call")
+    {
+        let n = o.numeric_metadata.entry("web_search_requests".into()).or_insert(0);
+        *n = n.saturating_add(1);
+    }
+}
+
 /// Usage snapshots replace reported fields; repeated final snapshots never add.
 pub fn observe(o: &mut Observation, v: &Value) {
+    observe_server_tools(o, v);
     let mut v = v;
     if v["response"].is_object() {
         v = &v["response"];
@@ -394,15 +494,19 @@ pub fn observe(o: &mut Observation, v: &Value) {
                 .or_else(|| d.get("cache_creation_tokens"))
                 .or_else(|| u.get("cache_creation_input_tokens"));
             // OpenAI omits writes when none were reported (including older
-            // models). An explicitly null/invalid value remains unknown, as do
-            // omitted categories from an arbitrary compatible provider, except that
-            // a compatible provider reporting cache reads in the Chat Completions
-            // shape has no field for writes at all: there, no writes were reported.
+            // models). Meta never reports writes and prices none (its rate card
+            // has cache reads only), so its omission is zero too. An explicitly
+            // null/invalid value remains unknown, as do omitted categories from
+            // an arbitrary compatible provider, except that a compatible provider
+            // reporting cache reads in the Chat Completions shape has no field for
+            // writes at all: there, no writes were reported.
             if let (Some(canonical), Some(alias)) = (d.get("cache_write_tokens"), d.get("cache_creation_tokens")) {
                 invalid |= number(canonical) != number(alias);
             }
             let lifetime_details = d.get("cache_write_tokens_details");
             let writes_omitted = o.provider == "openai" || (o.provider == "openai-compat" && t.cache_read.is_some());
+            let writes_omitted = matches!(o.provider.as_str(), "openai" | "meta")
+                || (o.provider == "openai-compat" && t.cache_read.is_some());
             t.cache_write = write.map(number).unwrap_or_else(|| {
                 (writes_omitted && lifetime_details.is_none()).then_some(0).filter(|_| input.is_some())
             });
@@ -600,6 +704,46 @@ mod tests {
         assert_eq!(o.actual_model.as_deref(), Some("actual"));
     }
     #[test]
+    fn server_tool_calls_are_counted_from_claude_usage_and_responses_items() {
+        // Claude: counts ride in usage.server_tool_use (message, then a delta
+        // snapshot replaces rather than adds).
+        let mut o = Observation::new("proxy", "id".into(), "anthropic", chrono::Utc::now().timestamp_millis());
+        observe(
+            &mut o,
+            &json!({"message":{"usage":{"input_tokens":100,"output_tokens":1,"server_tool_use":{"web_search_requests":1}}}}),
+        );
+        assert_eq!(o.numeric_metadata["web_search_requests"], 1, "message_start's own count is kept");
+        observe(
+            &mut o,
+            &json!({"usage":{"output_tokens":50,"server_tool_use":{"web_search_requests":3,"web_fetch_requests":2,"code_execution_requests":1}}}),
+        );
+        assert_eq!(o.numeric_metadata["web_search_requests"], 3);
+        assert_eq!(o.numeric_metadata["web_fetch_requests"], 2);
+        assert_eq!(o.numeric_metadata["code_execution_requests"], 1);
+        assert!(o.validate().is_ok());
+
+        // Responses streaming: each search item's done counts once, and the
+        // completed response's output array is the authoritative total.
+        let mut o = Observation::new("proxy", "id".into(), "openai", chrono::Utc::now().timestamp_millis());
+        observe(&mut o, &json!({"type":"response.output_item.added","item":{"type":"web_search_call","id":"ws_1"}}));
+        assert!(!o.numeric_metadata.contains_key("web_search_requests"), "added alone never counts");
+        observe(&mut o, &json!({"type":"response.output_item.done","item":{"type":"web_search_call","id":"ws_1"}}));
+        observe(&mut o, &json!({"type":"response.output_item.done","item":{"type":"message","id":"m_1"}}));
+        assert_eq!(o.numeric_metadata["web_search_requests"], 1);
+        observe(
+            &mut o,
+            &json!({"type":"response.completed","response":{"output":[{"type":"web_search_call","id":"ws_1"},{"type":"web_search_call","id":"ws_2"}]}}),
+        );
+        assert_eq!(o.numeric_metadata["web_search_requests"], 2);
+        assert!(o.validate().is_ok());
+
+        // A non-streamed response counts its output items directly.
+        let mut o = Observation::new("proxy", "id".into(), "openai", chrono::Utc::now().timestamp_millis());
+        observe(&mut o, &json!({"output":[{"type":"web_search_call"}]}));
+        assert_eq!(o.numeric_metadata["web_search_requests"], 1);
+    }
+
+    #[test]
     fn claude_delta_does_not_erase_input() {
         let mut o = Observation::new("proxy", "id".into(), "anthropic", chrono::Utc::now().timestamp_millis());
         observe(
@@ -666,6 +810,26 @@ mod tests {
             assert_eq!(o.tokens.input, None);
             assert_eq!(o.completeness, "partial");
         }
+    }
+    #[test]
+    fn meta_usage_without_cache_writes_is_complete() {
+        // A Muse Code response's usage as Meta reports it: cached reads, no writes.
+        let mut o = Observation::new("proxy", "id".into(), "meta", chrono::Utc::now().timestamp_millis());
+        observe(
+            &mut o,
+            &json!({"usage":{"input_tokens":18453,"input_tokens_details":{"cached_tokens":15217},"output_tokens":350,
+                "output_tokens_details":{"reasoning_tokens":174},"total_tokens":18803}}),
+        );
+        assert_eq!((o.tokens.input, o.tokens.cache_read, o.tokens.cache_write), (Some(3236), Some(15217), Some(0)));
+        assert_eq!((o.tokens.output, o.tokens.reasoning), (Some(350), Some(174)));
+        assert_eq!(o.completeness, "complete");
+        // Only a provider known to omit zero writes gets them; others stay unknown.
+        let mut o = Observation::new("proxy", "id".into(), "xai", chrono::Utc::now().timestamp_millis());
+        observe(
+            &mut o,
+            &json!({"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":20},"output_tokens":40}}),
+        );
+        assert_eq!((o.tokens.input, o.tokens.cache_write, o.completeness.as_str()), (None, None, "partial"));
     }
     #[test]
     fn inclusive_top_level_cache_writes_and_partial_snapshots_keep_categories() {

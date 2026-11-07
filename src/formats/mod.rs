@@ -13,6 +13,8 @@ pub mod responses;
 mod cache_translation_tests;
 #[cfg(test)]
 mod efficiency_tests;
+#[cfg(test)]
+mod props;
 
 use std::borrow::Cow;
 
@@ -30,8 +32,12 @@ pub struct TranslationConfig {
 
 /// Restrict translated OpenAI controls to a verified backend. Native requests
 /// remain under the caller's control. Never invent a tier or lower an effort.
+/// Translated Claude requests also lose a prefill that their model rejects.
 pub fn generation_controls(body: &mut Value, wire: Format, openai: bool, allow_tier: bool) -> Vec<&'static str> {
     let mut dropped = Vec::new();
+    if wire == Format::Claude && claude::drop_rejected_prefill(body) {
+        dropped.push("prefill_unsupported");
+    }
     if !openai {
         let removed = if wire == Format::Responses {
             body.get_mut("text").and_then(Value::as_object_mut).and_then(|t| t.remove("verbosity"))
@@ -120,8 +126,10 @@ pub fn preserve_cache_hints(
         return Err("Prompt cache prewarming is only supported by the Responses API".into());
     }
     if let Err(reason) = carry_cache_hints(source, target, original, translated) {
-        // Every attempt of every such request would log this; once per reason is enough.
-        if crate::diagnostics::warn_once(&format!("cache:{reason}"), std::time::Duration::from_secs(600)) {
+        // Every attempt of every such request would log this; once per reason is
+        // enough. An inspection logs nothing.
+        if crate::upstream::is_inspecting() {
+        } else if crate::diagnostics::warn_once(&format!("cache:{reason}"), std::time::Duration::from_secs(600)) {
             tracing::warn!(
                 "dropping explicit prompt cache hints: {reason} (repeats are logged at debug for ten minutes)"
             );
@@ -415,7 +423,42 @@ pub(crate) fn alternating_messages(messages: &[Message]) -> Cow<'_, [Message]> {
     }
 }
 
-pub(crate) fn write_openai_cache_lifetimes(details: &mut Value, usage: &Usage) {
+/// Translation treats absent counts as zero; durable billing capture separately
+/// preserves unknown and partial counts. OpenAI totals include cached input.
+pub(crate) fn openai_usage(u: &Value, wire: Format) -> Option<Usage> {
+    if !u.is_object() {
+        return None;
+    }
+    let (input, details, output, output_details) = match wire {
+        Format::Chat => ("prompt_tokens", "prompt_tokens_details", "completion_tokens", "completion_tokens_details"),
+        Format::Responses => ("input_tokens", "input_tokens_details", "output_tokens", "output_tokens_details"),
+        _ => return None,
+    };
+    let details = &u[details];
+    let cached = details["cached_tokens"].as_u64().unwrap_or(0);
+    let write = details["cache_write_tokens"]
+        .as_u64()
+        .or_else(|| details["cache_creation_tokens"].as_u64())
+        .or_else(|| u["cache_creation_input_tokens"].as_u64())
+        .unwrap_or(0);
+    Some(Usage {
+        input: u[input].as_u64().unwrap_or(0).saturating_sub(cached).saturating_sub(write),
+        cache_read: cached,
+        output: u[output].as_u64().unwrap_or(0),
+        reasoning: u[output_details]["reasoning_tokens"].as_u64().unwrap_or(0),
+        cache_write: write,
+        write_30m: details["cache_write_tokens_details"]["ttl_30m_tokens"].as_u64(),
+        write_12h: details["cache_write_tokens_details"]["ttl_12h_tokens"].as_u64(),
+        credits: None,
+    })
+}
+
+pub(crate) fn write_openai_cache_details(details: &mut Value, usage: &Usage) {
+    if usage.cache_write > 0 || usage.write_30m.is_some() || usage.write_12h.is_some() {
+        details["cache_write_tokens"] = usage.cache_write.into();
+        // The legacy spelling is an alias, not an additional amount.
+        details["cache_creation_tokens"] = usage.cache_write.into();
+    }
     for (field, tokens) in [("ttl_30m_tokens", usage.write_30m), ("ttl_12h_tokens", usage.write_12h)] {
         if let Some(tokens) = tokens {
             details["cache_write_tokens_details"][field] = tokens.into();
@@ -475,6 +518,22 @@ pub fn error_body(format: Format, status: u16, message: &str) -> Value {
             "error": { "message": message, "type": openai_error_type(status), "code": status }
         }),
     }
+}
+
+/// An upstream's rejection, translated into the client's dialect. Claude says a prompt
+/// overflowed its context only in words ("prompt is too long: …"); OpenAI clients look
+/// for the `context_length_exceeded` code. Every other body is `error_body`'s.
+pub fn translated_error_body(format: Format, upstream: Format, status: u16, message: &str) -> Value {
+    let mut body = error_body(format, status, message);
+    let prefix = "prompt is too long";
+    if matches!(format, Format::Chat | Format::Responses)
+        && upstream == Format::Claude
+        && status == 400
+        && message.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    {
+        body["error"]["code"] = "context_length_exceeded".into();
+    }
+    body
 }
 
 fn claude_error_type(status: u16) -> &'static str {
@@ -920,5 +979,40 @@ mod tests {
         assert_eq!(m, "claude-opus-4-1");
         assert_eq!(r.unwrap().budget, Some(8000));
         assert!(crate::ir::split_model_suffix("plain").1.is_none());
+    }
+
+    #[test]
+    fn only_claude_prompt_overflows_name_context_length_exceeded_for_openai_clients() {
+        let long = "Prompt is too long: 210000 tokens > 200000 maximum";
+        for format in [Format::Chat, Format::Responses] {
+            let body = translated_error_body(format, Format::Claude, 400, long);
+            assert_eq!(body["error"]["code"], "context_length_exceeded", "{format:?}");
+            assert_eq!(body["error"]["message"], long);
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(
+                translated_error_body(format, Format::Claude, 400, "prompt is too long")["error"]["code"],
+                "context_length_exceeded"
+            );
+        }
+        // Anything else keeps error_body's numeric code, and other dialects keep their own shape.
+        for (client, upstream, status, message) in [
+            (Format::Chat, Format::Claude, 400, "messages: text content blocks must be non-empty"),
+            (Format::Responses, Format::Claude, 413, long),
+            (Format::Responses, Format::Claude, 429, long),
+            (Format::Responses, Format::Gemini, 400, long),
+            (Format::Chat, Format::Responses, 400, long),
+            (Format::Responses, Format::Claude, 400, "the prompt is too long"),
+            (Format::Responses, Format::Claude, 400, "prompt is too"),
+            (Format::Responses, Format::Claude, 400, "prompt is too lon\u{f6}g"),
+            (Format::Gemini, Format::Claude, 400, long),
+            (Format::Claude, Format::Responses, 400, long),
+        ] {
+            assert_eq!(
+                translated_error_body(client, upstream, status, message),
+                error_body(client, status, message),
+                "{client:?} {upstream:?} {status} {message}"
+            );
+        }
+        assert_eq!(error_body(Format::Responses, 400, long)["error"]["code"], 400);
     }
 }

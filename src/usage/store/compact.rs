@@ -185,12 +185,14 @@ pub(super) fn compress_step(conn: &mut Connection, cursor: &mut i64, limit: i64)
         "UPDATE usage_observations SET payload=?2,snapshot_json=?3,
            pricing_partial=COALESCE(pricing_partial,json_extract(?4,'$.partial')) WHERE id=?1",
     )?;
+    let mut decoder = codec::Decoder::new(&tx);
     for (id, payload, snapshot) in &rows {
-        let payload = codec::decode(&tx, payload.into())?;
-        let snapshot = codec::decode(&tx, snapshot.into())?;
+        let payload = decoder.decode(payload.into())?;
+        let snapshot = decoder.decode(snapshot.into())?;
         update.execute(params![id, documents.store(&payload)?, documents.store(&snapshot)?, snapshot])?;
         *cursor = *id;
     }
+    drop(decoder);
     drop(update);
     if rows.is_empty() {
         // Caught up: everything up to the newest row is compressed.
@@ -300,6 +302,7 @@ pub fn compact(path: &Path) -> Result<Value> {
     ensure!(path.is_file(), "there is no usage database at {}", path.display());
     let _lock = lock(path, true)?;
     let mut conn = Connection::open(path)?;
+    codec::register(&conn)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     migrate(&mut conn)?;
     let before = file_bytes(path);
@@ -330,6 +333,7 @@ pub fn downgrade(path: &Path) -> Result<Value> {
     ensure!(path.is_file(), "there is no usage database at {}", path.display());
     let _lock = lock(path, true)?;
     let mut conn = Connection::open(path)?;
+    codec::register(&conn)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     ensure!(version == VERSION, "the usage database is at schema {version}; downgrade starts from {VERSION}");
@@ -362,15 +366,17 @@ pub fn downgrade(path: &Path) -> Result<Value> {
         if rows.is_empty() {
             break;
         }
+        let mut decoder = codec::Decoder::new(&tx);
         for (id, payload, snapshot) in &rows {
-            let payload = codec::decode(&tx, payload.into())?;
-            let snapshot = codec::decode(&tx, snapshot.into())?;
+            let payload = decoder.decode(payload.into())?;
+            let snapshot = decoder.decode(snapshot.into())?;
             tx.execute(
                 "UPDATE usage_observations SET payload=?2,snapshot_json=?3 WHERE id=?1",
                 params![id, payload, snapshot],
             )?;
         }
         decompressed += rows.len();
+        drop(decoder);
         tx.commit()?;
     }
     let tx = conn.transaction()?;
@@ -378,6 +384,7 @@ pub fn downgrade(path: &Path) -> Result<Value> {
     // audit, and omit rate combinations their calculator cannot represent.
     let catalogue: String = tx.query_row("SELECT value FROM usage_meta WHERE key='catalogue'", [], |r| r.get(0))?;
     let mut legacy: Value = serde_json::from_str(&catalogue)?;
+    legacy.as_object_mut().unwrap().remove("calculation");
     let rates = legacy["rates"].as_array_mut().ok_or_else(|| anyhow!("invalid saved catalogue"))?;
     let before_rates = rates.len();
     rates.retain(|r| {
@@ -400,14 +407,18 @@ pub fn downgrade(path: &Path) -> Result<Value> {
     }
     tx.execute("INSERT OR REPLACE INTO usage_meta(key,value) VALUES('catalogue_before_downgrade',?1)", [&catalogue])?;
     tx.execute("UPDATE usage_meta SET value=?1 WHERE key='catalogue'", [serde_json::to_string(&legacy)?])?;
-    for trigger in rollup::TRIGGERS {
+    for trigger in rollup::TRIGGERS.into_iter().chain(rollup::ENTRYPOINT_TRIGGERS) {
         tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger};"))?;
     }
+    client_totals::remove(&tx)?;
     tx.execute_batch(&format!(
-        "DROP TABLE usage_rollup;
+        "DROP TABLE IF EXISTS usage_entrypoint_rollup;
+         DROP TABLE IF EXISTS usage_entrypoints;
+         DROP TABLE usage_rollup;
          DROP TABLE usage_facets;
          DROP TABLE usage_dictionaries;
          DROP INDEX usage_entries_imported;
+         DROP INDEX IF EXISTS usage_entries_unpriced_time;
          DELETE FROM usage_meta WHERE key IN ('database_id','active_dictionary','compact_cursor');
          ALTER TABLE usage_observations DROP COLUMN pricing_partial;
          ALTER TABLE usage_observations DROP COLUMN write_30m;

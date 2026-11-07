@@ -39,6 +39,9 @@ impl Operation {
 #[derive(Default, Serialize, Deserialize)]
 pub struct Journal {
     pub operations: BTreeMap<String, Operation>,
+    /// Per subscription, not credential file: duplicate files share receipt history.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) observations: BTreeMap<String, super::notices::Observation>,
 }
 impl Journal {
     pub fn unresolved(&self) -> Option<&Operation> {
@@ -183,7 +186,11 @@ pub fn last_operation(root: &Path, provider: crate::accounts::Provider, account:
         }
         let file = File::open(path)?;
         ensure!(file.metadata()?.len() <= 16 << 20, "Reset journal too large");
-        let journal: Journal = serde_json::from_reader(file.take((16 << 20) + 1))?;
+        // Whole, then parsed: the only reader-based parse in the binary costs a
+        // second copy of serde_json's deserializers.
+        let mut bytes = Vec::new();
+        file.take((16 << 20) + 1).read_to_end(&mut bytes)?;
+        let journal: Journal = serde_json::from_slice(&bytes)?;
         for operation in journal.operations.values().filter(|o| o.account == account && o.provider == provider.as_str())
         {
             if latest.as_ref().is_none_or(|old| {

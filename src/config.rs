@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_yaml::Value as Yaml;
+use serde_json::Value as Yaml;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default)]
@@ -81,6 +81,13 @@ pub struct Config {
     /// Which faults send a push notification to the devices that turned them on.
     #[serde(skip_serializing_if = "Notifications::is_default")]
     pub notifications: Notifications,
+    /// Native push for the Fusebox iPhone app, through Apple's push service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apns: Option<Apns>,
+    /// The push relay iPhone apps without `apns` get their notifications through;
+    /// empty turns it off.
+    #[serde(skip_serializing_if = "is_default_push_relay")]
+    pub push_relay: String,
     /// Only route unprefixed model names to accounts without a `prefix`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub force_model_prefix: bool,
@@ -198,7 +205,7 @@ impl<'de> Deserialize<'de> for Routing {
         let v = Yaml::deserialize(d)?;
         let s = match &v {
             Yaml::String(s) => s.as_str(),
-            Yaml::Mapping(m) => m.get("strategy").and_then(Yaml::as_str).unwrap_or_default(),
+            Yaml::Object(m) => m.get("strategy").and_then(Yaml::as_str).unwrap_or_default(),
             _ => "",
         };
         Ok(match s.trim().to_ascii_lowercase().as_str() {
@@ -235,6 +242,12 @@ pub struct NamedClient {
     /// Model patterns this client may use (`*` wildcards); empty allows every model.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// Rewrite the requested model before routing: pattern (`*` wildcards,
+    /// matched case-insensitively on the suffix-stripped base model) to the
+    /// model or group to serve instead, which may carry its own reasoning
+    /// suffix. The `models` allowlist is checked against the mapped model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_map: BTreeMap<String, String>,
     /// User-Agent patterns its requests must match (`claude-cli/*`); empty allows any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub user_agents: Vec<String>,
@@ -282,6 +295,13 @@ pub struct Notifications {
     /// A named client's key used from an address it wasn't used from before, or refused
     /// at one its address list doesn't allow.
     pub client_new_address: bool,
+    /// A new banked reset, one used automatically, needing review, or expired unused.
+    pub banked_resets: bool,
+    /// Two days before a subscription charges again, or ends: ChatGPT's own date, or the
+    /// billing day set on a Claude or Meta account.
+    pub renewals: bool,
+    /// The same reminder a day before; with both on, each date is reminded twice.
+    pub renewals_day_before: bool,
     /// Chat and webhook URLs that get the same notifications (Discord, Slack, Teams,
     /// Telegram, ntfy, or any URL that takes JSON).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -296,6 +316,9 @@ impl Default for Notifications {
             account_used_up: false,
             account_errors: false,
             client_new_address: true,
+            banked_resets: true,
+            renewals: true,
+            renewals_day_before: false,
             webhooks: vec![],
         }
     }
@@ -305,6 +328,27 @@ impl Notifications {
     fn is_default(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// The Apple Push Notification service key that sends to the iPhone app: a token
+/// signing key (`AuthKey_<key-id>.p8`) from the developer account the app is signed with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Apns {
+    pub team_id: String,
+    pub key_id: String,
+    pub key_file: String,
+    /// The app's bundle ID.
+    #[serde(default = "default_apns_topic")]
+    pub topic: String,
+}
+
+fn is_default_push_relay(url: &String) -> bool {
+    url == crate::push::relay::DEFAULT_URL
+}
+
+fn default_apns_topic() -> String {
+    "com.digitalpals.fusebox".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -430,6 +474,8 @@ impl Default for Config {
             log_format: LogFormat::Text,
             tls: Tls::default(),
             notifications: Notifications::default(),
+            apns: None,
+            push_relay: crate::push::relay::DEFAULT_URL.into(),
             force_model_prefix: false,
             oauth_model_alias: BTreeMap::new(),
             oauth_excluded_models: BTreeMap::new(),
@@ -536,8 +582,23 @@ usage:
 #   account-used-up: false     # one account used up its 5-hour or weekly limit
 #   account-errors: false      # account errors and runs of failed requests
 #   client-new-address: true   # a named client's key used from a new address, or refused at one
+#   banked-resets: true        # a new reset, one used automatically, needing review, or expired unused
+#   renewals: true             # two days before a subscription charges again, or ends
+#   renewals-day-before: false # the same a day before
 #   webhooks:                  # the same notifications in chat: Discord, Slack, Teams, Telegram, ntfy or any URL
 #     - https://discord.com/api/webhooks/...
+
+# The same notifications for the Fusebox iPhone app, sent through Apple's push service
+# with a key from the Apple developer account the app is signed with.
+# apns:
+#   team-id: ABCDE12345
+#   key-id: KEY1234567
+#   key-file: /path/to/AuthKey_KEY1234567.p8
+#   topic: com.digitalpals.fusebox   # the app's bundle ID
+#
+# Without apns, the app gets them through the Fusebox push relay, sealed so the relay
+# can't read them. Another relay, or "" to turn it off:
+# push-relay: https://push.whombat.com
 
 # Models released after this Fusebox version, served until it knows them. The dashboard's
 # "Add model" writes here; an entry is removed once Fusebox or the provider lists the model.
@@ -723,13 +784,13 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let mut doc: Yaml = if text.trim().is_empty() {
-            Yaml::Mapping(Default::default())
+            Yaml::Object(Default::default())
         } else {
-            serde_yaml::from_str(text).context("invalid config")?
+            crate::yaml::from_str(text).context("invalid config")?
         };
         let ignored = crate::compat::normalize(&mut doc);
         let explicit = doc.get("auth-dir").is_some_and(|v| !v.is_null());
-        let mut cfg: Config = serde_yaml::from_value(doc).context("invalid config")?;
+        let mut cfg: Config = serde_json::from_value(doc).context("invalid config")?;
         cfg.ignored = ignored;
         cfg.prompt_cache.validate().map_err(anyhow::Error::msg)?;
         cfg.stream_limits.validate().map_err(anyhow::Error::msg)?;
@@ -799,6 +860,7 @@ impl Config {
                 client.models.iter().chain(&client.user_agents).all(|p| !p.trim().is_empty()),
                 "named-clients: {id} has an empty model or user-agent pattern"
             );
+            crate::policy::validate_model_map(client).map_err(|e| anyhow::anyhow!("named-clients: {id}: {e}"))?;
             for address in &client.addresses {
                 anyhow::ensure!(
                     crate::source::Cidr::parse(address).is_some(),
@@ -847,6 +909,17 @@ impl Config {
         );
         for hook in &cfg.notifications.webhooks {
             check_webhook_url(hook).map_err(|e| anyhow::anyhow!("notifications.webhooks: {e}"))?;
+        }
+        if let Some(apns) = &cfg.apns {
+            let id = |s: &str| s.len() == 10 && s.chars().all(|c| c.is_ascii_alphanumeric());
+            anyhow::ensure!(id(&apns.team_id), "apns.team-id: use the 10-character team ID");
+            anyhow::ensure!(id(&apns.key_id), "apns.key-id: use the 10-character key ID");
+            anyhow::ensure!(!apns.key_file.trim().is_empty(), "apns.key-file: name the .p8 key file");
+            anyhow::ensure!(!apns.topic.trim().is_empty(), "apns.topic: name the app's bundle ID");
+        }
+        if !cfg.push_relay.is_empty() {
+            let url = url::Url::parse(&cfg.push_relay).map_err(|_| anyhow::anyhow!("push-relay: not a URL"))?;
+            anyhow::ensure!(url.scheme() == "https" || url.host_str() == Some("127.0.0.1"), "push-relay: use https");
         }
         for (name, caps) in &cfg.model_capabilities {
             anyhow::ensure!(!name.trim().is_empty(), "model-capabilities: empty model name");
@@ -1000,6 +1073,42 @@ mod tests {
     }
 
     #[test]
+    fn named_client_model_maps_parse_validate_and_round_trip() {
+        let text = "named-clients:\n  - id: agent\n    label: Agent\n    key: fbx_agent\n    model-map:\n      claude-opus-*: claude-sonnet-5-5\n      gpt-6-astra: \"gpt-6-astra-mini(low)\"\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.named_clients[0].model_map.len(), 2);
+        assert_eq!(cfg.named_clients[0].model_map["gpt-6-astra"], "gpt-6-astra-mini(low)");
+        let written = crate::yaml::to_string(&cfg.named_clients[0]).unwrap();
+        assert!(written.contains("model-map:"), "{written}");
+        let back: NamedClient = serde_json::from_value(crate::yaml::from_str(&written).unwrap()).unwrap();
+        assert_eq!(back, cfg.named_clients[0]);
+        // No map, nothing written; a chaining map is refused at load.
+        assert!(!crate::yaml::to_string(&NamedClient::default()).unwrap().contains("model-map"));
+        let chained = text.replace("gpt-6-astra: \"gpt-6-astra-mini(low)\"", "gpt-6-astra: claude-opus-5-5");
+        assert!(format!("{:#}", Config::parse(&chained).unwrap_err()).contains("not mapped again"));
+    }
+
+    #[test]
+    fn apns_settings_are_checked() {
+        let cfg = Config::parse(
+            "apns:\n  team-id: ABCDE12345\n  key-id: KEY1234567\n  key-file: /etc/fusebox/AuthKey_KEY1234567.p8\n",
+        )
+        .unwrap();
+        let apns = cfg.apns.as_ref().unwrap();
+        assert_eq!((apns.team_id.as_str(), apns.topic.as_str()), ("ABCDE12345", "com.digitalpals.fusebox"));
+        assert!(Config::parse("").unwrap().apns.is_none());
+        assert!(!crate::yaml::to_string(&Config::default()).unwrap().contains("apns"), "unset, it isn't written");
+        for (text, problem) in [
+            ("apns: {team-id: ABC, key-id: KEY1234567, key-file: k.p8}", "team-id"),
+            ("apns: {team-id: ABCDE12345, key-id: KEY1234567, key-file: ''}", "key-file"),
+            ("apns: {team-id: ABCDE12345, key-id: KEY1234567, key-file: k.p8, topic: ' '}", "topic"),
+        ] {
+            assert!(format!("{:#}", Config::parse(text).unwrap_err()).contains(problem), "{text}");
+        }
+        assert!(Config::parse("apns: {team-id: ABCDE12345, key-id: KEY1234567, key-file: k.p8, key: x}").is_err());
+    }
+
+    #[test]
     fn source_settings_are_checked() {
         let cfg = Config::parse(
             "trusted-proxies: [127.0.0.1, 10.0.0.0/8, \"::1\"]\nproxy-protocol-port: 8319\nnamed-clients:\n  - id: a\n    label: A\n    key: fbx_a\n    addresses: [10.10.0.0/24, 100.101.7.12]\n",
@@ -1011,6 +1120,16 @@ mod tests {
         let defaults = Config::parse("").unwrap();
         assert_eq!((defaults.trusted_proxies.clone(), defaults.proxy_protocol_port), (None, 0));
         assert!(defaults.notifications.client_new_address, "new-address notifications are on unless turned off");
+        // Settings saved before this event existed turn it on; it can be turned off.
+        let saved = Config::parse(r#"notifications: {"sign-in-expired":true,"account-errors":true}"#).unwrap();
+        assert!(defaults.notifications.banked_resets && saved.notifications.banked_resets);
+        assert!(!Config::parse("notifications:\n  banked-resets: false\n").unwrap().notifications.banked_resets);
+        assert!(defaults.notifications.renewals && saved.notifications.renewals);
+        assert!(!Config::parse("notifications:\n  renewals: false\n").unwrap().notifications.renewals);
+        assert!(!defaults.notifications.renewals_day_before && !saved.notifications.renewals_day_before);
+        assert!(
+            Config::parse("notifications:\n  renewals-day-before: true\n").unwrap().notifications.renewals_day_before
+        );
         for (text, problem) in [
             ("trusted-proxies: [example.com]\n", "trusted-proxies"),
             ("trusted-proxies: [10.0.0.0/40]\n", "trusted-proxies"),

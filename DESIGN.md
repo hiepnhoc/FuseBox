@@ -174,7 +174,8 @@ Flat. Panels are `surface` with a 1px `line` hairline. The only shadow is on flo
 ## Components
 
 - **Segmented quota meter.** 20 segments of 5%, 9px tall (10px in the drawer, 20px on the account page), 2px gap, 180px at most. Lit segments are `meter` below 75% used, `warn` from 75% and `err` from 95%; the thresholds always measure used, even in Remaining mode. Off segments are `line`. To the right: the percentage ("<1%" and ">99%" at the ends), then a live reset countdown such as "↺ 2h 14m" or "↺ 3d 7h" in DM Mono for both 5H and WK. Use at most two units, omit zero suffixes, and show "↺ <1m" below one minute. Reserve 10ch for alignment; the full reset date, local time and timezone appear only in the hover tooltip.
-- **Pace mark.** A 2px `fg-3` tick across a quota meter where usage would be if spread evenly over the window, mirrored in Remaining mode. When the pace so far would use the window up before it resets (at least a quarter of the window gone, 20% used), the reset cell reads "out 1h 40m" in `warn`; the hover says when it runs out and when it resets. A provider's combined weekly row says "Runs out early" in `warn` when its subscriptions together would run out before renewals bring capacity back; the hover says when capacity comes back.
+- **Pace mark.** A 2px `fg-3` tick across a quota meter where usage would be if spread evenly over the window, mirrored in Remaining mode. When the pace so far would use the window up before it resets (at least a quarter of the window gone, 20% used), the reset cell reads "out 1h 40m" in `warn`; the hover says when it runs out and when it resets. A provider's combined weekly row is drawn the same way, with its subscriptions' weighted even pace and the next account's reset.
+- **Combined weekly status.** Beside a provider's combined weekly row, the forecast's verdict: **Expected to last** in `ok`, **Low reserve** in `warn` or **Quota gap expected** in `err`, with an 11px `fg-3` line under it. The bar never shows a forecast.
 - **Reset timeline.** Accounts, above the list, with two or more subscriptions: the next seven days on one hairline with day ticks, each subscription's weekly reset as its 14px logo in a 22px tile (`warn`/`err` border by usage), close resets on up to three lanes. Clicking opens the account.
 - **Review sheet.** Every config save first shows the file's changed lines in a 760px sheet like the palette: removed lines `del-bg` and struck through in `fg-3`, added lines `add-bg` in `fg`, three lines of context, longer runs folded to "⋯ 12 unchanged lines". **Keep editing** and **Save**.
 - **Playground.** Models, **Try a model**: model (with a list of ids and groups) and prompt, the answer streamed into an inset block, then one meta line: account, first token, total, tokens.
@@ -200,6 +201,7 @@ The same panel in daylight, chosen by the system or from the palette (`html[data
 
 - Do keep amber for the fuse only.
 - Do show the time until an account comes back.
+- Do show clock times in the browser's time zone on a 24-hour clock, whatever the locale (`hourCycle: 'h23'`, or `en-GB`); take time input as HH:MM text, since native time pickers can show AM/PM.
 - Do keep one primary (off-white) button per view at most.
 - Do give every control a visible 2px focus ring (`line-hover`) and 44px touch targets on phones.
 - Do set text fields to 16px on touch screens (`pointer: coarse`); iOS zooms into smaller ones, and in an installed app the zoom can stick.

@@ -21,6 +21,8 @@ use journal::{Attempt, Journal, Outcome};
 
 const CHECK_SECONDS: i64 = 300;
 const UNCERTAIN_SECONDS: i64 = 5 * 3600 + 600;
+/// An account without a 5-hour limit is checked hourly, in case one comes back.
+const NOT_NEEDED_SECONDS: i64 = 3600;
 const MAX_BODY: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +78,7 @@ impl Config {
                 && self.model.bytes().all(|c| c.is_ascii_alphanumeric() || b"-._".contains(&c)),
             "Window starter model must be a native Claude model name, without a group, prefix or options"
         );
-        self.timezone.parse::<chrono_tz::Tz>().context("Choose a valid IANA window starter timezone")?;
+        crate::zone::Zone::parse(&self.timezone).context("Choose a valid IANA window starter timezone")?;
         ensure!(
             !self.weekdays.is_empty()
                 && self.weekdays.len() <= 7
@@ -99,12 +101,13 @@ impl Config {
             Mode::Off => false,
             Mode::Always => true,
             Mode::WorkingHours => {
-                let (Ok(tz), Some(start), Some(end)) =
-                    (self.timezone.parse::<chrono_tz::Tz>(), clock(&self.start), clock(&self.end))
-                else {
+                let (Some(local), Some(start), Some(end)) = (
+                    crate::zone::Zone::parse(&self.timezone).ok().and_then(|tz| tz.local(now)),
+                    clock(&self.start),
+                    clock(&self.end),
+                ) else {
                     return false;
                 };
-                let local = now.with_timezone(&tz);
                 let time = local.hour() * 60 + local.minute();
                 let day = local.weekday().number_from_monday();
                 if start < end {
@@ -171,26 +174,22 @@ enum Window {
     Unknown,
     Inactive,
     Active(DateTime<Utc>),
+    /// The account has no 5-hour limit (a verified Ultra account), so nothing to start.
+    Absent,
 }
 
 /// Only explicit provider data proves inactivity. Missing, malformed, and a
 /// zero-percent window with a future reset are never treated as unused windows.
-fn window(value: &Value, now: DateTime<Utc>) -> Window {
-    let Some(w) = value.get("five_hour") else { return Window::Unknown };
-    if w.is_null() {
-        return Window::Inactive;
-    }
-    let Some(used) = w["utilization"].as_f64().filter(|u| u.is_finite() && (0.0..=100.0).contains(u)) else {
-        return Window::Unknown;
-    };
-    match w.get("resets_at") {
-        Some(Value::Null) if used == 0.0 => Window::Inactive,
-        Some(Value::String(s)) => match DateTime::parse_from_rfc3339(s) {
-            Ok(at) if at > now => Window::Active(at.with_timezone(&Utc)),
-            // An old reset alone cannot prove a fresh window has not begun.
-            _ => Window::Unknown,
-        },
-        _ => Window::Unknown,
+/// `ultra`: the account is on Ultra or confirmed without a 5-hour limit, where a bare
+/// null can mean there is no window.
+fn window(value: &Value, now: DateTime<Utc>, ultra: bool) -> Window {
+    use crate::quota::FiveHour;
+    match crate::quota::claude_five_hour(value, now) {
+        FiveHour::Absent => Window::Absent,
+        FiveHour::Idle => Window::Inactive,
+        FiveHour::Null if !ultra => Window::Inactive,
+        FiveHour::Active(at) => Window::Active(at),
+        FiveHour::Null | FiveHour::Unknown => Window::Unknown,
     }
 }
 
@@ -299,6 +298,7 @@ struct Api {
     http: reqwest::Client,
     token: String,
     origin: String,
+    acct: Arc<Account>,
 }
 
 impl Api {
@@ -313,7 +313,7 @@ impl Api {
         let origin = crate::upstream::CLAUDE_API.to_string();
         #[cfg(test)]
         let origin = app.window_starter_test_origin.lock().clone().unwrap_or(origin);
-        Ok(Self { http: app.http.reset_for_account(acct), token, origin })
+        Ok(Self { http: app.http.reset_for_account(acct), token, origin, acct: acct.clone() })
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
@@ -327,6 +327,9 @@ impl Api {
             .send()
             .await
             .map_err(|_| anyhow!("Could not read Claude window status"))?;
+        if path.starts_with("/api/oauth/usage") {
+            crate::quota::usage_answered(&self.acct, response.status(), response.headers());
+        }
         ensure!(response.status().is_success(), "Claude window status unavailable (HTTP {})", response.status());
         json_body(response).await
     }
@@ -344,13 +347,19 @@ impl Api {
 
     async fn usage(&self, app: &App, acct: &Arc<Account>, id: &str) -> Result<Value> {
         let epoch = acct.state.lock().identity_epoch;
+        // The quota poll and banked resets read this endpoint too; after a 429 all wait.
+        crate::quota::usage_gate(acct)?;
         let usage = self.get("/api/oauth/usage").await?;
         ensure!(native_id(acct)? == id && acct.state.lock().identity_epoch == epoch, "Claude account changed");
         // The general quota merger deliberately retains omitted windows. An
-        // explicit null from this endpoint instead means an inactive window.
+        // explicit null from this endpoint instead means an inactive window, but
+        // only where nothing else describes the 5-hour one: a typed session entry
+        // or a confirmed absence speaks for itself, and an unclear null stays unknown.
         let mut normalized = usage.clone();
+        let idle = window(&usage, Utc::now(), acct.state.lock().quota.may_lack_five_hour()) == Window::Inactive;
         for key in ["five_hour", "seven_day"] {
-            if usage.get(key) == Some(&Value::Null) {
+            let typed = key == "five_hour" && usage["limits"].is_array();
+            if usage.get(key) == Some(&Value::Null) && (key == "seven_day" || (idle && !typed)) {
                 normalized[key] = json!({"utilization":0.0,"resets_at":null});
             }
         }
@@ -386,7 +395,11 @@ pub async fn start(app: Arc<App>, acct: Arc<Account>, action: Action, automatic:
             Ok(view)
         }
         Err(e) => {
-            let view = View::new("unavailable", e.to_string(), Utc::now());
+            let mut view = View::new("unavailable", e.to_string(), Utc::now());
+            // A rate-limited usage endpoint: check again once its wait is over.
+            if let Some(until) = acct.state.lock().quota.usage_wait(Utc::now()) {
+                view.next_check_at = view.next_check_at.max(until);
+            }
             store(&app, &id, &view);
             Err(e)
         }
@@ -402,6 +415,8 @@ async fn run(app: &Arc<App>, acct: &Arc<Account>, id: &str, action: Action, auto
     if !action.check_only && busy(app, id, &policy.model, now) {
         return Ok(View::new("skipped", "Real work, a cooldown or a quota operation is already active", now));
     }
+    // Nothing to learn while the usage endpoint asked to wait; skip the profile read too.
+    crate::quota::usage_gate(acct)?;
     let api = Api::new(app, acct).await?;
     let organization = api.identity(id).await?;
     current(app, acct, id, &root, automatic)?;
@@ -413,7 +428,14 @@ async fn run(app: &Arc<App>, acct: &Arc<Account>, id: &str, action: Action, auto
     let foreground = ForegroundGuard::new(app, id);
     let usage = api.usage(app, acct, id).await?;
     let now = Utc::now();
-    let state = window(&usage, now);
+    let ultra = acct.state.lock().quota.may_lack_five_hour();
+    let state = window(&usage, now, ultra);
+    if state == Window::Absent {
+        let mut view =
+            View::new("not_needed", "This account has no five-hour limit, so there is no window to start", now);
+        view.next_check_at = now + chrono::Duration::seconds(NOT_NEEDED_SECONDS);
+        return Ok(view);
+    }
     if let Window::Active(reset) = state {
         if let Some(attempt) = journal.attempt.as_mut()
             && matches!(attempt.outcome, Outcome::Pending | Outcome::Unknown)
@@ -551,7 +573,7 @@ async fn run(app: &Arc<App>, acct: &Arc<Account>, id: &str, action: Action, auto
     // window. Re-read usage, including after an uncertain network completion.
     if current(app, acct, id, &root, false).is_ok()
         && let Ok(usage) = api.usage(app, acct, id).await
-        && let Window::Active(reset) = window(&usage, Utc::now())
+        && let Window::Active(reset) = window(&usage, Utc::now(), ultra)
     {
         let attempt = journal.attempt.as_mut().unwrap();
         attempt.outcome = Outcome::Started;
@@ -576,6 +598,16 @@ fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> DateTime<Utc> {
     now + chrono::Duration::seconds(seconds)
 }
 
+/// Whether the poller checks this account now: at its next check, or sooner when an
+/// account found to have no 5-hour limit reports one again (at most every 5 minutes).
+fn due(st: &crate::accounts::AccountState, now: DateTime<Utc>) -> bool {
+    let Some(v) = &st.window_starter else { return true };
+    v.next_check_at <= now
+        || (v.status == "not_needed"
+            && !st.quota.no_five_hour_limit
+            && v.checked_at + chrono::Duration::seconds(CHECK_SECONDS) <= now)
+}
+
 pub async fn poller(app: Arc<App>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -594,9 +626,7 @@ pub async fn poller(app: Arc<App>) {
             if app.shutdown.is_cancelled() {
                 return;
             }
-            if !policy.selected(&acct)
-                || acct.state.lock().window_starter.as_ref().is_some_and(|v| v.next_check_at > Utc::now())
-            {
+            if !policy.selected(&acct) || !due(&acct.state.lock(), Utc::now()) {
                 continue;
             }
             let action = Action { request_id: uuid::Uuid::new_v4().to_string(), check_only: false };

@@ -64,6 +64,7 @@ impl App {
             &cfg.auth_dir().join(crate::accounts::COOLDOWNS_FILE),
         ));
         pool.restore_attributions(crate::attribution::Saved::load(&cfg.auth_dir().join(crate::attribution::FILE)));
+        crate::quota::Saved::load(&cfg.auth_dir().join(crate::quota::SAVED_FILE)).restore(&pool);
         let (live, _) = broadcast::channel(512);
         let sessions = Arc::new(crate::affinity::Sessions::load(&cfg.auth_dir(), cfg.session_affinity_idle_seconds));
         let push = crate::push::Push::load(&cfg.auth_dir());
@@ -169,8 +170,14 @@ impl App {
     }
 
     pub fn broadcast(&self, kind: &str, data: impl Serialize) {
+        /// `{"type":…,"data":…}`, written straight from `data` instead of through a `Value` tree.
+        #[derive(Serialize)]
+        struct Message<'a, T> {
+            r#type: &'a str,
+            data: T,
+        }
         if self.live.receiver_count() > 0 {
-            let msg = serde_json::json!({ "type": kind, "data": data }).to_string();
+            let msg = serde_json::to_string(&Message { r#type: kind, data }).expect("live messages serialize");
             let _ = self.live.send(msg);
             // Every path that changes the model list (config, sign-ins, discovery)
             // already announces account changes; tell dashboards about models only

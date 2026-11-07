@@ -10,12 +10,16 @@ const policy = { mode: 'off', accounts: [], model: 'claude-haiku-4-5-20251001', 
 function piece(name) {
   const at = app.indexOf(name);
   assert.ok(at >= 0);
-  return app.slice(at, app.indexOf('\n}\n', at) + 2);
+  const end = app.indexOf('\n}\n', at);
+  assert.ok(end > at, `app.js no longer ends ${name}`);
+  return app.slice(at, end + 2);
 }
 function load(extra = {}) {
   const ctx = { S: { accounts: [], config: { values: { 'window-starter': structuredClone(policy) }, errors: {}, secrets: {} } },
     esc, acctLabel: (a) => a.label, when: (s) => s,
     windowOf: (a) => a.quota?.windows?.find((w) => w.name === '5h'),
+    noShortLimit: (a) => !!a.quota?.no_five_hour_limit && !a.quota?.windows?.find((w) => w.name === '5h'),
+    noShortNote: (a) => (ctx.noShortLimit(a) ? ' · no 5h limit' : ''),
     document: { addEventListener() {} }, ...extra };
   vm.createContext(ctx);
   vm.runInContext(config, ctx);
@@ -42,7 +46,9 @@ test('working hours expose timezone, weekdays, times and explicit safe account s
   assert.doesNotMatch(html, /data-id="b"/);
   assert.match(html, /Unavailable account · gone/);
   assert.match(html, /Working hours timezone/);
-  assert.match(html, /type="time"/);
+  assert.doesNotMatch(html, /type="time"/, "browser time pickers can show AM/PM");
+  assert.match(html, /placeholder="09:00"/);
+  assert.match(html, /24-hour clock/);
   assert.equal((html.match(/data-config-act="window-day"/g) || []).length, 7);
   assert.match(html, /data-day="6" aria-pressed="false"/);
   assert.match(html, /No selection means no automatic requests/);
@@ -69,6 +75,31 @@ test('active windows use the provider reset time and unavailable messages are es
   assert.match(run('windowStarterHTML(a)'), /data-act="window-check"/);
   run('a.quota=null');
   assert.match(run('windowStarterHTML(a)'), /&lt;unsafe>/);
+});
+
+test('accounts without a 5-hour limit have no starter; settings say why', () => {
+  const { run } = load();
+  run(`var a={id:'a',window_starter_supported:true,window_starter_selected:true,quota:{no_five_hour_limit:true,windows:[]}}`);
+  assert.equal(run('windowStarterHTML(a)'), '');
+  run(`a.quota=null; a.window_starter={status:'not_needed',message:'No limit here',retry_after:'2099-01-01T00:00:00Z'}`);
+  assert.equal(run('windowStarterHTML(a)'), '');
+  // Still selectable: the flag can clear again, and the selection should survive that.
+  run(`S.accounts = [{id:'a',label:'ultra',window_starter_supported:true,quota:{no_five_hour_limit:true,windows:[]}},{id:'b',label:'max',window_starter_supported:true}];
+    S.config.values['window-starter'].mode='always'; S.config.values['window-starter'].accounts=['a'];`);
+  const html = run('configWindowStarterHTML()');
+  assert.match(html, /data-id="a" checked><span>ultra · no 5h limit</);
+  assert.match(html, /data-id="b" ><span>max</);
+  assert.doesNotMatch(html, /Unavailable account/);
+});
+
+test('a 5-hour limit reported since the last starter check overrides its not_needed result', () => {
+  const { run } = load();
+  run(`var a={id:'a',window_starter_supported:true,window_starter_selected:true,
+    quota:{no_five_hour_limit:false,windows:[{name:'5h',used:0,resets_at:null}]},
+    window_starter:{status:'not_needed',message:'This account has no five-hour limit, so there is no window to start'}}`);
+  const html = run('windowStarterHTML(a)');
+  assert.doesNotMatch(html, /This account has no five-hour limit/);
+  assert.match(html, /data-act="window-start"/);
 });
 
 test('manual requests carry a unique ID and status checks never ask for generation', async () => {

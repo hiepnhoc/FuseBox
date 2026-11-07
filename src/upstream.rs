@@ -15,14 +15,14 @@ pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 pub const OPENAI_API: &str = "https://api.openai.com/v1";
 pub const GEMINI_API: &str = "https://generativelanguage.googleapis.com";
 
-pub const CC_VERSION: &str = "2.1.309";
-pub const CC_USER_AGENT: &str = "claude-cli/2.1.309 (external, cli)";
+pub const CC_VERSION: &str = "2.1.318";
+pub const CC_USER_AGENT: &str = "claude-cli/2.1.318 (external, cli)";
 const CC_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const CC_FINGERPRINT_SALT: &str = "59cf53e54c78";
-pub const CODEX_USER_AGENT: &str = "codex-tui/0.164.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.164.0)";
+pub const CODEX_USER_AGENT: &str = "codex-tui/0.166.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.166.0)";
 pub const CODEX_ORIGINATOR: &str = "codex-tui";
 /// The Codex release `CODEX_USER_AGENT` claims; its model list depends on it.
-pub const CODEX_VERSION: &str = "0.164.0";
+pub const CODEX_VERSION: &str = "0.166.0";
 pub const CODEX_WS_BETA: &str = "responses_websockets=2026-02-06";
 
 pub struct Prepared {
@@ -226,8 +226,58 @@ pub fn residency_requirement(headers: &HeaderMap) -> Result<Option<String>, Stri
     Ok(requirement)
 }
 
+/// Header names a genuine client sent that Fusebox drops are recorded (names
+/// only) as evidence for client-compatibility reviews: a header a new client
+/// release adds would otherwise vanish silently for all production traffic.
+/// Expected drops are not recorded: anything `forwardable` already excludes
+/// (auth, hop-by-hop, forwarding, Fusebox's own), the transport headers
+/// Fusebox sets itself, and names the client's `Connection` header nominated.
+fn note_dropped(provider: Provider, recorded_as: Option<&'static str>, nominated: &HashSet<String>, name: &str) {
+    let Some(recorded_as) = recorded_as else { return };
+    if INSPECTING.with(std::cell::Cell::get) {
+        return;
+    }
+    if nominated.contains(name) || !forwardable(name) || matches!(name, "content-type" | "accept") {
+        return;
+    }
+    if crate::clients::note_dropped_header(recorded_as, name) {
+        tracing::info!(
+            provider = provider.as_str(),
+            header = name,
+            "client header is not forwarded upstream; recorded for the compatibility review"
+        );
+    }
+}
+
+thread_local! {
+    static INSPECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current `prepare` is an inspection's.
+pub(crate) fn is_inspecting() -> bool {
+    INSPECTING.with(std::cell::Cell::get)
+}
+
+/// Runs `f` (a synchronous `prepare`) for an inspection: a request that is never
+/// sent is no evidence of what clients send, so dropped headers aren't recorded.
+pub(crate) fn inspecting<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            INSPECTING.with(|i| i.set(self.0));
+        }
+    }
+    let _reset = Reset(INSPECTING.with(|i| i.replace(true)));
+    f()
+}
+
 fn inbound_headers(provider: Provider, cfg: Option<&Config>, client: &HeaderMap) -> Vec<(String, String)> {
     let nominated = connection_headers(client);
+    let recorded_as = match provider {
+        Provider::Claude if crate::clients::is_claude_code(client) => Some(crate::clients::CLAUDE_CODE),
+        Provider::Codex if crate::clients::is_codex(client) => Some(crate::clients::CODEX),
+        _ => None,
+    };
     let extensions = cfg.and_then(|cfg| cfg.upstream_header_allowlist.get(provider.as_str()));
     client
         .iter()
@@ -253,6 +303,10 @@ fn inbound_headers(provider: Provider, cfg: Option<&Config>, client: &HeaderMap)
                 return Some((name.to_string(), value.to_string()));
             }
             tracing::debug!(provider = provider.as_str(), header = name, "dropping upstream header");
+            // A documented name dropped for its value (not UTF-8) says nothing about the allowlist.
+            if !(documented || extended) {
+                note_dropped(provider, recorded_as, &nominated, name);
+            }
             None
         })
         .collect()
@@ -502,26 +556,27 @@ fn strip_foreign_thinking(body: &mut Value) {
 
 /// JavaScript-compatible 3-char build fingerprint Claude Code puts in its billing header.
 fn cc_fingerprint(message: &str) -> String {
-    let units: Vec<u16> = message.encode_utf16().collect();
-    let sampled: Vec<u16> = [4usize, 7, 20].iter().map(|&i| units.get(i).copied().unwrap_or(b'0' as u16)).collect();
+    // JavaScript indexes UTF-16 code units, including individual surrogates.
+    // Only these three positions matter, regardless of the prompt's length.
+    let mut units = message.encode_utf16();
+    let sampled = [units.nth(4), units.nth(2), units.nth(12)].map(|unit| unit.unwrap_or(b'0' as u16));
     let version = crate::clients::version(crate::clients::CLAUDE_CODE);
     let input = format!("{CC_FINGERPRINT_SALT}{}{version}", String::from_utf16_lossy(&sampled));
     hex::encode(Sha256::digest(input.as_bytes()))[..3].to_string()
 }
 
-fn first_user_text(body: &Value) -> (Option<usize>, String) {
-    let Some(msgs) = body["messages"].as_array() else { return (None, String::new()) };
-    let Some(idx) = msgs.iter().position(|m| m["role"] == "user") else { return (None, String::new()) };
+fn first_user_text(body: &Value) -> (Option<usize>, &str) {
+    let Some(msgs) = body["messages"].as_array() else { return (None, "") };
+    let Some(idx) = msgs.iter().position(|m| m["role"] == "user") else { return (None, "") };
     let text = match &msgs[idx]["content"] {
-        Value::String(s) => s.clone(),
+        Value::String(s) => s.as_str(),
         Value::Array(blocks) => blocks
             .iter()
             .filter(|b| b["type"] == "text")
             .filter_map(|b| b["text"].as_str())
             .find(|t| !t.starts_with("<system-reminder>"))
-            .unwrap_or_default()
-            .to_string(),
-        _ => String::new(),
+            .unwrap_or_default(),
+        _ => "",
     };
     (Some(idx), text)
 }
@@ -531,9 +586,9 @@ fn first_user_text(body: &Value) -> (Option<usize>, String) {
 /// Account/session identity is bound separately for native and cloaked requests alike.
 fn cloak_body(body: &mut Value, count_tokens: bool, cache_defaults: bool) {
     let configured_cache = !cache_defaults || crate::cache::has_claude_controls(body);
-    let original: Vec<Value> = match &body["system"] {
+    let original: Vec<Value> = match body["system"].take() {
         Value::String(s) => vec![json!({"type": "text", "text": s})],
-        Value::Array(blocks) => blocks.clone(),
+        Value::Array(blocks) => blocks,
         _ => vec![],
     };
     let caller: Vec<Value> = original
@@ -556,7 +611,7 @@ fn cloak_body(body: &mut Value, count_tokens: bool, cache_defaults: bool) {
     let billing = format!(
         "x-anthropic-billing-header: cc_version={}.{}; cc_entrypoint=cli;",
         crate::clients::version(crate::clients::CLAUDE_CODE),
-        cc_fingerprint(&text)
+        cc_fingerprint(text)
     );
     body["system"] = json!([
         { "type": "text", "text": billing },
@@ -870,6 +925,7 @@ fn gemini(t: &Target, mut body: Value) -> Prepared {
     if let Some(o) = body.as_object_mut() {
         o.remove("model");
     }
+    crate::formats::gemini::drop_empty_system_parts(&mut body);
     let headers = vec![
         ("x-goog-api-key".into(), token),
         ("content-type".into(), "application/json".into()),
@@ -895,6 +951,7 @@ fn vertex(t: &Target, mut body: Value) -> Prepared {
     if let Some(o) = body.as_object_mut() {
         o.remove("model");
     }
+    crate::formats::gemini::drop_empty_system_parts(&mut body);
     let action = gemini_action(t);
     let mut headers = vec![
         ("content-type".into(), "application/json".into()),
@@ -921,8 +978,10 @@ fn vertex(t: &Target, mut body: Value) -> Prepared {
 
 // ----------------------------------------------------------------- antigravity
 
-fn antigravity(t: &Target, body: Value) -> Prepared {
+fn antigravity(t: &Target, mut body: Value) -> Prepared {
     let (token, _, _, _) = creds(t.acct);
+    // Before wrapping: the envelope moves the instruction under `request`.
+    crate::formats::gemini::drop_empty_system_parts(&mut body);
     let project = crate::antigravity::project(t.acct);
     let base = crate::antigravity::request_base(t.acct);
     let path = if t.stream { "streamGenerateContent?alt=sse" } else { "generateContent" };
@@ -1174,6 +1233,53 @@ mod tests {
 
     fn get_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn dropped_genuine_client_header_names_are_recorded_without_changing_forwarding() {
+        crate::clients::reset();
+        let genuine = request_headers(&[
+            ("user-agent", CC_USER_AGENT),
+            ("anthropic-beta", "some-beta"),
+            ("x-novel-claude-header", "SECRET-VALUE"),
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-fusebox-session", "abc"),
+            ("authorization", "Bearer SECRET"),
+            ("content-type", "application/json"),
+            ("accept", "text/event-stream"),
+        ]);
+        let forwarded = inbound_headers(Provider::Claude, None, &genuine);
+        // Forwarding is exactly what it was: the novel header still drops.
+        assert!(get_header(&forwarded, "x-novel-claude-header").is_none());
+        assert_eq!(get_header(&forwarded, "anthropic-beta"), Some("some-beta"));
+        // Only the novel name is recorded; expected drops are not, and no
+        // value is kept anywhere in the snapshot.
+        let dropped = crate::clients::dropped_headers();
+        assert_eq!(
+            dropped.get(crate::clients::CLAUDE_CODE).map(|v| v.as_slice()),
+            Some(["x-novel-claude-header".to_string()].as_slice())
+        );
+        assert!(!format!("{:?}", crate::clients::snapshot()).contains("SECRET"));
+
+        // The same headers from a client that is not Claude Code record nothing.
+        crate::clients::reset();
+        let stranger = request_headers(&[("user-agent", "curl/8.0"), ("x-novel-claude-header", "v")]);
+        let _ = inbound_headers(Provider::Claude, None, &stranger);
+        assert!(crate::clients::dropped_headers().is_empty());
+        crate::clients::reset();
+    }
+
+    #[test]
+    fn an_inspection_records_no_dropped_header_names() {
+        let genuine = request_headers(&[("user-agent", CC_USER_AGENT), ("x-only-seen-while-inspecting", "v")]);
+        let forwarded = inspecting(|| inbound_headers(Provider::Claude, None, &genuine));
+        assert!(get_header(&forwarded, "x-only-seen-while-inspecting").is_none(), "still dropped");
+        let recorded = crate::clients::dropped_headers();
+        assert!(
+            !recorded.values().flatten().any(|name| name == "x-only-seen-while-inspecting"),
+            "an inspection is not evidence of client traffic: {recorded:?}"
+        );
+        assert!(!INSPECTING.with(std::cell::Cell::get), "the flag is cleared afterwards");
     }
 
     fn oauth_account(provider: Provider) -> std::sync::Arc<Account> {
@@ -1898,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn muse_requests_match_1_4_12_identity() {
+    fn muse_requests_match_1_4_14_identity() {
         let cfg = Config {
             auth_dir: "/nonexistent".into(),
             meta_api_key: vec![crate::config::KeyEntry { api_key: "test".into(), ..Default::default() }],
@@ -1928,7 +2034,7 @@ mod tests {
         for (name, expected) in [
             (
                 "user-agent",
-                "muse-build/1.4.12 (interactive; macos-aarch64; build 80d5266d8a4cb84d6d4ec595a4ef39cc596fa128)",
+                "muse-build/1.4.14 (interactive; macos-aarch64; build dec7d7497fecdad135ec5835a8161dbc92e55b58)",
             ),
             ("x-client-id", "tbh:tui"),
             ("x-tbh-agent-role", "main"),
@@ -1943,7 +2049,7 @@ mod tests {
     }
 
     #[test]
-    fn grok_subscription_requests_match_1_0_67_identity() {
+    fn grok_subscription_requests_match_1_0_70_identity() {
         let cfg = Config {
             auth_dir: "/nonexistent".into(),
             xai_api_key: vec![crate::config::KeyEntry { api_key: "test".into(), ..Default::default() }],
@@ -1973,8 +2079,8 @@ mod tests {
         );
         assert_eq!(prepared.url, "https://cli-chat-proxy.grok.com/v1/responses");
         for (name, expected) in [
-            ("x-grok-client-version", "1.0.67"),
-            ("user-agent", "grok-pager/1.0.67 grok-shell/1.0.67 (macos; aarch64)"),
+            ("x-grok-client-version", "1.0.70"),
+            ("user-agent", "grok-pager/1.0.70 grok-shell/1.0.70 (macos; aarch64)"),
             ("x-grok-client-identifier", "grok-shell"),
             ("x-grok-client-mode", "interactive"),
             ("x-xai-token-auth", "xai-grok-cli"),
@@ -1998,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_generated_requests_match_2_1_309_identity() {
+    fn claude_generated_requests_match_2_1_318_identity() {
         let acct = claude_account();
         *acct.cred.write() = Credential::OAuth(crate::accounts::OAuth {
             access_token: "test".into(),
@@ -2030,12 +2136,12 @@ mod tests {
         );
         assert_eq!(
             prepared.headers.iter().find(|(name, _)| name == "user-agent").unwrap().1,
-            "claude-cli/2.1.309 (external, cli)"
+            "claude-cli/2.1.318 (external, cli)"
         );
-        // The published 2.1.309 client's algorithm uses the same salt and samples.
+        // The published 2.1.318 client's algorithm uses the same salt and samples.
         assert_eq!(
             prepared.body["system"][0]["text"],
-            "x-anthropic-billing-header: cc_version=2.1.309.c22; cc_entrypoint=cli;"
+            "x-anthropic-billing-header: cc_version=2.1.318.195; cc_entrypoint=cli;"
         );
     }
 
@@ -2394,5 +2500,31 @@ mod tests {
         assert!(f.chars().all(|c| c.is_ascii_hexdigit()));
         // Short messages fall back to '0' for missing positions.
         assert_eq!(cc_fingerprint(""), cc_fingerprint("abc"));
+    }
+
+    #[test]
+    fn bounded_fingerprint_matches_full_utf16_for_unicode_and_short_messages() {
+        fn reference(message: &str) -> String {
+            let units: Vec<u16> = message.encode_utf16().collect();
+            let sampled: Vec<u16> =
+                [4usize, 7, 20].iter().map(|&i| units.get(i).copied().unwrap_or(b'0' as u16)).collect();
+            let version = crate::clients::version(crate::clients::CLAUDE_CODE);
+            let input = format!("{CC_FINGERPRINT_SALT}{}{version}", String::from_utf16_lossy(&sampled));
+            hex::encode(Sha256::digest(input.as_bytes()))[..3].to_string()
+        }
+        // Exercise both halves of astral characters at every sampled position,
+        // including a UTF-16 surrogate pair formed by two separated samples.
+        for text in ["hello world with enough text", "é中文🦀𐐷x".repeat(30).as_str(), "🦀".repeat(30).as_str()]
+        {
+            for (end, _) in text.char_indices().chain(std::iter::once((text.len(), '\0'))) {
+                assert_eq!(cc_fingerprint(&text[..end]), reference(&text[..end]));
+            }
+        }
+        for padding in 0..24 {
+            let text = format!("{}🦀abc𐐷xyz🦀", "a".repeat(padding));
+            assert_eq!(cc_fingerprint(&text), reference(&text));
+        }
+        let long = "prefix with enough text".to_string() + &"é🦀".repeat(200_000);
+        assert_eq!(cc_fingerprint(&long), reference(&long));
     }
 }

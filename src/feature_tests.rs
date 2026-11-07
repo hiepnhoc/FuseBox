@@ -37,6 +37,8 @@ enum Act {
     BigDelta,
     /// A Codex image generation stream whose image event is 4 KiB.
     BigImage,
+    /// A normal answer whose headers come only after 1.5 s.
+    Late,
 }
 
 #[derive(Default)]
@@ -68,6 +70,9 @@ async fn responses(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
     let model = body["model"].as_str().unwrap_or_default().to_string();
     mock.calls.lock().push((account.clone(), model.clone()));
     let act = mock.acts.lock().get(&(account.clone(), model.clone())).copied().unwrap_or(Act::Answer);
+    if act == Act::Late {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
     let created = json!({"type":"response.created","response":{"id":"resp_1","model":model}});
     let sse = |events: Vec<Value>| {
         let body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
@@ -107,7 +112,7 @@ async fn responses(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body)
             json!({"type":"response.output_item.done","item":{"type":"image_generation_call","result":"x".repeat(4096),"output_format":"png"}}),
             json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","tool_usage":{"image_gen":{"images":1}}}}),
         ]),
-        Act::Answer | Act::BigDelta => {
+        Act::Answer | Act::BigDelta | Act::Late => {
             let text = if act == Act::BigDelta { "x".repeat(4096) } else { format!("{account}:{model}") };
             let done = json!({"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":model,
                 "output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],
@@ -211,6 +216,17 @@ async fn serve(router: axum::Router) -> Server {
     Server { url, task }
 }
 
+async fn media(State(mock): State<Arc<Mock>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let account = key(&headers);
+    let model = body["model"].as_str().unwrap().to_string();
+    mock.calls.lock().push((account.clone(), model.clone()));
+    if mock.acts.lock().get(&(account, model)) == Some(&Act::GatewayTimeout) {
+        return (StatusCode::GATEWAY_TIMEOUT, Json(json!({"error":{"message":"generation still running"}})))
+            .into_response();
+    }
+    Json(json!({"data":[{"b64_json":"synthetic"}],"output":[]})).into_response()
+}
+
 struct Setup {
     app: Arc<App>,
     proxy: Server,
@@ -231,6 +247,9 @@ async fn setup(edit: impl FnOnce(&mut Config, &str)) -> Setup {
     let provider = serve(
         axum::Router::new()
             .route("/v1/responses", post(responses))
+            .route("/v1/images/generations", post(media))
+            .route("/v1/images/edits", post(media))
+            .route("/v1/responses/compact", post(media))
             .route("/v1/embeddings", post(embeddings))
             .route("/v1beta/models/{*path}", post(google_embeddings))
             .route("/v1/publishers/google/models/{*path}", post(google_embeddings))
@@ -289,6 +308,26 @@ async fn higher_priority_accounts_answer_first() {
     let b = s.app.pool.all().into_iter().find(|a| a.label == "b").unwrap();
     b.cool(None, chrono::Utc::now() + chrono::Duration::minutes(5), "429");
     assert_eq!(ask(&s, "client", "gpt-up", &[]).await, (200, "a:gpt-up".into()));
+}
+
+#[tokio::test]
+async fn media_gateway_timeouts_do_not_repeat_work_on_another_account() {
+    for (path, model) in
+        [("images/generations", "gpt-image-2"), ("images/edits", "gpt-image-2"), ("responses/compact", "gpt-up")]
+    {
+        let s = setup(|cfg, _| cfg.codex_api_key[0].priority = 10).await;
+        s.mock.acts.lock().insert(("a".into(), model.into()), Act::GatewayTimeout);
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/{path}", s.proxy.url))
+            .bearer_auth("client")
+            .json(&json!({"model":model,"prompt":"synthetic test","image":"data:image/png;base64,AA"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT, "{path}");
+        assert_eq!(response.json::<Value>().await.unwrap()["error"]["message"], "generation still running");
+        assert_eq!(*s.mock.calls.lock(), [("a".into(), model.into())], "{path} repeated an ambiguous generation");
+    }
 }
 
 #[tokio::test]
@@ -488,6 +527,71 @@ async fn streams_that_fail_or_stall_before_content_move_to_the_next_account() {
     let a = s.app.pool.all().into_iter().find(|x| x.label == "a").unwrap();
     assert!(a.cooling_until("gpt-slow").is_some());
     assert!(a.cooling_until("gpt-up").is_none());
+}
+
+#[tokio::test]
+async fn the_last_account_left_is_not_benched_for_a_stall() {
+    let s = setup(|cfg, _| {
+        cfg.codex_api_key[0].priority = 10;
+        cfg.first_token_timeout_seconds = 1;
+    })
+    .await;
+    for account in ["a", "b"] {
+        s.mock.acts.lock().insert((account.into(), "gpt-slow".into()), Act::Stall);
+    }
+    let (status, _) = ask(&s, "client", "gpt-slow", &[]).await;
+    assert_eq!(status, 504);
+    let account = |label: &str| s.app.pool.all().into_iter().find(|x| x.label == label).unwrap();
+    let (a, b) = (account("a"), account("b"));
+    // `a` stalled while `b` was free, so it sits out; `b` was the last one left, so it
+    // stays in and only shows the stall.
+    assert!(a.cooling_until("gpt-slow").is_some());
+    assert!(a.paused_by_stall("gpt-slow"));
+    assert!(b.cooling_until("gpt-slow").is_none());
+    assert!(b.snapshot()["last_error"].as_str().unwrap().contains("sent nothing"), "{}", b.snapshot());
+    // The client's retry reaches `b` again instead of a made-up rate limit.
+    s.mock.acts.lock().remove(&("b".to_string(), "gpt-slow".to_string()));
+    assert_eq!(ask(&s, "client", "gpt-slow", &[]).await, (200, "b:gpt-slow".into()));
+
+    // With `b` out for a sign-in, `a`'s stall is what keeps the model away: a 503 that
+    // says so, with the wait, rather than "rate limited".
+    b.cool(None, chrono::Utc::now() + chrono::Duration::minutes(5), "401: unauthorized");
+    let calls = s.mock.calls.lock().len();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/responses", s.proxy.url))
+        .bearer_auth("client")
+        .json(&json!({"model":"gpt-slow","stream":true,"input":"hi"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let wait: u64 = resp.headers()["retry-after"].to_str().unwrap().parse().unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    let body: Value = resp.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("gpt-slow stalled") && !message.contains("rate limited"), "{body}");
+    assert_eq!(s.mock.calls.lock().len(), calls, "no upstream call");
+}
+
+#[tokio::test]
+async fn the_last_account_left_gets_longer_to_send_its_first_token() {
+    let s = setup(|cfg, _| {
+        cfg.codex_api_key[0].priority = 10;
+        cfg.first_token_timeout_seconds = 1;
+    })
+    .await;
+    s.mock.acts.lock().insert(("a".into(), "gpt-late".into()), Act::Late);
+    let account = |label: &str| s.app.pool.all().into_iter().find(|x| x.label == label).unwrap();
+    // While `b` could take it, `a` keeps to the deadline and the request moves on.
+    assert_eq!(ask(&s, "client", "gpt-late", &[]).await, (200, "b:gpt-late".into()));
+    account("a").state.lock().cooldowns.clear();
+    account("a").state.lock().stall_pauses.clear();
+    // With `b` out, `a` is all there is: its 1.5 s headers are waited for.
+    account("b").cool(None, chrono::Utc::now() + chrono::Duration::minutes(5), "401: unauthorized");
+    let calls = s.mock.calls.lock().len();
+    assert_eq!(ask(&s, "client", "gpt-late", &[]).await, (200, "a:gpt-late".into()));
+    assert_eq!(s.mock.calls.lock().len(), calls + 1, "one upstream call");
+    assert!(account("a").cooling_until("gpt-late").is_none());
 }
 
 #[tokio::test]
@@ -1114,7 +1218,7 @@ fn the_config_refuses_settings_that_would_misbehave() {
     assert_eq!(cfg.log_format, crate::config::LogFormat::Json);
     assert_eq!(cfg.named_clients[0].tokens_per_day, Some(5000));
     // Groups serialize back to the short form unless they balance.
-    let yaml = serde_yaml::to_string(&cfg.model_groups).unwrap();
+    let yaml = crate::yaml::to_string(&cfg.model_groups).unwrap();
     assert!(yaml.contains("smart:\n- claude-opus-5-5"), "{yaml}");
     assert!(yaml.contains("balance: true"), "{yaml}");
     assert_eq!(Config::default().first_token_timeout_seconds, 120);
@@ -1149,6 +1253,170 @@ fn cooldowns_survive_a_restart() {
     assert_eq!(acct.cooling_until("claude-sonnet-5-5").map(|t| t.timestamp()), Some(until.timestamp()));
     assert!(acct.cooling_until("expired").is_none());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn pause_kinds_survive_a_restart_and_a_cleared_error() {
+    let dir = std::env::temp_dir().join(format!("fusebox-pause-kinds-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = Config {
+        auth_dir: dir.to_string_lossy().into(),
+        claude_api_key: vec![
+            KeyEntry { api_key: "limited".into(), ..Default::default() },
+            KeyEntry { api_key: "broke".into(), ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let model = "claude-sonnet-5-5";
+    let message = "Your credit balance is too low to access the Anthropic API.";
+    let pool = crate::accounts::Pool::default();
+    pool.reload(&cfg);
+    let (limited, broke) = (pool.all().remove(0), pool.all().remove(1));
+    limited.rate_limit(model, chrono::Utc::now() + chrono::Duration::seconds(40), "429: slow down");
+    broke.refuse(chrono::Utc::now() + chrono::Duration::minutes(30), "API credit balance too low", 400, message);
+    // The kinds are not read from the shown error: clearing or replacing it changes no answer.
+    limited.state.lock().clear_error();
+    broke.state.lock().set_error("some later problem");
+    assert!(limited.paused_by_limit(model));
+    assert_eq!(broke.refusal(), Some((400, message.to_string())));
+    // Faults, the dashboard and the app name it for what it is.
+    assert_eq!(broke.state.lock().pauses(chrono::Utc::now())["*"].1, "credit");
+    assert_eq!(limited.state.lock().pauses(chrono::Utc::now())[model].1, "rate_limit");
+    let path = dir.join(crate::accounts::COOLDOWNS_FILE);
+    pool.cooldowns().save(&path).unwrap();
+    let restarted = crate::accounts::Pool::default();
+    restarted.reload(&cfg);
+    restarted.restore_cooldowns(&crate::accounts::Cooldowns::load(&path));
+    let (limited, broke) = (restarted.all().remove(0), restarted.all().remove(1));
+    assert!(limited.paused_by_limit(model), "a rate limit stays a wait to advertise");
+    assert_eq!(broke.refusal(), Some((400, message.to_string())), "the refusal is given again");
+    assert!(!broke.paused_by_limit(model));
+    assert_eq!(broke.state.lock().last_error(chrono::Utc::now()), Some("API credit balance too low"));
+    // A later pause of another kind on the same key takes over.
+    limited.cool(Some(model), chrono::Utc::now() + chrono::Duration::minutes(2), "upstream sent nothing");
+    assert!(!limited.paused_by_limit(model));
+    // An older release reads the file and ignores the new fields.
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"limits\"") && text.contains("\"refusal\""), "{text}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// An account held out until a sign-in can't answer, so monitoring doesn't count it
+/// ready: with no other account, `/readyz` says so.
+#[tokio::test]
+async fn an_account_held_out_until_a_sign_in_is_not_ready() {
+    let dir = std::env::temp_dir().join(format!("fusebox-held-ready-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let expired = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    std::fs::write(
+        dir.join("codex-held.json"),
+        json!({"type":"codex","access_token":"FAKE_ACCESS","refresh_token":"FAKE_REFRESH","expired":expired,
+            "account_id":"held"})
+        .to_string(),
+    )
+    .unwrap();
+    let app =
+        App::new(Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() }, dir.join("config.yaml"));
+    let held = app.pool.get("file:codex-held.json").unwrap();
+    let proxy = serve(crate::server::router(app.clone())).await;
+    let client = reqwest::Client::new();
+    assert_eq!(client.get(format!("{}/readyz", proxy.url)).send().await.unwrap().status(), 200);
+    held.state.lock().refresh_hold = Some(crate::accounts::RefreshHold::new("FAKE_REFRESH", "invalid_grant".into()));
+    assert!(held.held_out());
+    let ready = client.get(format!("{}/readyz", proxy.url)).send().await.unwrap();
+    assert_eq!(ready.status(), 503);
+    assert_eq!(ready.json::<Value>().await.unwrap()["accounts"]["ready"], 0);
+    let metrics = client.get(format!("{}/metrics", proxy.url)).send().await.unwrap().text().await.unwrap();
+    let line = metrics.lines().find(|l| l.starts_with("fusebox_account_ready{")).unwrap();
+    assert!(line.ends_with(" 0"), "{line}");
+    let overview: Value = client.get(format!("{}/api/overview", proxy.url)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(overview["accounts"]["signin"], 1, "{overview}");
+    assert_eq!(overview["accounts"]["active"], 0, "{overview}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A refresh token refused for good stays refused after a restart: the account stays
+/// out and says to sign in again, instead of asking the token endpoint once more. A
+/// sign-in meanwhile (another refresh token in the file) lifts it.
+#[test]
+fn a_refused_refresh_token_stays_refused_after_a_restart() {
+    let dir = std::env::temp_dir().join(format!("fusebox-held-restart-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let expired = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let write = |refresh: &str| {
+        std::fs::write(
+            dir.join("codex-held.json"),
+            json!({"type":"codex","access_token":"FAKE_ACCESS","refresh_token":refresh,"expired":expired,
+                "account_id":"held"})
+            .to_string(),
+        )
+        .unwrap()
+    };
+    write("FAKE_REFUSED");
+    let cfg = Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() };
+    let pool = crate::accounts::Pool::default();
+    pool.reload(&cfg);
+    let held = pool.get("file:codex-held.json").unwrap();
+    held.state.lock().refresh_hold = Some(crate::accounts::RefreshHold::new(
+        "FAKE_REFUSED",
+        "OAuth endpoint returned HTTP 400 (invalid_grant)".into(),
+    ));
+    assert!(held.held_out());
+    let path = dir.join(crate::accounts::COOLDOWNS_FILE);
+    pool.cooldowns().save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"hold\"") && !text.contains("FAKE_REFUSED"), "digests only: {text}");
+    let restart = || {
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        pool.restore_cooldowns(&crate::accounts::Cooldowns::load(&path));
+        pool.get("file:codex-held.json").unwrap()
+    };
+    let again = restart();
+    assert!(again.held_out(), "still out after a restart");
+    let error = again.state.lock().last_error(chrono::Utc::now()).map(String::from).unwrap();
+    assert!(crate::push::signin_error(&error), "{error}");
+    write("FAKE_NEW_SIGN_IN");
+    let signed_in = restart();
+    assert!(!signed_in.held_out(), "a new refresh token lifts it");
+    assert_eq!(signed_in.state.lock().last_error(chrono::Utc::now()), None);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// What an older release reads from `.cooldowns.state`: only `rate` and `quota`, with any
+/// other field ignored. It must still find every deadline after this release saved it.
+#[test]
+fn the_cooldowns_file_still_reads_as_the_base_release_reads_it() {
+    #[derive(serde::Deserialize)]
+    struct BaseAccount {
+        #[serde(default)]
+        rate: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        quota: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+    }
+    let cfg = Config {
+        auth_dir: "/nonexistent".into(),
+        claude_api_key: vec![KeyEntry { api_key: "broke".into(), ..Default::default() }],
+        ..Default::default()
+    };
+    let pool = crate::accounts::Pool::default();
+    pool.reload(&cfg);
+    let key = pool.all().remove(0);
+    let (soon, later) =
+        (chrono::Utc::now() + chrono::Duration::seconds(40), chrono::Utc::now() + chrono::Duration::minutes(30));
+    key.rate_limit("claude-sonnet-5-5", soon, "429: slow down");
+    key.refuse(later, "API credit balance too low", 400, "Your credit balance is too low.");
+    let mut text = serde_json::to_string(&pool.cooldowns()).unwrap();
+    assert!(text.contains("\"limits\"") && text.contains("\"refusal\""), "{text}");
+    // A saved refresh hold rides along too (here added by hand: API keys have none).
+    let mut value: Value = serde_json::from_str(&text).unwrap();
+    value[&key.id]["hold"] = json!({"refresh": "00", "reason": "invalid_grant"});
+    text = value.to_string();
+    let base: BTreeMap<String, BaseAccount> = serde_json::from_str(&text).unwrap();
+    let account = &base[&key.id];
+    assert_eq!(account.rate.get("claude-sonnet-5-5"), Some(&soon));
+    assert_eq!(account.rate.get("*"), Some(&later));
+    assert!(account.quota.is_empty());
 }
 
 #[test]

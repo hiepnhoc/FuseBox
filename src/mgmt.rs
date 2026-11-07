@@ -115,7 +115,7 @@ pub async fn start_login_with(app: &Arc<App>, provider: Provider, opts: LoginOpt
             tokio::spawn(async move {
                 let result = async {
                     let signed = crate::device::wait(&app2, provider, &dev).await?;
-                    save_signed(&app2, provider, signed)
+                    save_signed(&app2, provider, signed).await
                 }
                 .await;
                 settle(&app2, &state2, &result);
@@ -214,10 +214,128 @@ pub async fn start_login_with(app: &Arc<App>, provider: Provider, opts: LoginOpt
     }
 }
 
-fn save_signed(app: &Arc<App>, provider: Provider, s: crate::device::Signed) -> Result<String> {
-    let path = app.cfg().auth_dir().join(&s.file);
-    write_oauth_file(&path, provider, &s.oauth, &s.extra)?;
+/// Where a new sign-in is saved: `name`, unless Fusebox already has this account in a
+/// file named otherwise (older releases used other names). That file is then signed in
+/// again, so the account keeps its ID, selections and settings, and no stale copy is left
+/// retrying a revoked refresh token. When `name` holds another account (`a+b@x` and
+/// `a_b@x` share a file name, as do one email's ChatGPT workspaces), the sign-in gets a
+/// name of its own, `<stem>-<8 hex of its identity>.json`, rather than overwriting it.
+fn sign_in_path(app: &App, provider: Provider, cred: &crate::accounts::OAuth, name: &str) -> std::path::PathBuf {
+    let fresh = app.cfg().auth_dir().join(name);
+    let exact = Credential::OAuth(cred.clone()).identity(provider);
+    // Older Claude files can lack the account UUID; one email is one Claude account.
+    let by_email = (provider == Provider::Claude && cred.email.is_some())
+        .then(|| Credential::OAuth(crate::accounts::OAuth { account_id: None, ..cred.clone() }).identity(provider));
+    let mut same: Vec<_> = app
+        .pool
+        .all()
+        .iter()
+        .filter(|a| a.provider == provider && matches!(&*a.cred.read(), Credential::OAuth(_)))
+        .filter(|a| {
+            let identity = a.cred.read().identity(provider);
+            identity == exact || by_email.as_ref() == Some(&identity)
+        })
+        .filter_map(|a| a.path.clone())
+        .collect();
+    same.sort();
+    if !same.is_empty() && !same.contains(&fresh) {
+        return same.swap_remove(0);
+    }
+    // Whether another account holds a file name: the file says, or while it can't be
+    // read, the account loaded from it.
+    let taken = |path: &std::path::Path| {
+        let holder =
+            crate::accounts::read_oauth_file(path).map(|(p, o, _, _)| (p, Credential::OAuth(o))).or_else(|| {
+                let held = app.pool.all().into_iter().find(|a| a.path.as_deref() == Some(path))?;
+                let cred = held.cred.read().clone();
+                Some((held.provider, cred))
+            });
+        holder.is_some_and(|(p, c)| {
+            let same_claude_email = matches!(&c, Credential::OAuth(o) if p == Provider::Claude
+                && provider == Provider::Claude
+                && o.email.as_deref().zip(cred.email.as_deref()).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b)));
+            c.identity(p) != exact && !same_claude_email
+        })
+    };
+    if !taken(&fresh) {
+        return fresh;
+    }
+    // The suffix grows in the unlikely case that its shorter form is someone else's too.
+    let stem = name.strip_suffix(".json").unwrap_or(name);
+    let named = |len: usize| app.cfg().auth_dir().join(format!("{stem}-{}.json", &exact[..len]));
+    [8, 16].into_iter().map(named).find(|path| !taken(path)).unwrap_or_else(|| named(exact.len()))
+}
+
+/// One sign-in is saved at a time, so two can't pick the same free file name.
+static SIGN_IN_SAVES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Saves a sign-in and, when it signs an existing account in again, makes it that
+/// account's credential at once. Waiting out a refresh of the old tokens first keeps the
+/// reload from taking the new ones for an older copy, and the old sign-in's error ends.
+async fn save_sign_in(
+    app: &Arc<App>,
+    provider: Provider,
+    cred: &crate::accounts::OAuth,
+    name: &str,
+    extra: &[(&str, Value)],
+) -> Result<std::path::PathBuf> {
+    let _one_at_a_time = SIGN_IN_SAVES.lock().await;
+    let path = sign_in_path(app, provider, cred, name);
+    let existing = app.pool.all().into_iter().find(|a| a.path.as_deref() == Some(path.as_path()));
+    let guard = match &existing {
+        Some(a) => Some(a.refresh_lock.clone().lock_owned().await),
+        None => None,
+    };
+    // Deferred saves can retry without the refresh lock. Keep one writer from
+    // replacing the new grant with the old grant's tokens, or sharing its temp file.
+    let mut pending = existing.as_ref().map(|a| a.pending_oauth_save.lock());
+    write_oauth_file(&path, provider, cred, extra)?;
+    if let Some(a) = &existing
+        && let Some((_, saved, _, _)) = crate::accounts::read_oauth_file(&path)
+        && Credential::OAuth(saved.clone()).identity(provider) == a.cred.read().identity(provider)
+    {
+        // A refresh save still pending holds the old grant's tokens.
+        if let Some(save) = pending.as_deref_mut() {
+            *save = None;
+        }
+        *a.cred.write() = Credential::OAuth(saved);
+        let mut st = a.state.lock();
+        if st.last_error(chrono::Utc::now()).is_some_and(crate::push::signin_error) {
+            st.clear_error();
+        }
+    }
+    drop(pending);
+    drop(guard);
     app.reload_accounts();
+    Ok(path)
+}
+
+/// Reads a new sign-in's usage and plan at once, as the account's quota refresh does,
+/// so its meters fill in without waiting for the next poll round (up to a minute).
+fn read_signed_in(app: &Arc<App>, path: &std::path::Path) {
+    let Some(acct) = app.pool.all().into_iter().find(|a| a.path.as_deref() == Some(path)) else { return };
+    if !matches!(acct.provider, Provider::Codex | Provider::Claude | Provider::Meta) || !acct.is_oauth() {
+        return;
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        if oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
+            return;
+        }
+        acct.state.lock().quota_epoch += 1;
+        if let Err(e) = crate::quota::poll(&app, &acct).await {
+            tracing::debug!(account = %acct.label, "quota check after sign-in failed: {e:#}");
+        }
+        if let Err(e) = crate::quota::poll_plan(&app, &acct).await {
+            tracing::debug!(account = %acct.label, "plan check after sign-in failed: {e:#}");
+        }
+        app.broadcast("accounts", Value::Null);
+    });
+}
+
+async fn save_signed(app: &Arc<App>, provider: Provider, s: crate::device::Signed) -> Result<String> {
+    let path = save_sign_in(app, provider, &s.oauth, &s.file, &s.extra).await?;
+    read_signed_in(app, &path);
     Ok(s.oauth.email.unwrap_or(s.file))
 }
 
@@ -329,17 +447,16 @@ pub async fn complete_login(app: &Arc<App>, state: &str, code: &str) -> Result<S
     let result = async {
         if provider == Provider::Devin {
             let signed = crate::devin::complete_login(app, code.trim(), &verifier).await?;
-            return save_signed(app, provider, signed);
+            return save_signed(app, provider, signed).await;
         }
         if provider == Provider::Kiro {
             let pending = kiro.ok_or_else(|| anyhow!("this Kiro sign-in has no registered client; start again"))?;
             let signed = crate::kiro::complete_pkce(&app.http.control(None), &pending, code.trim()).await?;
-            return save_signed(app, provider, signed);
+            return save_signed(app, provider, signed).await;
         }
         let (cred, name, extra) = oauth::exchange(app, provider, code.trim(), state, &verifier).await?;
-        let path = app.cfg().auth_dir().join(&name);
-        write_oauth_file(&path, provider, &cred, &extra)?;
-        app.reload_accounts();
+        let path = save_sign_in(app, provider, &cred, &name, &extra).await?;
+        read_signed_in(app, &path);
         Ok::<_, anyhow::Error>(cred.email.unwrap_or(name))
     }
     .await;
@@ -382,15 +499,22 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
         .route("/accounts/{id}/quota/refresh", post(refresh_quota))
         .route("/accounts/{id}/window-starter", post(start_window))
         .route("/accounts/{id}/activity", get(account_activity))
+        .route("/accounts/{id}/test", post(test_account))
         .route("/accounts/{id}/priority", post(set_priority))
         .route("/accounts/{id}/models", put(set_account_models))
         .route("/accounts/{id}/models/fetch", post(fetch_account_models))
+        .route("/accounts/{id}/billing", post(set_billing))
         .route("/clients/usage", get(client_usage))
         .route("/client-identities", get(client_identities))
         .route("/client-identities/reset", post(reset_client_identities))
         .route("/playground", post(crate::server::playground))
         .route("/procs", get(procs))
         .route("/procs/signal", post(procs_signal))
+        // A pasted request may be as large as one a client sends.
+        .route(
+            "/inspect",
+            post(crate::inspect::inspect).layer(axum::extract::DefaultBodyLimit::max(crate::admission::MAX_BODY_SIZE)),
+        )
         .route("/routes", get(routes))
         .route("/keys", post(add_key))
         .route("/keys/models", post(list_key_models))
@@ -635,13 +759,17 @@ fn ok() -> Response {
 async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
     let cfg = app.cfg();
     let accounts = app.pool.all();
-    let (mut active, mut cooling, mut disabled) = (0, 0, 0);
+    let (mut active, mut cooling, mut disabled, mut signin) = (0, 0, 0, 0);
     let mut providers = std::collections::BTreeMap::<&str, usize>::new();
     for a in &accounts {
         *providers.entry(a.provider.as_str()).or_default() += 1;
+        let held = a.held_out();
         let st = a.state.lock();
         if st.disabled {
             disabled += 1;
+        } else if held {
+            // Out of rotation until a sign-in.
+            signin += 1;
         } else if st.quota_refreshing
             || st.cooldowns.get("*").is_some_and(|t| *t > chrono::Utc::now())
             || st.quota_cooldowns.get("*").is_some_and(|t| *t > chrono::Utc::now())
@@ -672,7 +800,7 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
         "totals": *app.stats.totals.lock(),
         "active": app.stats.active.load(Ordering::Relaxed),
         "series": app.stats.series(),
-        "accounts": { "total": accounts.len(), "active": active, "cooling": cooling, "disabled": disabled, "providers": providers },
+        "accounts": { "total": accounts.len(), "active": active, "cooling": cooling, "disabled": disabled, "signin": signin, "providers": providers },
         // Each provider's subscriptions together, per window: the dashboard's combined limits.
         "pools": crate::push::current_pools(&app),
         "models": app.pool.models().len(),
@@ -683,14 +811,21 @@ async fn overview(State(app): State<Arc<App>>) -> Json<Value> {
 
 async fn accounts(State(app): State<Arc<App>>) -> Json<Value> {
     let cfg = app.cfg();
+    let all = app.pool.all();
+    // Enabled subscriptions per provider: "prioritized" only means something beside another.
+    let mut enabled = std::collections::HashMap::<crate::accounts::Provider, usize>::new();
+    for a in &all {
+        if !a.state.lock().disabled {
+            *enabled.entry(a.provider).or_default() += 1;
+        }
+    }
     Json(Value::Array(
-        app.pool
-            .all()
-            .iter()
+        all.iter()
             .map(|a| {
                 let mut snapshot = a.snapshot();
+                let shared = enabled.get(&a.provider).copied().unwrap_or(0) > 1;
                 snapshot["banked_reset_plan"] =
-                    serde_json::to_value(crate::banked_resets::plan(a, &cfg)).unwrap_or_default();
+                    serde_json::to_value(crate::banked_resets::plan(a, &cfg, shared)).unwrap_or_default();
                 snapshot["quota_attribution"] = attribution_json(&a.state.lock().attribution, &cfg);
                 snapshot["window_starter_supported"] = json!(crate::window_starter::supported(a));
                 snapshot["window_starter_selected"] = json!(cfg.window_starter.selected(a));
@@ -783,7 +918,7 @@ async fn requests(State(app): State<Arc<App>>, Query(q): Query<RequestsQuery>) -
 
 /// What has tripped: expired sign-ins, used-up limits, rate limits, account errors,
 /// runs of failed requests and providers with no account left. The same rules as the
-/// faults menu and push notifications.
+/// faults menu and push notifications. Dismissed faults are left out (`/faults/dismissed`).
 async fn faults(State(app): State<Arc<App>>) -> Json<Value> {
     Json(crate::push::current_faults(&app))
 }
@@ -960,11 +1095,11 @@ async fn remove_model(State(app): State<Arc<App>>, Json(b): Json<AddedModel>) ->
     }
 }
 
-/// Asks Claude and Codex for their model lists now (at most once per 10 minutes per account).
-async fn check_models(State(app): State<Arc<App>>) -> Json<Value> {
-    let (asked, new) = crate::discovery::check_now(&app).await;
+/// Schedule bounded model checks and report any overlapping checks still in progress.
+async fn check_models(State(app): State<Arc<App>>) -> Json<crate::discovery::CheckResult> {
+    let result = crate::discovery::check_now(&app).await;
     app.broadcast("accounts", Value::Null);
-    Json(json!({ "asked": asked, "new": new }))
+    Json(result)
 }
 
 #[derive(Deserialize)]
@@ -974,12 +1109,15 @@ struct ToggleBody {
 
 async fn toggle_account(State(app): State<Arc<App>>, Path(id): Path<String>, Json(b): Json<ToggleBody>) -> Response {
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
-    if let Some(path) = &acct.path
-        && let Err(e) = set_file_disabled(path, b.disabled)
-    {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    if let Some(path) = &acct.path {
+        let _save = acct.pending_oauth_save.lock();
+        if let Err(e) = set_file_disabled(path, b.disabled) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+        acct.state.lock().disabled = b.disabled;
+    } else if let Err(e) = app.pool.set_key_disabled(&id, b.disabled) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save the account switch: {e}"));
     }
-    acct.state.lock().disabled = b.disabled;
     app.broadcast("accounts", Value::Null);
     ok()
 }
@@ -998,6 +1136,161 @@ async fn refresh_account(State(app): State<Arc<App>>, Path(id): Path<String>) ->
         }
         Err(e) => err(StatusCode::BAD_GATEWAY, format!("{e:#}")),
     }
+}
+
+/// When each account was last tested from the dashboard (one test a minute).
+static ACCOUNT_TESTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The account's cheapest listed model at bundled list prices; unpriced
+/// models fall back to the usual small-model names, then alphabetical.
+fn cheapest_model(acct: &crate::accounts::Account) -> Option<String> {
+    let models = acct.public_models();
+    let provider = match acct.provider {
+        Provider::Claude => "anthropic",
+        Provider::Codex => "openai",
+        Provider::Meta => "meta",
+        _ => acct.provider.as_str(),
+    };
+    let priced = models.iter().filter_map(|model| {
+        let mut o = crate::usage::types::Observation::new(
+            "proxy",
+            "account-test-pricing".into(),
+            provider,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        o.actual_model = Some(model.clone());
+        o.completeness = "complete".into();
+        o.tokens.input = Some(1000);
+        o.tokens.output = Some(1000);
+        // Pricing needs every token field reported; a test reads no cache.
+        o.tokens.cache_read = Some(0);
+        o.tokens.cache_write = Some(0);
+        crate::usage::pricing::Catalogue::bundled_catalogue()
+            .and_then(|c| c.price(&o).cost_nanos)
+            .map(|cost| (cost, model))
+    });
+    if let Some((_, model)) = priced.min() {
+        return Some(model.clone());
+    }
+    let small = |m: &String| {
+        let m = m.to_ascii_lowercase();
+        ["mini", "haiku", "flash", "lite", "nano", "small"].iter().any(|s| m.contains(s))
+    };
+    models.iter().find(|m| small(m)).cloned().or_else(|| models.iter().min().cloned())
+}
+
+/// Sends one tiny request pinned to this account — no failover and no retry on
+/// the same account, except once after refreshing a refused token, so the
+/// result says whether *this* sign-in works. It is a real request: recorded
+/// like the playground and may start a 5-hour window, which the drawer says.
+/// An account waiting for a sign-in or cooling down is reported, not sent to.
+async fn test_account(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    incoming: axum::http::HeaderMap,
+) -> Response {
+    use futures::StreamExt as _;
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    if acct.state.lock().disabled {
+        return err(StatusCode::CONFLICT, "this account is disabled; enable it to test it");
+    }
+    let Some(model) = cheapest_model(&acct) else {
+        return err(StatusCode::CONFLICT, "this account serves no models to test with");
+    };
+    // Sending to an account that waits for a sign-in or is cooling down would
+    // say nothing new, and a fresh 429 would extend its pause.
+    let not_now = |status: u16, error: String| {
+        Json(json!({ "ok": false, "status": status, "model": model, "ms": 0, "reply": "", "error": error, "sent": false }))
+            .into_response()
+    };
+    if acct.held_out() {
+        return not_now(401, "this account is waiting for a sign-in; nothing was sent".into());
+    }
+    if let Some(until) = acct.cooling_until(&model) {
+        let left = (until - chrono::Utc::now()).num_seconds().max(1);
+        return not_now(429, format!("{model} is cooling down on this account for {left}s more; nothing was sent"));
+    }
+    {
+        let mut tests = ACCOUNT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if tests.get(&id).is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(60)) {
+            return err(StatusCode::TOO_MANY_REQUESTS, "tested just now; wait a minute between tests");
+        }
+        tests.insert(id.clone(), std::time::Instant::now());
+    }
+    // A prefixed account is reached as `prefix/model`, the only way it serves
+    // anything when `force-model-prefix` is on.
+    let model = match acct.prefix.as_deref().filter(|p| !p.is_empty()) {
+        Some(prefix) => format!("{prefix}/{model}"),
+        None => model,
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(source) = incoming.get(crate::source::HEADER) {
+        headers.insert(crate::source::HEADER, source.clone());
+    }
+    let scope = crate::affinity::scope_for_key(Some("fusebox-dashboard-account-test"));
+    if let (Ok(scope), Ok(client)) =
+        (axum::http::HeaderValue::from_str(&scope), axum::http::HeaderValue::from_str("dashboard"))
+    {
+        headers.insert(crate::affinity::SCOPE_HEADER, scope);
+        headers.insert(crate::usage::capture::CLIENT_HEADER, client);
+    }
+    headers.insert(axum::http::header::USER_AGENT, axum::http::HeaderValue::from_static("fusebox-account-test"));
+    let call = crate::proxy::Call {
+        format: crate::ir::Format::Chat,
+        body: json!({
+            "model": model, "max_tokens": 16, "stream": true,
+            "messages": [{ "role": "user", "content": "Reply with the word ok." }],
+        }),
+        headers,
+        stream: true,
+        transport: "http",
+        path_model: None,
+        session: None,
+        session_source: None,
+        routing_selection: None,
+        pinned_account: Some(acct.clone()),
+    };
+    let started = std::time::Instant::now();
+    let (ok, status, text, error) = match crate::proxy::execute(app.clone(), call).await {
+        crate::proxy::Reply::Json(v) => {
+            (true, 200, v["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string(), Value::Null)
+        }
+        crate::proxy::Reply::Stream { mut frames, .. } => {
+            let mut text = String::new();
+            let mut error = Value::Null;
+            let collect = async {
+                while let Some(frame) = frames.next().await {
+                    let Ok(v) = serde_json::from_str::<Value>(&frame.data) else { continue };
+                    if !v["error"].is_null() {
+                        error = v["error"].clone();
+                    }
+                    if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                        text.push_str(delta);
+                    }
+                }
+            };
+            if tokio::time::timeout(std::time::Duration::from_secs(120), collect).await.is_err() && error.is_null() {
+                error = json!({"message": "the test timed out after 120 seconds"});
+            }
+            (error.is_null(), if error.is_null() { 200 } else { 502 }, text, error)
+        }
+        crate::proxy::Reply::Error(status, body) => (false, status, String::new(), body["error"].clone()),
+    };
+    let message = if error.is_null() {
+        Value::Null
+    } else {
+        error["message"].as_str().map_or_else(|| json!(error.to_string()), |m| json!(m))
+    };
+    Json(json!({
+        "ok": ok,
+        "status": status,
+        "model": model,
+        "ms": started.elapsed().as_millis() as u64,
+        "reply": text.trim().chars().take(120).collect::<String>(),
+        "error": message,
+    }))
+    .into_response()
 }
 
 async fn reset_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
@@ -1082,10 +1375,11 @@ async fn apply_banked_reset(
 }
 async fn refresh_quota(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
-    if !matches!(acct.provider, Provider::Codex | Provider::Claude | Provider::Kiro) || !acct.is_oauth() {
+    if !matches!(acct.provider, Provider::Codex | Provider::Claude | Provider::Meta | Provider::Kiro) || !acct.is_oauth()
+    {
         return err(
             StatusCode::BAD_REQUEST,
-            "Subscription quota is only available for Codex, Claude and Kiro OAuth accounts",
+            "Subscription quota is only available for Codex, Claude, Meta and Kiro OAuth accounts",
         );
     }
     if oauth::ensure_fresh(&app, &acct, chrono::Duration::minutes(5), false).await.is_err() {
@@ -1093,12 +1387,16 @@ async fn refresh_quota(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
     }
     // Quota can still refresh if this subscription does not offer banked resets.
     acct.state.lock().quota_epoch += 1;
-    if crate::quota::poll(&app, &acct).await.is_err() {
+    if let Err(e) = crate::quota::poll(&app, &acct).await {
+        if e.downcast_ref::<crate::quota::UsageWait>().is_some() {
+            return err(StatusCode::TOO_MANY_REQUESTS, e.to_string());
+        }
         return err(StatusCode::BAD_GATEWAY, "Could not refresh provider usage");
     }
     let _ = crate::quota::poll_plan(&app, &acct).await;
     app.broadcast("accounts", Value::Null);
-    if !app.cfg().banked_resets {
+    // Banked resets are a Claude/Codex feature; a Meta refresh ends with quota.
+    if !app.cfg().banked_resets || acct.provider == Provider::Meta {
         return ok();
     }
     match crate::banked_resets::refresh(&app, &acct).await {
@@ -1110,9 +1408,22 @@ async fn refresh_quota(State(app): State<Arc<App>>, Path(id): Path<String>) -> R
 async fn delete_account(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
     let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
     if let Some(path) = &acct.path {
+        // A submitted refresh may rotate and save tokens after its caller leaves.
+        // Let it finish before deleting, then invalidate old request allocations so
+        // a later save cannot recreate the removed credential file.
+        let refreshing = acct.refresh_lock.lock().await;
+        let mut pending = acct.pending_oauth_save.lock();
         if let Err(e) = std::fs::remove_file(path) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
+        *pending = None;
+        {
+            let mut state = acct.state.lock();
+            state.disabled = true;
+            state.update_identity(String::new());
+        }
+        drop(pending);
+        drop(refreshing);
         app.reload_accounts();
         return ok();
     }
@@ -1308,16 +1619,14 @@ pub(crate) fn keep_original(app: &App, text: &str) {
     }
 }
 
-fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut serde_yaml::Value)) -> Response {
+fn edit_config(app: &Arc<App>, edit: impl FnOnce(&mut Value)) -> Response {
     let _guard = app.config_write.lock();
     let text = match std::fs::read_to_string(&app.cfg_path) {
         Ok(text) => text,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not read config: {e}")),
     };
-    let mut doc: serde_yaml::Value = match serde_yaml::from_str(&text) {
-        Ok(serde_yaml::Value::Null) | Err(_) if text.trim().is_empty() => {
-            serde_yaml::Value::Mapping(Default::default())
-        }
+    let mut doc = match crate::yaml::from_str(&text) {
+        Ok(Value::Null) | Err(_) if text.trim().is_empty() => Value::Object(Default::default()),
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, format!("config.yaml doesn't parse: {e}")),
     };
@@ -1526,7 +1835,8 @@ fn live_load(app: &App) -> String {
 }
 
 fn live_faults(app: &App) -> String {
-    format!(r#"{{"type":"faults","data":{}}}"#, crate::push::current_faults(app))
+    let (shown, dismissed) = crate::push::listed_faults(app);
+    format!(r#"{{"type":"faults","data":{shown},"dismissed":{dismissed}}}"#)
 }
 
 /// One ticker for every dashboard: account load and faults are checked each second
@@ -1608,9 +1918,11 @@ async fn set_priority(State(app): State<Arc<App>>, Path(id): Path<String>, Json(
     if let Some(path) = &acct.path {
         app.suppress_reload();
         let value = (b.priority != 0).then(|| json!(b.priority));
+        let saving = acct.pending_oauth_save.lock();
         if let Err(e) = crate::accounts::set_file_field(path, "priority", value) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save the priority: {e}"));
         }
+        drop(saving);
         app.reload_accounts();
         return ok();
     }
@@ -1673,6 +1985,61 @@ async fn set_priority(State(app): State<Arc<App>>, Path(id): Path<String>, Json(
         return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save config: {e}"));
     }
     app.set_config(cfg);
+    ok()
+}
+
+#[derive(Deserialize)]
+struct BillingBody {
+    /// A day it charges or charged; none clears it.
+    date: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    period: crate::quota::BillingPeriod,
+    /// Cancelled: it ends when the period paid for runs out.
+    #[serde(default)]
+    ends: bool,
+}
+
+/// The billing day of a subscription whose provider gives none (Claude, Meta), kept in
+/// its credential file as `billing`, with the plan it was set on.
+async fn set_billing(State(app): State<Arc<App>>, Path(id): Path<String>, Json(b): Json<BillingBody>) -> Response {
+    use crate::quota::{Billing, BillingPeriod};
+    use chrono::Datelike;
+    let Some(acct) = app.pool.get(&id) else { return err(StatusCode::NOT_FOUND, "unknown account") };
+    if !acct.takes_billing() {
+        let why = if acct.provider == Provider::Codex {
+            "ChatGPT gives its own billing date"
+        } else {
+            "Only Claude and Meta subscriptions take a billing date"
+        };
+        return err(StatusCode::BAD_REQUEST, why);
+    }
+    if b.period == BillingPeriod::Yearly && acct.provider != Provider::Claude {
+        return err(StatusCode::BAD_REQUEST, "Only Claude Pro is billed yearly");
+    }
+    let today = chrono::Local::now().date_naive();
+    let value = match b.date {
+        None => None,
+        Some(date) => {
+            let latest = today.checked_add_months(chrono::Months::new(b.period.months())).unwrap_or(today);
+            if date > latest {
+                let most = if b.period == BillingPeriod::Yearly { "a year" } else { "a month" };
+                return err(StatusCode::BAD_REQUEST, format!("The next charge is at most {most} away"));
+            }
+            if date.year() < 2000 {
+                return err(StatusCode::BAD_REQUEST, "That date is too long ago");
+            }
+            let plan = acct.state.lock().quota.plan.clone();
+            Some(json!(Billing::new(date, b.period, b.ends, plan, today)))
+        }
+    };
+    let Some(path) = &acct.path else { return err(StatusCode::BAD_REQUEST, "This account has no credential file") };
+    app.suppress_reload();
+    let saving = acct.pending_oauth_save.lock();
+    if let Err(e) = crate::accounts::set_file_field(path, "billing", value) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("Could not save the billing date: {e}"));
+    }
+    drop(saving);
+    app.reload_accounts();
     ok()
 }
 
@@ -1745,6 +2112,523 @@ async fn client_usage(State(app): State<Arc<App>>) -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_account_test_model_is_the_cheapest_priced_one() {
+        let cfg = Config {
+            auth_dir: "/nonexistent".into(),
+            codex_api_key: vec![crate::config::KeyEntry { api_key: "k".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let pool = crate::accounts::Pool::default();
+        pool.reload(&cfg);
+        let acct = pool.all().remove(0);
+        let price = |model: &str| {
+            let mut o = crate::usage::types::Observation::new("proxy", "t".into(), "openai", 0);
+            o.actual_model = Some(model.into());
+            o.completeness = "complete".into();
+            o.tokens.input = Some(1000);
+            o.tokens.output = Some(1000);
+            o.tokens.cache_read = Some(0);
+            o.tokens.cache_write = Some(0);
+            crate::usage::pricing::Catalogue::bundled_catalogue().and_then(|c| c.price(&o).cost_nanos)
+        };
+        let chosen = cheapest_model(&acct).unwrap();
+        let cost = price(&chosen).expect("the chosen model is priced, so the pricing branch ran");
+        for model in acct.public_models() {
+            assert!(price(&model).is_none_or(|other| other >= cost), "{model} is cheaper than {chosen}");
+        }
+    }
+
+    #[tokio::test]
+    async fn removing_a_sign_in_waits_for_refresh_and_invalidates_old_saves() {
+        let dir = std::env::temp_dir().join(format!("fusebox-remove-refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("account.json");
+        std::fs::write(
+            &path,
+            json!({"type":"codex", "access_token":"old", "refresh_token":"refresh", "account_id":"workspace"})
+                .to_string(),
+        )
+        .unwrap();
+        let app =
+            App::new(Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() }, dir.join("config.yaml"));
+        let account = app.pool.all()[0].clone();
+        let refreshing = account.refresh_lock.clone().lock_owned().await;
+        let mut deleting = tokio::spawn({
+            let app = app.clone();
+            let id = account.id.clone();
+            async move { delete_account(State(app), Path(id)).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut deleting).await.is_err(),
+            "deletion must wait until a rotating token has been saved"
+        );
+        let Credential::OAuth(mut credential) = account.cred.read().clone() else { unreachable!() };
+        credential.access_token = "rotated".into();
+        assert!(oauth::publish_refreshed(&account, credential.clone(), vec![]));
+        drop(refreshing);
+        assert_eq!(deleting.await.unwrap().status(), StatusCode::OK);
+        assert!(!path.exists());
+        assert!(app.pool.get(&account.id).is_none());
+        // Work that selected the old allocation before deletion cannot recreate it.
+        assert!(!oauth::publish_refreshed(&account, credential, vec![]));
+        assert!(!path.exists());
+        app.reload_accounts();
+        assert!(app.pool.all().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn api_key_switches_survive_reload_and_restart() {
+        let dir = std::env::temp_dir().join(format!("fusebox-key-switches-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config {
+            auth_dir: dir.to_string_lossy().into(),
+            claude_api_key: vec![crate::config::KeyEntry {
+                api_key: "synthetic-claude-key".into(),
+                ..Default::default()
+            }],
+            openai_compatibility: vec![
+                crate::config::CompatEntry {
+                    name: "compatible".into(),
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    api_keys: vec!["synthetic-compat-a".into(), "synthetic-compat-b".into()],
+                    ..Default::default()
+                },
+                crate::config::CompatEntry {
+                    name: "keyless".into(),
+                    base_url: "http://127.0.0.1:2/v1".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let app = App::new(cfg.clone(), dir.join("config.yaml"));
+        let ids: Vec<_> = app.pool.all().iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids.len(), 4);
+        for id in &ids {
+            assert_eq!(
+                toggle_account(State(app.clone()), Path(id.clone()), Json(ToggleBody { disabled: true }))
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+            app.reload_accounts();
+            assert!(app.pool.get(id).unwrap().state.lock().disabled, "reload re-enabled {id}");
+        }
+        // A changed configuration may replace Account allocations too.
+        cfg.claude_api_key[0].priority = 10;
+        cfg.openai_compatibility[0].priority = 10;
+        app.set_config(cfg.clone());
+        let restarted = App::new(cfg.clone(), dir.join("config.yaml"));
+        for id in &ids {
+            assert!(app.pool.get(id).unwrap().state.lock().disabled);
+            assert!(restarted.pool.get(id).unwrap().state.lock().disabled, "restart re-enabled {id}");
+        }
+        // Enabling one compatible key leaves its sibling disabled.
+        assert_eq!(
+            toggle_account(State(restarted), Path(ids[1].clone()), Json(ToggleBody { disabled: false })).await.status(),
+            StatusCode::OK
+        );
+        let restarted = App::new(cfg, dir.join("config.yaml"));
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(restarted.pool.get(id).unwrap().state.lock().disabled, i != 1);
+        }
+        let saved = std::fs::read_to_string(dir.join(".disabled-api-keys.state")).unwrap();
+        assert!(!saved.contains("synthetic-"), "the switch state must not contain API keys");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.join(".disabled-api-keys.state")).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_billing_day_set_by_hand_is_kept_in_the_file_and_shown_as_the_renewal() {
+        let dir = std::env::temp_dir().join(format!("fusebox-billing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: Value| std::fs::write(dir.join(name), body.to_string()).unwrap();
+        file("claude-a.json", json!({"type":"claude","access_token":"a","refresh_token":"b","email":"a@example.test"}));
+        file("codex-c.json", json!({"type":"codex","access_token":"c","refresh_token":"d","email":"c@example.test"}));
+        file("meta-m.json", json!({"type":"meta","api_key":"m","refresh_token":"r","email":"m@example.test"}));
+        let app = App::new(
+            Config {
+                auth_dir: dir.to_string_lossy().into(),
+                claude_api_key: vec![crate::config::KeyEntry { api_key: "k".into(), ..Default::default() }],
+                ..Default::default()
+            },
+            dir.join("config.yaml"),
+        );
+        let by = |file: &str| app.pool.all().into_iter().find(|a| a.id == format!("file:{file}")).unwrap();
+        let key = app.pool.all().into_iter().find(|a| a.path.is_none()).unwrap();
+        app.pool.get("file:claude-a.json").unwrap().state.lock().quota.plan = Some("pro".into());
+        let set = |id: String, body: Value| {
+            let app = app.clone();
+            async move {
+                let body: BillingBody = serde_json::from_value(body).unwrap();
+                set_billing(State(app), Path(id), Json(body)).await.status()
+            }
+        };
+        let today = chrono::Local::now().date_naive();
+        let date = |d: chrono::NaiveDate| d.format("%Y-%m-%d").to_string();
+        let soon = today + chrono::Duration::days(10);
+        assert_eq!(set(by("claude-a.json").id.clone(), json!({ "date": date(soon) })).await, StatusCode::OK);
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("claude-a.json")).unwrap()).unwrap();
+        assert_eq!(saved["billing"], json!({ "date": date(soon), "period": "monthly", "plan": "pro" }));
+        assert_eq!(saved["refresh_token"], "b", "the rest of the file is kept");
+        let shown = by("claude-a.json").snapshot();
+        assert_eq!(shown["takes_billing"], true);
+        assert_eq!(shown["billing"]["plan_changed"], false);
+        let renewal = &shown["quota"]["renewal"];
+        assert_eq!((renewal["manual"].as_bool(), renewal["estimated"].as_bool()), (Some(true), Some(false)));
+        let at = chrono::DateTime::parse_from_rfc3339(renewal["at"].as_str().unwrap()).unwrap();
+        assert_eq!(at.with_timezone(&chrono::Local).date_naive(), soon);
+        // A plan change keeps the day but makes it an estimate to check.
+        by("claude-a.json").state.lock().quota.plan = Some("max_5x".into());
+        let shown = by("claude-a.json").snapshot();
+        assert_eq!(
+            (shown["billing"]["plan_changed"].as_bool(), shown["quota"]["renewal"]["estimated"].as_bool()),
+            (Some(true), Some(true))
+        );
+        // Yearly is Claude Pro's alone, and a date is at most one period away.
+        let year = today + chrono::Duration::days(200);
+        assert_eq!(set(by("claude-a.json").id.clone(), json!({ "date": date(year) })).await, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            set(by("claude-a.json").id.clone(), json!({ "date": date(year), "period": "yearly" })).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            set(by("meta-m.json").id.clone(), json!({ "date": date(soon), "period": "yearly" })).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            set(by("meta-m.json").id.clone(), json!({ "date": date(soon), "ends": true })).await,
+            StatusCode::OK
+        );
+        assert_eq!(by("meta-m.json").snapshot()["quota"]["renewal"]["ends"], true);
+        // ChatGPT and API keys give no file to keep it in, or a date of their own.
+        assert_eq!(set(by("codex-c.json").id.clone(), json!({ "date": date(soon) })).await, StatusCode::BAD_REQUEST);
+        assert_eq!(set(key.id.clone(), json!({ "date": date(soon) })).await, StatusCode::BAD_REQUEST);
+        assert_eq!(by("codex-c.json").snapshot()["takes_billing"], false);
+        // Clearing it leaves no field behind.
+        assert_eq!(set(by("claude-a.json").id.clone(), json!({ "date": null })).await, StatusCode::OK);
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("claude-a.json")).unwrap()).unwrap();
+        assert!(saved.get("billing").is_none());
+        assert!(by("claude-a.json").snapshot()["quota"].get("renewal").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_key_switch_returns_an_error_and_keeps_the_previous_state() {
+        let dir = std::env::temp_dir().join(format!("fusebox-key-switch-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = App::new(
+            Config {
+                auth_dir: dir.to_string_lossy().into(),
+                codex_api_key: vec![crate::config::KeyEntry { api_key: "synthetic".into(), ..Default::default() }],
+                ..Default::default()
+            },
+            dir.join("config.yaml"),
+        );
+        let account = app.pool.all()[0].clone();
+        let state_path = dir.join(".disabled-api-keys.state");
+        // A directory at the destination reliably rejects replacement on every OS.
+        std::fs::create_dir(&state_path).unwrap();
+        assert_eq!(
+            toggle_account(State(app.clone()), Path(account.id.clone()), Json(ToggleBody { disabled: true }))
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!account.state.lock().disabled);
+        app.reload_accounts();
+        assert!(!app.pool.get(&account.id).unwrap().state.lock().disabled);
+        std::fs::remove_dir(&state_path).unwrap();
+        assert_eq!(
+            toggle_account(State(app.clone()), Path(account.id.clone()), Json(ToggleBody { disabled: true }))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(account.state.lock().disabled);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_new_sign_in_replaces_the_revoked_tokens_even_while_they_refresh() {
+        let dir = std::env::temp_dir().join(format!("fusebox-sign-in-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("claude-d204ac98-x@example.test.json");
+        std::fs::write(
+            &old,
+            json!({"type":"claude","access_token":"old","refresh_token":"revoked","email":"x@example.test",
+                "account_uuid":"u1","expired":"2000-01-01T00:00:00Z"})
+            .to_string(),
+        )
+        .unwrap();
+        let app =
+            App::new(Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() }, dir.join("config.yaml"));
+        let acct = app.pool.all()[0].clone();
+        let id = acct.id.clone();
+        // A refresh of the revoked token is under way when the new sign-in arrives.
+        let refreshing = acct.refresh_lock.clone().lock_owned().await;
+        let fresh = crate::accounts::OAuth {
+            access_token: "new".into(),
+            refresh_token: "fresh".into(),
+            email: Some("x@example.test".into()),
+            account_id: Some("u1".into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(8)),
+            ..Default::default()
+        };
+        let saving = tokio::spawn({
+            let app = app.clone();
+            async move { save_sign_in(&app, Provider::Claude, &fresh, "claude-x@example.test.json", &[]).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!saving.is_finished(), "the save waits for the refresh");
+        // The refresh ends refused for good: the account waits for a sign-in.
+        {
+            let mut hold =
+                crate::accounts::RefreshHold::new("revoked", "OAuth endpoint returned HTTP 400 (invalid_grant)".into());
+            let mut st = acct.state.lock();
+            st.set_error(hold.error_text());
+            hold.error_id = st.last_error_id(chrono::Utc::now()).map(String::from);
+            st.refresh_hold = Some(hold);
+        }
+        assert!(acct.held_out());
+        drop(refreshing);
+        saving.await.unwrap().unwrap();
+        let all = app.pool.all();
+        assert_eq!(all.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), [id.as_str()], "one account, same ID");
+        let Credential::OAuth(o) = all[0].cred.read().clone() else { panic!() };
+        assert_eq!((o.access_token.as_str(), o.refresh_token.as_str()), ("new", "fresh"));
+        assert_eq!(all[0].state.lock().last_error(chrono::Utc::now()), None, "the old sign-in's error is over");
+        assert!(!all[0].held_out(), "the new refresh token lifts the hold");
+        oauth::ensure_fresh(&app, &all[0], chrono::Duration::minutes(5), false).await.unwrap();
+        assert!(all[0].state.lock().refresh_hold.is_none());
+        assert!(!dir.join("claude-x@example.test.json").exists());
+        // Other errors are not the sign-in's to clear.
+        all[0].state.lock().set_error("500: upstream exploded");
+        let again = crate::accounts::OAuth { refresh_token: "fresher".into(), ..o };
+        save_sign_in(&app, Provider::Claude, &again, "claude-x@example.test.json", &[]).await.unwrap();
+        assert_eq!(app.pool.all()[0].state.lock().last_error(chrono::Utc::now()), Some("500: upstream exploded"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signing_in_again_waits_for_pending_credential_writes() {
+        let dir = std::env::temp_dir().join(format!("fusebox-sign-in-save-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("account.json");
+        std::fs::write(
+            &path,
+            json!({"type":"codex", "access_token":"old", "refresh_token":"old-refresh", "account_id":"workspace"})
+                .to_string(),
+        )
+        .unwrap();
+        let app =
+            App::new(Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() }, dir.join("config.yaml"));
+        let account = app.pool.all()[0].clone();
+        let Credential::OAuth(old) = account.cred.read().clone() else { unreachable!() };
+        // A failed disk write leaves the old grant's rotated tokens to save later.
+        let obstacle = path.with_extension("json.tmp");
+        std::fs::create_dir(&obstacle).unwrap();
+        assert!(oauth::publish_refreshed(
+            &account,
+            crate::accounts::OAuth {
+                access_token: "rotated".into(),
+                refresh_token: "rotated-refresh".into(),
+                ..old.clone()
+            },
+            vec![],
+        ));
+        std::fs::remove_dir(obstacle).unwrap();
+        let mut pending = account.pending_oauth_save.lock();
+        assert!(pending.is_some());
+        let fresh =
+            crate::accounts::OAuth { access_token: "signed-in".into(), refresh_token: "fresh-grant".into(), ..old };
+        let (started, start) = std::sync::mpsc::channel();
+        let (finished, finish) = std::sync::mpsc::channel();
+        let saving = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            started.send(()).unwrap();
+            let result = runtime.block_on(save_sign_in(&app, Provider::Codex, &fresh, "account.json", &[]));
+            let _ = finished.send(());
+            result
+        });
+        start.recv().unwrap();
+        assert!(finish.recv_timeout(Duration::from_millis(50)).is_err(), "the pending writer still owns the file");
+        // Complete the deferred write under its normal lock. The new grant must
+        // be written afterwards, or this retry restores the superseded tokens.
+        let deferred = pending.as_ref().unwrap();
+        write_oauth_file(&path, Provider::Codex, &deferred.credential, &[]).unwrap();
+        *pending = None;
+        drop(pending);
+        saving.join().unwrap().unwrap();
+        let disk: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(disk["access_token"], "signed-in");
+        assert_eq!(disk["refresh_token"], "fresh-grant");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_never_overwrites_another_accounts_file() {
+        let dir = std::env::temp_dir().join(format!("fusebox-sign-in-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app =
+            App::new(Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() }, dir.join("config.yaml"));
+        let oauth = |id: &str, email: &str| crate::accounts::OAuth {
+            access_token: format!("FAKE_ACCESS_{id}"),
+            refresh_token: format!("FAKE_REFRESH_{id}"),
+            email: Some(email.into()),
+            account_id: Some(id.into()),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(8)),
+            ..Default::default()
+        };
+        let hex = |p: Provider, o: &crate::accounts::OAuth| Credential::OAuth(o.clone()).identity(p)[..8].to_string();
+        let token = |path: &std::path::Path| {
+            let saved: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            saved["access_token"].as_str().unwrap().to_string()
+        };
+        let cases = [
+            // `file_safe` writes both `a+b@x` and `a_b@x` as `a_b@x`.
+            (
+                Provider::Claude,
+                oauth("u1", "a_b@example.test"),
+                oauth("u2", "a+b@example.test"),
+                "claude-a_b@example.test",
+            ),
+            // One email, two ChatGPT workspaces on the same plan.
+            (
+                Provider::Codex,
+                oauth("w1", "w@example.test"),
+                oauth("w2", "w@example.test"),
+                "codex-w@example.test-plus",
+            ),
+        ];
+        for (provider, first, second, stem) in cases {
+            let name = format!("{stem}.json");
+            let first_path = save_sign_in(&app, provider, &first, &name, &[]).await.unwrap();
+            assert_eq!(first_path, dir.join(&name));
+            let second_path = save_sign_in(&app, provider, &second, &name, &[]).await.unwrap();
+            assert_eq!(second_path, dir.join(format!("{stem}-{}.json", hex(provider, &second))));
+            assert_eq!(token(&first_path), "FAKE_ACCESS_".to_string() + first.account_id.as_deref().unwrap());
+            assert_eq!(token(&second_path), "FAKE_ACCESS_".to_string() + second.account_id.as_deref().unwrap());
+            // Signing in again finds each account's own file.
+            let again = crate::accounts::OAuth { access_token: "FAKE_AGAIN".into(), ..second.clone() };
+            assert_eq!(save_sign_in(&app, provider, &again, &name, &[]).await.unwrap(), second_path);
+            assert_eq!(save_sign_in(&app, provider, &first, &name, &[]).await.unwrap(), first_path);
+            assert_eq!(token(&second_path), "FAKE_AGAIN");
+        }
+        assert_eq!(app.pool.all().len(), 4, "four accounts, none overwritten");
+        // A file under the suffixed name holding yet another account is kept as well.
+        let third = oauth("w3", "w@example.test");
+        let squatter = dir.join(format!("codex-w@example.test-plus-{}.json", hex(Provider::Codex, &third)));
+        std::fs::write(
+            &squatter,
+            json!({"type":"codex","access_token":"FAKE_SQUATTER","refresh_token":"FAKE_R","email":"w@example.test",
+                "account_id":"w9"})
+            .to_string(),
+        )
+        .unwrap();
+        let full = Credential::OAuth(third.clone()).identity(Provider::Codex);
+        let third_path =
+            save_sign_in(&app, Provider::Codex, &third, "codex-w@example.test-plus.json", &[]).await.unwrap();
+        assert_eq!(third_path, dir.join(format!("codex-w@example.test-plus-{}.json", &full[..16])));
+        assert_eq!(token(&squatter), "FAKE_SQUATTER");
+        assert_eq!(token(&third_path), "FAKE_ACCESS_w3");
+        // One email is one Claude account: a new UUID for it still signs that file in again.
+        let renewed = oauth("u3", "a_b@example.test");
+        assert_eq!(
+            sign_in_path(&app, Provider::Claude, &renewed, "claude-a_b@example.test.json"),
+            dir.join("claude-a_b@example.test.json")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signing_in_again_reuses_the_accounts_file_whatever_it_is_called() {
+        let dir = std::env::temp_dir().join(format!("fusebox-sign-in-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: Value| std::fs::write(dir.join(name), body.to_string()).unwrap();
+        // Production on 2026-10-31: an older release named this file with a prefix.
+        file(
+            "claude-d204ac98-x@example.test.json",
+            json!({"type":"claude","access_token":"old","refresh_token":"revoked","email":"x@example.test",
+                "account_uuid":"u1","expired":"2099-01-01T00:00:00Z","priority":10}),
+        );
+        file(
+            "claude-legacy-old@example.test.json",
+            json!({"type":"claude","access_token":"a","refresh_token":"b","email":"old@example.test"}),
+        );
+        file(
+            "codex-w@example.test-plus.json",
+            json!({"type":"codex","access_token":"c","refresh_token":"d","email":"w@example.test","account_id":"w1"}),
+        );
+        let app =
+            App::new(Config { auth_dir: dir.to_string_lossy().into(), ..Default::default() }, dir.join("config.yaml"));
+        let oauth = |id: &str, email: &str| crate::accounts::OAuth {
+            access_token: "new".into(),
+            refresh_token: "fresh".into(),
+            email: Some(email.into()),
+            account_id: Some(id.into()),
+            ..Default::default()
+        };
+        let path = |p: Provider, o: &crate::accounts::OAuth, name: &str| sign_in_path(&app, p, o, name);
+        let x = oauth("u1", "x@example.test");
+        assert_eq!(
+            path(Provider::Claude, &x, "claude-x@example.test.json"),
+            dir.join("claude-d204ac98-x@example.test.json")
+        );
+        let other = oauth("u9", "y@example.test");
+        assert_eq!(
+            path(Provider::Claude, &other, "claude-y@example.test.json"),
+            dir.join("claude-y@example.test.json")
+        );
+        let legacy = oauth("u5", "old@example.test");
+        assert_eq!(
+            path(Provider::Claude, &legacy, "claude-old@example.test.json"),
+            dir.join("claude-legacy-old@example.test.json"),
+            "a Claude file without its UUID is found by email"
+        );
+        // A ChatGPT email can have several workspaces: only the same account ID counts, and
+        // another workspace gets a file of its own rather than overwriting this one.
+        let workspace = oauth("w2", "w@example.test");
+        let hex = &Credential::OAuth(workspace.clone()).identity(Provider::Codex)[..8];
+        assert_eq!(
+            path(Provider::Codex, &workspace, "codex-w@example.test-plus.json"),
+            dir.join(format!("codex-w@example.test-plus-{hex}.json"))
+        );
+        let same = oauth("w1", "w@example.test");
+        assert_eq!(
+            path(Provider::Codex, &same, "codex-w@example.test-pro.json"),
+            dir.join("codex-w@example.test-plus.json")
+        );
+        assert_eq!(path(Provider::Claude, &same, "claude-w@example.test.json"), dir.join("claude-w@example.test.json"));
+
+        // Signing in again keeps the account's ID and settings and replaces only its tokens.
+        let before: Vec<String> = app.pool.all().iter().map(|a| a.id.clone()).collect();
+        let target = path(Provider::Claude, &x, "claude-x@example.test.json");
+        write_oauth_file(&target, Provider::Claude, &x, &[]).unwrap();
+        app.reload_accounts();
+        let after: Vec<String> = app.pool.all().iter().map(|a| a.id.clone()).collect();
+        assert_eq!(after, before, "no second account");
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!((saved["refresh_token"].as_str(), saved["priority"].as_i64()), (Some("fresh"), Some(10)));
+        // Where the usual name already holds the account too, that file is the one used.
+        file(
+            "claude-x@example.test.json",
+            json!({"type":"claude","access_token":"e","refresh_token":"f","email":"x@example.test","account_uuid":"u1"}),
+        );
+        app.reload_accounts();
+        assert_eq!(path(Provider::Claude, &x, "claude-x@example.test.json"), dir.join("claude-x@example.test.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn clearing_an_account_error_is_authenticated_scoped_and_race_safe() {
@@ -1941,16 +2825,46 @@ mod tests {
                 .unwrap();
         request.headers_mut().insert("authorization", "Bearer secret".parse().unwrap());
         let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        let mut next_faults = async || loop {
-            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        // Waits for a faults message with this list (the ticker's first broadcast may repeat
+        // the state the socket started with).
+        let mut faults_become = async |want: &Value, what: &str| loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap_or_else(|_| panic!("{what}"))
+                .unwrap()
+                .unwrap();
             let msg: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-            if msg["type"] == "faults" {
-                return msg["data"].clone();
+            if msg["type"] == "faults" && msg["data"] == *want {
+                return msg["dismissed"].clone();
             }
         };
-        assert_eq!(next_faults().await, listed, "a new socket starts with every fault");
+        faults_become(&listed, "a new socket starts with every fault").await;
+
+        // Dismissed, the fault leaves the list everywhere, and comes back when restored.
+        let post = |path: &str, body: Value| {
+            client
+                .post(format!("http://{addr}/{path}"))
+                .header("x-forwarded-for", "100.64.0.7")
+                .bearer_auth("secret")
+                .json(&body)
+                .send()
+        };
+        let get = |path: &str| {
+            let request = client.get(format!("http://{addr}/{path}")).header("x-forwarded-for", "100.64.0.7");
+            async move { request.bearer_auth("secret").send().await.unwrap().json::<Value>().await.unwrap() }
+        };
+        let key = fault["key"].clone();
+        assert_eq!(post("faults/dismiss", json!({"key": "error:nobody"})).await.unwrap().status(), 404);
+        assert_eq!(post("faults/dismiss", json!({"key": key})).await.unwrap().status(), 200);
+        assert_eq!(faults_become(&json!([]), "a dismissed fault leaves the live list").await, listed);
+        assert_eq!(get("faults").await, json!([]));
+        assert_eq!(get("faults/dismissed").await, listed);
+        assert_eq!(post("faults/restore", json!({"key": key})).await.unwrap().status(), 200);
+        assert_eq!(faults_become(&listed, "a restored fault is listed again").await, json!([]));
+        assert_eq!(get("faults/dismissed").await, json!([]));
+
         account.state.lock().clear_error();
-        assert_eq!(next_faults().await, json!([]), "a cleared fault is sent at once");
+        faults_become(&json!([]), "a cleared fault is sent at once").await;
         server.abort();
     }
 

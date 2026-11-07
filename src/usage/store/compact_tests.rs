@@ -43,7 +43,7 @@ const START: &str = "2026-03-27T00:00:00Z";
 /// off bucket boundaries across the Amsterdam DST change on 29 March.
 fn journal(seed: u64, count: usize) -> Vec<Observation> {
     let mut rng = Lcg(seed);
-    let base = boundary(START, chrono_tz::UTC).unwrap();
+    let base = boundary(START, &crate::zone::Zone::utc()).unwrap();
     let mut out = Vec::new();
     for i in 0..count {
         let source = match rng.next(10) {
@@ -91,6 +91,10 @@ fn journal(seed: u64, count: usize) -> Vec<Observation> {
             }
             _ => {}
         }
+        // Claude Code clients name an entrypoint; other proxy calls and imports have none.
+        if source == "proxy" && provider == "anthropic" {
+            o.entrypoint = [None, Some("sdk-ts"), Some("cli"), Some("t3-code")][i % 4].map(Into::into);
+        }
         out.push(o);
     }
     out
@@ -115,6 +119,16 @@ fn queries() -> Vec<Query> {
                 timezone: Some(zone.into()),
                 ..Default::default()
             });
+            // Partial buckets at both ends read entries for one entrypoint only.
+            if zone == "Asia/Kathmandu" {
+                out.push(Query {
+                    start: start.map(Into::into),
+                    end: end.map(Into::into),
+                    timezone: Some(zone.into()),
+                    entrypoint: Some("sdk-ts".into()),
+                    ..Default::default()
+                });
+            }
         }
     }
     let base = Query {
@@ -128,6 +142,15 @@ fn queries() -> Vec<Query> {
         |q: &mut Query| q.model = Some("claude-sonnet-4-6".into()),
         |q: &mut Query| q.account = Some("account-1".into()),
         |q: &mut Query| q.client = Some("client-0".into()),
+        |q: &mut Query| q.entrypoint = Some("sdk-ts".into()),
+        |q: &mut Query| {
+            q.entrypoint = Some("cli".into());
+            q.account = Some("account-1".into());
+        },
+        |q: &mut Query| {
+            q.entrypoint = Some("t3-code".into());
+            q.source = Some("codex".into());
+        },
         |q: &mut Query| q.client = Some("collector:laptop".into()),
         |q: &mut Query| q.source = Some("proxy".into()),
         |q: &mut Query| q.source = Some("codex".into()),
@@ -148,30 +171,37 @@ async fn assert_rollups_match(store: &Store) {
         let fast = store.dashboard(q.clone()).await.unwrap();
         let scan = store.dashboard_scan(q.clone()).await.unwrap();
         assert_eq!(fast, scan, "rollup summary differs for {q:?}");
+        let fast = store.entrypoints(q.clone()).await.unwrap();
+        assert_eq!(fast, store.entrypoints_scan(q.clone()).await.unwrap(), "entrypoints differ for {q:?}");
     }
     // The triggers must leave exactly what a rebuild from scratch produces.
     store
         .call(|c| {
-            let dump = |c: &Connection| -> Result<(Vec<String>, Vec<String>)> {
+            let dump = |c: &Connection| -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
                 let rows = |sql: &str| -> Result<Vec<String>> {
                     Ok(c.prepare(sql)?.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?)
                 };
-                let sums = (0..8).map(|i| format!("k{i},s{i}")).collect::<Vec<_>>().join(",");
+                let sums = (0..rollup::AMOUNTS.len()).map(|i| format!("k{i},s{i}")).collect::<Vec<_>>().join(",");
                 Ok((
                     rows(&format!(
                         "SELECT json_array(bucket,dims,provider,model,account_id,client,observations,partial,missing,pricing_partial,{sums}) FROM usage_rollup ORDER BY bucket,dims"
                     ))?,
                     rows("SELECT json_array(bucket,dims,source,observations) FROM usage_facets ORDER BY bucket,dims")?,
+                    rows(&format!(
+                        "SELECT json_array(bucket,dims,provider,model,account_id,client,entrypoint,observations,partial,missing,pricing_partial,{sums}) FROM usage_entrypoint_rollup ORDER BY bucket,dims"
+                    ))?,
                 ))
             };
             let live = dump(c)?;
             let tx = c.transaction()?;
-            tx.execute_batch("DELETE FROM usage_rollup; DELETE FROM usage_facets;")?;
+            tx.execute_batch("DELETE FROM usage_rollup; DELETE FROM usage_facets; DELETE FROM usage_entrypoint_rollup;")?;
             rollup::backfill(&tx)?;
+            rollup::backfill_entrypoints(&tx)?;
             let rebuilt = dump(&tx)?;
             tx.rollback()?;
             assert_eq!(live, rebuilt, "rollups drifted from the journal");
             assert!(!live.0.is_empty());
+            assert!(!live.2.is_empty(), "the journal has calls with an entrypoint");
             Ok(())
         })
         .await
@@ -199,7 +229,7 @@ async fn rollups_match_a_full_scan_through_inserts_purges_suppression_and_repric
     // More evidence for the same responses, then a purge through the middle of a bucket.
     let records = journal(8, 600);
     store.call(move |c| insert_batch(c, &records)).await.unwrap();
-    let cut = boundary("2026-03-27T09:07:30Z", chrono_tz::UTC).unwrap();
+    let cut = boundary("2026-03-27T09:07:30Z", &crate::zone::Zone::utc()).unwrap();
     store.purge(cut).await.unwrap();
     // Repricing rewrites entries in place through delete and insert.
     store
@@ -229,7 +259,7 @@ async fn sums_beyond_64_bits_fall_back_to_the_exact_scan() {
     let store = Store::open(&p, 64, 3650, None).unwrap();
     let mut records = journal(3, 50);
     // 200 maximal responses in one bucket: their cost passes the 64-bit range.
-    let at = boundary("2026-03-28T12:01:00Z", chrono_tz::UTC).unwrap();
+    let at = boundary("2026-03-28T12:01:00Z", &crate::zone::Zone::utc()).unwrap();
     for i in 0..200 {
         let mut o = Observation::new("proxy", format!("huge-{i}"), "openai", at + i);
         o.actual_model = Some("gpt-6-astra".into());
@@ -284,7 +314,7 @@ fn documents(c: &Connection) -> Result<Vec<Document>> {
 #[tokio::test]
 async fn compression_is_invisible_to_readers_and_downgrade_restores_the_original_text() {
     let p = temp("compress");
-    let store = Store::open(&p, 64, 3650, None).unwrap();
+    let store = Store::start(&p, 64, 3650, Catalogue::provider_fixture(), None).unwrap();
     let records = journal(11, 1200);
     store.call(move |c| insert_batch(c, &records)).await.unwrap();
     let everything = Query { start: Some("2026-03-01".into()), end: Some("2026-05-01".into()), ..Default::default() };
@@ -437,7 +467,7 @@ async fn compression_is_invisible_to_readers_and_downgrade_restores_the_original
     drop(c);
 
     // And forward again: the same records, the same totals.
-    let store = Store::open(&p, 64, 3650, None).unwrap();
+    let store = Store::start(&p, 64, 3650, Catalogue::provider_fixture(), None).unwrap();
     assert_eq!(store.dashboard_scan(everything.clone()).await.unwrap(), store.dashboard(everything).await.unwrap());
     let back = store.call(|c| documents(c)).await.unwrap();
     assert_eq!(strip(&back), strip(&latest));

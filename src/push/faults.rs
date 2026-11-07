@@ -20,6 +20,12 @@ pub enum Event {
     /// A named client's key used from a new address, or refused at one. Sent as it
     /// happens rather than found by the check.
     ClientAddress,
+    /// A new banked reset, one used automatically, needing review, or expired unused.
+    /// Sent when observed, independently of the fault check.
+    BankedReset,
+    /// A subscription charges again, or ends, within two days. Sent by its own check,
+    /// once for each date, and never listed as a fault.
+    Renewal,
     /// Counted for the app badge, never sent (rate limits come and go too often).
     #[default]
     Quiet,
@@ -28,7 +34,7 @@ pub enum Event {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Fault {
     /// Stable identity: `signin:<id>`, `quota:<id>`, `error:<id>`, `failures:<id>`,
-    /// `rate:<id>`, `pace:<id>:<window>`, `pace:pool:<provider>:<window>` or
+    /// `rate:<id>`, `credit:<id>`, `pace:<id>:<window>`, `pace:pool:<provider>:<window>` or
     /// `provider:<provider>`. Also the notification's tag.
     pub key: String,
     pub event: Event,
@@ -139,6 +145,8 @@ pub struct AccountView {
     pub subscription: bool,
     /// The subscription plan, as the quota reports it ("max_20x").
     pub plan: Option<String>,
+    /// The provider confirmed the account has no 5-hour limit.
+    pub no_five_hour: bool,
     pub disabled: bool,
     /// From `AccountState::pauses`: model -> (until, kind).
     pub pauses: BTreeMap<String, (DateTime<Utc>, &'static str)>,
@@ -150,6 +158,10 @@ pub struct AccountView {
     /// Per current window (name, model scope): the points of it each client used, by the
     /// client's name (from quota attribution).
     pub clients: Vec<(String, Option<String>, BTreeMap<String, f64>)>,
+    /// When the subscription next charges, or ends.
+    pub renewal: Option<crate::quota::NextRenewal>,
+    /// A sustained run of refused usage reads: (HTTP status, since when).
+    pub usage_refused: Option<(u16, DateTime<Utc>)>,
 }
 
 impl AccountView {
@@ -163,6 +175,8 @@ impl AccountView {
             windows: &self.windows,
             history: &self.history,
             forecast_available: !self.signin_error(),
+            no_five_hour: self.no_five_hour,
+            paused: matches!(self.pauses.get("*"), Some((_, "quota" | "rate_limit" | "credit"))),
         }
     }
 
@@ -177,7 +191,7 @@ impl AccountView {
 
     /// Can't take any request now: paused whole for a limit, or its sign-in expired.
     fn unavailable(&self) -> bool {
-        matches!(self.pauses.get("*"), Some((_, "quota" | "rate_limit"))) || self.signin_error()
+        matches!(self.pauses.get("*"), Some((_, "quota" | "rate_limit" | "credit"))) || self.signin_error()
     }
 
     fn path(&self) -> String {
@@ -269,6 +283,22 @@ pub fn faults(accounts: &[AccountView], now: DateTime<Utc>) -> Vec<Fault> {
                     )
                 });
             }
+            // Only adding credit brings it back; meanwhile requests skip it.
+            Some((_, (until, "credit"))) => {
+                out.push(Fault {
+                    kind: "credit",
+                    level: "err",
+                    summary: "API credit used up".into(),
+                    detail: Some("Add credit to this API key. Requests skip it meanwhile.".into()),
+                    until: Some(*until),
+                    ..fault(
+                        "credit",
+                        Event::AccountErrors,
+                        format!("{}: API credit used up", a.label),
+                        format!("{} · add credit; requests skip it for {}.", a.provider_name, span(*until - now)),
+                    )
+                });
+            }
             Some((model, (until, "rate_limit"))) => {
                 let what = if model == "*" { "Every model".to_string() } else { model.clone() };
                 out.push(Fault {
@@ -352,6 +382,28 @@ pub fn faults(accounts: &[AccountView], now: DateTime<Utc>) -> Vec<Fault> {
                     )
                 });
             }
+        }
+        // Usage reads refused for a while after good refreshes: the readings
+        // shown are stale and the account may be suspended. Display only —
+        // routing is untouched — and the sign-in fault already covers an
+        // account whose error says to sign in again.
+        if let Some((status, since)) = a.usage_refused
+            && !a.signin_error()
+        {
+            out.push(Fault {
+                kind: "error",
+                level: "warn",
+                summary: "Usage check refused".into(),
+                detail: Some(format!(
+                    "The provider answers HTTP {status} to usage checks; the quota shown may be stale. Requests are not paused by this."
+                )),
+                ..fault(
+                    "usage-refused",
+                    Event::AccountErrors,
+                    format!("{}: usage check refused (HTTP {status})", a.label),
+                    format!("{} · refused for {}; quota shown may be stale.", a.provider_name, span(now - since)),
+                )
+            });
         }
         if a.failures >= 3 && !error {
             let mut f = Fault {
@@ -561,6 +613,11 @@ mod tests {
             "Your refresh token was revoked",
             "OAuth token has expired",
             "please sign in again",
+            // A refresh token refused for good (`RefreshHold::error_text`): the codes alone
+            // would not read as a sign-in, so the text says it.
+            "refresh failed: OAuth endpoint returned HTTP 400 (refresh_token_reused); sign in again",
+            "refresh failed: OAuth endpoint returned HTTP 400 (token_revoked); sign in again",
+            "refresh failed: OAuth endpoint returned HTTP 401; sign in again",
         ] {
             assert!(signin_error(text), "{text}");
         }
@@ -570,10 +627,27 @@ mod tests {
     }
 
     #[test]
+    fn a_sustained_usage_refusal_warns_without_touching_the_signin_fault() {
+        let now = Utc::now();
+        let mut refused = acct("u", "claude");
+        refused.usage_refused = Some((403, now - Duration::hours(2)));
+        let f = faults(std::slice::from_ref(&refused), now);
+        assert_eq!(keys(&f), ["usage-refused:u"]);
+        assert_eq!((f[0].kind, f[0].level, f[0].event), ("error", "warn", Event::AccountErrors));
+        assert!(f[0].detail.as_deref().unwrap().contains("HTTP 403"), "{f:?}");
+        // A sign-in error already says it louder; no second fault.
+        refused.last_error = Some("401 Unauthorized".into());
+        let f = faults(&[refused], now);
+        assert!(keys(&f).contains(&"signin:u") && !keys(&f).contains(&"usage-refused:u"), "{:?}", keys(&f));
+    }
+
+    #[test]
     fn mirrors_the_faults_menu() {
         let now = Utc::now();
+        // Held out for a sign-in: no pause, so nothing hides the fault.
         let mut signin = acct("a", "claude");
-        signin.last_error = Some("token refresh failed: invalid_grant".into());
+        signin.last_error =
+            Some("refresh failed: OAuth endpoint returned HTTP 400 (token_revoked); sign in again".into());
         let mut key = acct("k", "claude");
         key.api_key = true;
         key.last_error = Some("401 Unauthorized".into());
@@ -591,9 +665,16 @@ mod tests {
         let mut off = acct("d", "claude");
         off.disabled = true;
         off.last_error = Some("invalid_grant".into());
+        // An API key out of prepaid credit says so, rather than "rate limited".
+        let mut broke = acct("b", "claude");
+        broke.api_key = true;
+        broke.pauses.insert("*".into(), (now + Duration::minutes(30), "credit"));
+        broke.last_error = Some("API credit balance too low: Your credit balance is too low".into());
 
-        let f = faults(&[signin, key, spent, limited, checking, off], now);
-        assert_eq!(keys(&f), ["signin:a", "error:k", "quota:q", "rate:r", "failures:r"]);
+        let f = faults(&[signin, key, spent, limited, checking, off, broke], now);
+        assert_eq!(keys(&f), ["signin:a", "error:k", "quota:q", "rate:r", "failures:r", "credit:b"]);
+        assert_eq!(f[5].event, Event::AccountErrors);
+        assert_eq!(f[5].title, "b@example.com: API credit used up");
         assert_eq!(f[0].title, "Claude sign-in expired");
         assert_eq!(f[0].path, "#/accounts/a");
         assert_eq!(f[2].title, "q@example.com: weekly limit used up");
@@ -761,6 +842,38 @@ mod tests {
         assert_eq!(keys(&f), ["pace:a:week"]);
         assert_eq!(f[0].detail.as_deref(), Some("It would run out before it renews. The laptop used 56% of it."));
         assert_eq!(f[0].account.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn an_ultra_account_that_cannot_serve_leaves_the_five_hour_warning() {
+        let now = Utc::now();
+        let five = |used, reset| Window { name: "5h".into(), used, resets_at: Some(reset), model: None };
+        let week = |used| Window { name: "week".into(), used, resets_at: Some(now + Duration::days(3)), model: None };
+        let limited = AccountView {
+            subscription: true,
+            plan: Some("max_5x".into()),
+            windows: vec![five(90.0, now + Duration::hours(1)), week(10.0)],
+            ..acct("limited", "claude")
+        };
+        let ultra = |last_error: Option<&str>, used| AccountView {
+            subscription: true,
+            plan: Some("max_20x".into()),
+            no_five_hour: true,
+            last_error: last_error.map(String::from),
+            windows: vec![week(used)],
+            ..acct("ultra", "claude")
+        };
+        let warned = |accounts: &[AccountView]| faults(accounts, now).iter().any(|f| f.key == "pace:pool:claude:5h");
+        assert!(!warned(&[limited.clone(), ultra(None, 10.0)]), "a working Ultra account takes the overflow");
+        assert!(warned(&[limited.clone(), ultra(Some("401: sign in again"), 100.0)]));
+        assert!(warned(&[limited.clone(), ultra(Some("refresh failed: invalid_grant"), 10.0)]), "signed out");
+        assert!(warned(&[limited.clone(), ultra(None, 100.0)]), "its week used up");
+        let paused = AccountView {
+            pauses: BTreeMap::from([("*".to_string(), (now + Duration::hours(2), "rate_limit"))]),
+            ..ultra(None, 10.0)
+        };
+        assert!(paused.unavailable());
+        assert!(warned(&[limited, paused]), "paused as a whole");
     }
 
     #[test]

@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
 use crate::formats::{self, Frame};
 use crate::ir::Format;
@@ -43,7 +43,15 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(middleware::from_fn_with_state(app.clone(), request_body::encoded_body))
         .layer(middleware::from_fn_with_state(app.clone(), client_auth))
         .layer(DefaultBodyLimit::max(request_body::MAX_BODY_SIZE))
-        .layer(CorsLayer::permissive());
+        // Any origin, with no cookies or credentials. Headers a preflight asks for are
+        // allowed by name: the `*` of `CorsLayer::permissive` doesn't cover `Authorization`.
+        .layer(
+            CorsLayer::new()
+                .allow_headers(AllowHeaders::mirror_request())
+                .allow_methods(Any)
+                .allow_origin(Any)
+                .expose_headers(Any),
+        );
 
     Router::new()
         .merge(api)
@@ -64,6 +72,13 @@ pub fn router(app: Arc<App>) -> Router {
             Router::new()
                 .route("/metrics", get(crate::metrics::metrics))
                 .layer(middleware::from_fn_with_state(app.clone(), crate::mgmt::auth)),
+        )
+        // Pool-level status for client keys (status lines, agents checking
+        // quota). Its own light auth, no CORS: it is not a browser API.
+        .merge(
+            Router::new()
+                .route("/v1/fusebox/status", get(fusebox_status))
+                .layer(middleware::from_fn_with_state(app.clone(), status_auth)),
         )
         // Before anything else, so every check and log line sees the real client.
         .layer(middleware::from_fn_with_state(app.clone(), crate::source::layer))
@@ -101,11 +116,11 @@ impl ClientAuth {
     }
 }
 
-async fn client_auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
-    let cfg = app.cfg();
+/// The credential a request carries, in the spellings clients use.
+fn provided_key(req: &Request) -> Option<String> {
     let h = req.headers();
     let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(str::trim).map(String::from);
-    let provided = get("authorization")
+    get("authorization")
         .and_then(|v| v.strip_prefix("Bearer ").map(|s| s.trim().to_string()))
         .or_else(|| get("x-api-key"))
         .or_else(|| get("x-goog-api-key"))
@@ -113,7 +128,12 @@ async fn client_auth(State(app): State<Arc<App>>, mut req: Request, next: Next) 
             req.uri().query().and_then(|q| {
                 url::form_urlencoded::parse(q.as_bytes()).find(|(k, _)| k == "key").map(|(_, v)| v.into_owned())
             })
-        });
+        })
+}
+
+async fn client_auth(State(app): State<Arc<App>>, mut req: Request, next: Next) -> Response {
+    let cfg = app.cfg();
+    let provided = provided_key(&req);
     // Collector credentials are ingestion-only even on an otherwise open proxy.
     let collector_key = provided.as_deref().is_some_and(|k| k.starts_with("fbxc_"));
     let named = provided.as_ref().and_then(|k| cfg.named_clients.iter().find(|c| crate::mgmt::constant_eq(&c.key, k)));
@@ -199,6 +219,148 @@ async fn client_auth(State(app): State<Arc<App>>, mut req: Request, next: Next) 
         .into_response()
 }
 
+/// Status reads accept any client key (never a collector key, which is
+/// ingestion-only) and apply only a named client's expiry and address list.
+/// They count as no request anywhere: no rate, budget, stats or usage.
+async fn status_auth(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    let cfg = app.cfg();
+    let provided = provided_key(&req);
+    let refused = |status: u16, message: &str| {
+        (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+            axum::Json(formats::error_body(Format::Chat, status, message)),
+        )
+            .into_response()
+    };
+    if provided.as_deref().is_some_and(|k| k.starts_with("fbxc_")) {
+        return refused(401, "invalid or missing API key");
+    }
+    let named = provided.as_ref().and_then(|k| cfg.named_clients.iter().find(|c| crate::mgmt::constant_eq(&c.key, k)));
+    let open = cfg.api_keys.is_empty() && cfg.named_clients.is_empty();
+    let shared = provided.as_ref().is_some_and(|k| cfg.api_keys.iter().any(|a| crate::mgmt::constant_eq(a, k)));
+    if !open && named.is_none() && !shared {
+        return refused(401, "invalid or missing API key");
+    }
+    if open
+        && cfg.is_loopback()
+        && let Some(problem) = crate::mgmt::foreign_page(&req)
+    {
+        return refused(403, problem);
+    }
+    if let Some(client) = named
+        && let Err(denied) = app.clients.admit_status(client, req.headers())
+    {
+        return refused(denied.status, &denied.message);
+    }
+    next.run(req).await
+}
+
+/// Pool-level status for whoever holds a client key: combined quota pools,
+/// account counts and next resets. No account ids, labels, emails or key
+/// material — safe to poll from a status line or a coding agent deciding
+/// whether to start more work. `?format=line` answers one line of text.
+async fn fusebox_status(
+    State(app): State<Arc<App>>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let now = chrono::Utc::now();
+    let accounts = app.pool.all();
+    let (mut ready, mut cooling, mut held, mut disabled) = (0usize, 0usize, 0usize, 0usize);
+    let mut by_provider: std::collections::BTreeMap<&str, (usize, usize, Option<chrono::DateTime<chrono::Utc>>)> =
+        std::collections::BTreeMap::new();
+    let mut lone_windows: std::collections::BTreeMap<&str, Vec<Value>> = std::collections::BTreeMap::new();
+    for acct in &accounts {
+        // Before the state lock, which `held_out` takes too.
+        let is_held = acct.held_out();
+        let models = acct.public_models();
+        let st = acct.state.lock();
+        let pauses = st.pauses(now);
+        // Ready means a request can be routed to it: an account serving no
+        // model, or with every one of its models paused, is as unavailable as
+        // an account-wide pause.
+        let routable = models.iter().any(|m| !pauses.contains_key(m.as_str()));
+        let is_ready = !is_held && !st.disabled && !pauses.contains_key("*") && routable;
+        ready += usize::from(is_ready);
+        cooling += usize::from(!st.disabled && !pauses.is_empty());
+        held += usize::from(is_held);
+        disabled += usize::from(st.disabled);
+        let entry = by_provider.entry(acct.provider.as_str()).or_insert((0, 0, None));
+        entry.0 += 1;
+        entry.1 += usize::from(is_ready);
+        for window in &st.quota.windows {
+            if let Some(at) = window.resets_at.filter(|at| *at > now) {
+                entry.2 = Some(entry.2.map_or(at, |prev| prev.min(at)));
+            }
+            if window.model.is_none() {
+                lone_windows.entry(acct.provider.as_str()).or_default().push(json!({
+                    "name": window.name, "used": window.used,
+                    "resets_at": window.resets_at.map(|t| t.to_rfc3339()),
+                }));
+            }
+        }
+    }
+    let mut pools = crate::push::current_pools(&app);
+    let pooled: std::collections::HashSet<String> = pools
+        .as_array()
+        .map(|list| list.iter().filter_map(|p| p["provider"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    if let Some(list) = pools.as_array_mut() {
+        for pool in list {
+            if let Some(pool) = pool.as_object_mut() {
+                pool.remove("account_ids");
+            }
+        }
+    }
+    // A provider with one account has no pool; its windows ride along here
+    // unweighted, with no account identity anywhere near them.
+    let providers: Vec<Value> = by_provider
+        .into_iter()
+        .map(|(provider, (total, ready_n, next_reset))| {
+            let windows =
+                if pooled.contains(provider) { Vec::new() } else { lone_windows.remove(provider).unwrap_or_default() };
+            json!({
+                "provider": provider, "accounts": total, "ready": ready_n,
+                "next_reset": next_reset.map(|t| t.to_rfc3339()), "windows": windows,
+            })
+        })
+        .collect();
+    let status = if ready > 0 { "ready" } else { "unavailable" };
+    if query.get("format").is_some_and(|f| f == "line") {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(list) = pools.as_array() {
+            for pool in list {
+                parts.push(format!(
+                    "{} {} {:.0}%",
+                    pool["provider"].as_str().unwrap_or_default(),
+                    pool["window"].as_str().unwrap_or_default(),
+                    pool["used"].as_f64().unwrap_or_default()
+                ));
+            }
+        }
+        for provider in &providers {
+            for window in provider["windows"].as_array().map(Vec::as_slice).unwrap_or_default() {
+                parts.push(format!(
+                    "{} {} {:.0}%",
+                    provider["provider"].as_str().unwrap_or_default(),
+                    window["name"].as_str().unwrap_or_default(),
+                    window["used"].as_f64().unwrap_or_default()
+                ));
+            }
+        }
+        parts.push(format!("{ready}/{} accounts ready", accounts.len()));
+        return ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], format!("{}\n", parts.join(" · ")))
+            .into_response();
+    }
+    axum::Json(json!({
+        "status": status,
+        "accounts": {"total": accounts.len(), "ready": ready, "cooling": cooling, "held": held, "disabled": disabled},
+        "providers": providers,
+        "pools": pools,
+        "models": app.pool.models().len(),
+    }))
+    .into_response()
+}
+
 /// A named client's admitted request: its address is recorded, and is news when new.
 pub(crate) fn address_used(app: &Arc<App>, client: &crate::config::NamedClient, source: &crate::source::Source) {
     if app.addresses.note(&client.id, source) == crate::addresses::Noted::New {
@@ -258,6 +420,7 @@ async fn run(app: Arc<App>, format: Format, headers: HeaderMap, body: Bytes) -> 
         session: None,
         session_source: None,
         routing_selection: None,
+        pinned_account: None,
     };
     reply(format, proxy::execute(app, call).await, false)
 }
@@ -294,16 +457,28 @@ fn outcome(o: crate::media::Outcome) -> Response {
     }
 }
 
-/// A named client may only use the models its limits allow, media models included.
-fn model_denied(app: &App, headers: &HeaderMap, body: &Value, fallback: &str) -> Option<Response> {
-    let model = body["model"].as_str().filter(|m| !m.is_empty()).unwrap_or(fallback);
-    let denied = crate::policy::check_model(app, headers, model).err()?;
-    Some(outcome(Err((denied.status, formats::error_body(Format::Chat, denied.status, &denied.message)))))
+/// A named client may only use the models its limits allow, media models
+/// included; its model-map rewrites the body's model first, as everywhere.
+fn model_denied(app: &App, headers: &HeaderMap, body: &mut Value, fallback: &str) -> Option<Response> {
+    let model = body["model"].as_str().filter(|m| !m.is_empty()).unwrap_or(fallback).to_string();
+    let admitted = match crate::policy::admit_model(app, headers, &model) {
+        Ok(admitted) => admitted,
+        Err(denied) => {
+            return Some(outcome(Err((
+                denied.status,
+                formats::error_body(Format::Chat, denied.status, &denied.message),
+            ))));
+        }
+    };
+    if admitted.mapped.is_some() {
+        body["model"] = admitted.model.into();
+    }
+    None
 }
 
 async fn image_generations(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     match parse_body(&app, Format::Chat, &headers, &body) {
-        Ok(v) => match model_denied(&app, &headers, &v, crate::media::DEFAULT_IMAGE_MODEL) {
+        Ok(mut v) => match model_denied(&app, &headers, &mut v, crate::media::DEFAULT_IMAGE_MODEL) {
             Some(r) => r,
             None => outcome(crate::media::images(app, headers, v, false).await),
         },
@@ -315,7 +490,7 @@ async fn image_edits(State(app): State<Arc<App>>, req: Request) -> Response {
     let headers = req.headers().clone();
     let multipart =
         headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("multipart/"));
-    let body = if multipart {
+    let mut body = if multipart {
         let form = match axum::extract::Multipart::from_request(req, &app).await {
             Ok(f) => f,
             Err(e) => return outcome(Err((400, formats::error_body(Format::Chat, 400, &e.body_text())))),
@@ -334,7 +509,7 @@ async fn image_edits(State(app): State<Arc<App>>, req: Request) -> Response {
             Err(r) => return *r,
         }
     };
-    if let Some(r) = model_denied(&app, &headers, &body, crate::media::DEFAULT_IMAGE_MODEL) {
+    if let Some(r) = model_denied(&app, &headers, &mut body, crate::media::DEFAULT_IMAGE_MODEL) {
         return r;
     }
     outcome(crate::media::images(app, headers, body, true).await)
@@ -350,7 +525,7 @@ async fn video_create(
         return outcome(Err((404, formats::error_body(Format::Chat, 404, "unknown video endpoint"))));
     }
     match parse_body(&app, Format::Chat, &headers, &body) {
-        Ok(v) => match model_denied(&app, &headers, &v, crate::media::DEFAULT_VIDEO_MODEL) {
+        Ok(mut v) => match model_denied(&app, &headers, &mut v, crate::media::DEFAULT_VIDEO_MODEL) {
             Some(r) => r,
             None => outcome(crate::media::video_create(app, headers, v, &kind).await),
         },
@@ -406,6 +581,7 @@ pub async fn playground(
         session: None,
         session_source: None,
         routing_selection: None,
+        pinned_account: None,
     };
     reply(Format::Chat, proxy::execute(app, call).await, false)
 }
@@ -416,7 +592,7 @@ async fn video_status(State(app): State<Arc<App>>, Path(id): Path<String>, heade
 
 async fn compact(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
     match parse_body(&app, Format::Responses, &headers, &body) {
-        Ok(v) => match model_denied(&app, &headers, &v, "") {
+        Ok(mut v) => match model_denied(&app, &headers, &mut v, "") {
             Some(r) => r,
             None => outcome(crate::media::compact(app, headers, v).await),
         },
@@ -462,6 +638,7 @@ async fn completions(State(app): State<Arc<App>>, headers: HeaderMap, body: Byte
         session: None,
         session_source: None,
         routing_selection: None,
+        pinned_account: None,
     };
     match proxy::execute(app, call).await {
         Reply::Json(v) => {
@@ -560,6 +737,7 @@ async fn gemini(
         session: None,
         session_source: None,
         routing_selection: None,
+        pinned_account: None,
     };
     reply(Format::Gemini, proxy::execute(app, call).await, json_array)
 }
@@ -672,9 +850,14 @@ async fn codex_models(
 fn reply(_format: Format, r: Reply, json_array: bool) -> Response {
     match r {
         Reply::Json(v) => axum::Json(v).into_response(),
-        Reply::Error(status, v) => {
+        Reply::Error(status, mut v) => {
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (code, axum::Json(v)).into_response()
+            let wait = proxy::take_retry_after(&mut v);
+            let mut resp = (code, axum::Json(v)).into_response();
+            if let Some(wait) = wait {
+                resp.headers_mut().insert(header::RETRY_AFTER, wait.into());
+            }
+            resp
         }
         Reply::Stream { frames, account } => {
             let (body, ctype) = if json_array {
@@ -895,6 +1078,53 @@ mod tests {
             let src = icon["src"].as_str().unwrap();
             let resp = router(app.clone()).oneshot(Request::get(src).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{src}");
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_apps_may_send_a_bearer_key_to_the_proxy_routes_only() {
+        let cfg = crate::config::Config {
+            auth_dir: "/nonexistent".into(),
+            api_keys: vec!["client-key".into()],
+            ..Default::default()
+        };
+        let app = App::new(cfg, "/nonexistent/config.yaml".into());
+        let preflight = |path: &str| {
+            Request::builder()
+                .method("OPTIONS")
+                .uri(path)
+                .header(header::ORIGIN, "https://app.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization,content-type,x-stainless-os")
+                .body(Body::empty())
+                .unwrap()
+        };
+        for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+            let resp = router(app.clone()).oneshot(preflight(path)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let h = resp.headers();
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*", "{path}");
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_HEADERS], "authorization,content-type,x-stainless-os", "{path}");
+            assert_eq!(h[header::ACCESS_CONTROL_ALLOW_METHODS], "*", "{path}");
+            assert!(!h.contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS), "{path}");
+        }
+        // The answer itself still exposes every header, and is still authenticated.
+        let request = Request::get("/v1/models").header(header::ORIGIN, "https://app.example");
+        let resp = router(app.clone()).oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS], "*");
+        assert!(!resp.headers().contains_key(header::ACCESS_CONTROL_ALLOW_CREDENTIALS));
+
+        // The management API, the dashboard and metrics get no CORS headers at all.
+        for path in ["/api/accounts", "/api/config", "/", "/metrics"] {
+            let resp = router(app.clone()).oneshot(preflight(path)).await.unwrap();
+            let cors = resp.headers().keys().filter(|k| k.as_str().starts_with("access-control-")).count();
+            assert_eq!(cors, 0, "{path}: {:?}", resp.headers());
+            let request = Request::get(path).header(header::ORIGIN, "https://app.example");
+            let resp = router(app.clone()).oneshot(request.body(Body::empty()).unwrap()).await.unwrap();
+            let cors = resp.headers().keys().filter(|k| k.as_str().starts_with("access-control-")).count();
+            assert_eq!(cors, 0, "{path}: {:?}", resp.headers());
         }
     }
 }

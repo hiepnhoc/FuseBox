@@ -26,15 +26,18 @@ const UsageTools = (() => {
     shift(r.start, 0); shift(r.end, 0);
     if (r.start >= r.end) throw new Error('The end date must be on or after the start date.');
     const q = new URLSearchParams({ start: r.start, end: r.end, timezone });
-    for (const k of ['provider', 'model', 'account', 'client']) if (filters[k]) q.set(k, filters[k]);
+    for (const k of ['provider', 'model', 'account', 'client', 'entrypoint']) if (filters[k]) q.set(k, filters[k]);
     return q.toString();
   };
   const privateLabel = (value, hidden) => hidden && value != null && value !== '' ? '••••••' : String(value ?? 'Unknown');
   // Totals: cents above a dollar, four places below so small estimates stay visible.
+  const currency = [2, 4].map((digits) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: digits, maximumFractionDigits: digits }));
+  const numbers = new Intl.NumberFormat('en-US');
+  const count = (value) => value == null ? 'Unknown' : numbers.format(value);
   const dollars = (nanos) => {
     if (nanos == null || !Number.isFinite(Number(nanos))) return 'Unpriced';
     const v = Number(nanos) / 1e9, small = v !== 0 && Math.abs(v) < 1;
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: small ? 4 : 2, maximumFractionDigits: small ? 4 : 2 }).format(v);
+    return currency[small ? 1 : 0].format(v);
   };
   const compact = (v) => v == null || !Number.isFinite(Number(v)) ? 'Unknown' : v >= 1e9 ? `${(v / 1e9).toFixed(2)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}k` : String(Math.round(v));
 
@@ -77,8 +80,48 @@ const UsageTools = (() => {
     series.forEach((d, i) => { if (d.total > series[peak].total || d.total === series[peak].total && d.calls > series[peak].calls) peak = i; });
     return { keys, colors, series, peak, max: Math.max(0, ...series.map((d) => d.total)), OTHER };
   };
+  // Reuse each format in the page's current timezone. Keeping only the latest
+  // timezone per style bounds the cache even when a caller changes timezones.
+  const timeStyles = {
+    date: ['en-CA', { year: 'numeric', month: '2-digit', day: '2-digit' }],
+    timestamp: [undefined, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric', hourCycle: 'h23' }],
+    clock: ['en-GB', { hour: 'numeric', minute: 'numeric', second: 'numeric', hour12: false }],
+    weekday: ['en-GB', { weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false }],
+    hourMinute: ['en-GB', { hour: '2-digit', minute: '2-digit', hour12: false }],
+    weekdayName: ['en-GB', { weekday: 'short' }],
+    monthDay: ['en-US', { month: 'short', day: 'numeric' }],
+    dayDate: ['en-GB', { weekday: 'short', day: 'numeric', month: 'short' }],
+    reset: ['en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZoneName: 'short' }],
+  };
+  const timeFormats = new Map();
+  const timeFormat = (style, timezone) => {
+    let cached = timeFormats.get(style);
+    if (!cached || cached.timezone !== timezone) {
+      const [locale, options] = timeStyles[style];
+      cached = { timezone, formatter: new Intl.DateTimeFormat(locale, { ...options, timeZone: timezone }) };
+      timeFormats.set(style, cached);
+    }
+    return cached.formatter;
+  };
+  const timeText = (value, timezone, style, invalid = 'Invalid Date') => {
+    const at = new Date(value);
+    return Number.isFinite(at.getTime()) ? timeFormat(style, timezone).format(at) : invalid;
+  };
+  // Read the browser's current zone at render/timer boundaries, rather than
+  // constructing a default formatter for every request row or meter tooltip.
+  let localTimezone = null;
+  const refreshLocalTimezone = () => {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const changed = timezone !== localTimezone;
+    localTimezone = timezone;
+    return changed;
+  };
+  const localTimeText = (value, style) => {
+    if (localTimezone === null) refreshLocalTimezone();
+    return timeText(value, localTimezone, style);
+  };
   // Local calendar date of an instant in the page's timezone.
-  const localDate = (ms, timezone) => new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+  const localDate = (ms, timezone) => timeFormat('date', timezone).format(new Date(ms));
   const beforeProxy = (day, firstProxyMs, timezone) => firstProxyMs != null && Number.isFinite(Number(firstProxyMs)) && day < localDate(Number(firstProxyMs), timezone);
   // Sizes in decimal units, as the server's messages: "512 B", "3.4 MB", "128 MB", "1.2 GB".
   const bytes = (v) => {
@@ -91,16 +134,16 @@ const UsageTools = (() => {
   const parts = (iso) => { const at = new Date(`${iso}T00:00:00Z`); return { w: W[at.getUTCDay()], m: M[at.getUTCMonth()], d: at.getUTCDate(), y: at.getUTCFullYear(), monday: at.getUTCDay() === 1 }; };
   const dayLabel = (iso) => { const p = parts(iso); return `${p.w} ${p.m} ${p.d}`; };
   const shortDate = (iso) => { const p = parts(iso); return `${p.m} ${p.d}`; };
-  return { OTHER, escape, date, shift, range, dates, query, privateLabel, dollars, compact, chart, localDate, beforeProxy, parts, dayLabel, shortDate, bytes };
+  return { OTHER, escape, date, shift, range, dates, query, privateLabel, count, dollars, compact, chart, localDate, beforeProxy, timeText, localTimeText, refreshLocalTimezone, parts, dayLabel, shortDate, bytes };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = UsageTools;
 
 const Usage = {
   preset: '7', range: UsageTools.range(7), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-  filters: { provider: '', model: '', account: '', client: '' },
+  filters: { provider: '', model: '', account: '', client: '', entrypoint: '' },
   stack: 'provider', metric: 'cost', hoverDay: null, dim: 'model', showAll: false, clientsAll: false,
   drawerOpen: false, customError: '',
-  summary: null, status: null,
+  summary: null, status: null, entrypoints: null,
   loading: false, loaded: false, error: '', actionError: '', busy: false,
   sequence: 0, credential: null, confirm: null, roots: {}, collectorDraft: '', rows: [],
   // A price sync: the plan models.dev gave (null until checked), whether a check is in
@@ -108,11 +151,11 @@ const Usage = {
   sync: null, syncBusy: false, syncDone: null,
 };
 const ux = UsageTools.escape;
-const usageCount = (value) => value == null ? 'Unknown' : new Intl.NumberFormat('en-US').format(value);
+const usageCount = UsageTools.count;
 const usageSensitive = (value) => ux(UsageTools.privateLabel(value, S.private));
 const usageSource = (source) => ({ proxy: 'Proxy', claude_code: 'Claude Code history', codex: 'Codex history' }[source] || source || 'Unknown source');
-const usageTime = (value) => value == null || value === 0 ? 'Not reported' : Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString(undefined, { timeZone: Usage.timezone }) : 'Not reported';
-const usageClock = (value) => value == null || value === 0 ? 'Not reported' : new Date(value).toLocaleTimeString('en-GB', { timeZone: Usage.timezone, hour12: false });
+const usageTime = (value) => value == null || value === 0 ? 'Not reported' : UsageTools.timeText(value, Usage.timezone, 'timestamp', 'Not reported');
+const usageClock = (value) => value == null || value === 0 ? 'Not reported' : UsageTools.timeText(value, Usage.timezone, 'clock');
 const usageButton = (act, label, extra = '', disabled = false, cls = 'btn') => `<button class="${cls}" type="button" data-usage-act="${act}" ${extra}${disabled || Usage.busy ? ' disabled' : ''}>${label}</button>`;
 const usagePhone = () => typeof mob === 'function' && mob();
 const usageCombined = () => Usage.summary?.combined || {};
@@ -141,6 +184,7 @@ const USAGE_PARTS = {
   head: () => usageHeadHTML(),
   notices: () => usageNoticesHTML(),
   cost: () => (Usage.summary ? usageCostHTML() : !Usage.loading && !Usage.error ? '<div class="card pad"><h2 class="h-sec">No usage loaded</h2><p class="meta">Refresh to read persisted metadata.</p></div>' : ''),
+  entrypoints: () => (Usage.summary && Usage.entrypoints ? usageEntrypointsHTML() : ''),
   breakdown: () => (Usage.summary ? usageBreakdownHTML() : ''),
   clients: () => (Usage.summary ? usageClientsHTML() : ''),
   drawer: () => (Usage.drawerOpen ? usageDrawerHTML() : ''),
@@ -157,15 +201,18 @@ function usageHTML() {
   return `<div class="usage-page">
     ${usagePart('head')}
     ${usagePart('notices')}
-    <div id="usage-results" class="usage-results" aria-busy="${Usage.loading}">${usagePart('cost')}${usagePart('breakdown')}
+    <div id="usage-results" class="usage-results" aria-busy="${Usage.loading}">${usagePart('cost')}${usagePart('entrypoints')}${usagePart('breakdown')}
     ${usagePart('clients')}</div>
     ${usagePart('drawer')}
   </div>`;
 }
 function usageNoticesHTML() {
   const u = Usage;
+  const reasons = u.summary?.combined?.totals?.unpriced_reasons || {};
+  const missing = Number(reasons.missing_usage || 0) + Number(reasons.incomplete_usage || 0);
   return `${u.error ? `<div class="notice usage-message err" role="alert"><span class="grow">${S.private ? 'Usage could not be loaded. Try refreshing.' : ux(u.error)}</span>${usageButton('refresh', 'Retry', '', false, 'btn sm')}</div>` : ''}
     ${u.actionError && !u.drawerOpen ? `<p class="notice usage-message err" role="alert">${S.private ? 'The action failed. Retry or check server logs.' : ux(u.actionError)}</p>` : ''}
+    ${missing ? `<p class="usage-message meta">${usageCount(missing)} calls have missing or incomplete token usage, often after cancellation or upstream errors. Their costs remain unknown and are excluded from estimates. Adding model prices cannot recover missing usage.</p>` : ''}
     ${u.loading && !u.summary ? '<p class="usage-message meta" role="status">Loading usage metadata…</p>' : ''}`;
 }
 
@@ -189,7 +236,7 @@ function usageHeadHTML() {
   const refresh = `<button class="icon-btn row" type="button" data-usage-act="refresh" title="Refresh · updates every minute" aria-label="Refresh usage"${u.loading ? ' disabled' : ''}><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M11.5 7a4.5 4.5 0 1 1-1.3-3.2"/><path d="M11.5 1.8v2.6H8.9"/></svg></button>`;
   const today = usageToday(), min = UsageTools.shift(today, -365);
   const custom = u.preset === 'custom' ? `<form id="usage-range" class="u-custom"><label class="u-field"><span>From</span><input type="date" name="start" value="${ux(u.range.start)}" min="${min}" max="${today}" required></label><label class="u-field"><span>Through</span><input type="date" name="through" value="${ux(u.range.through)}" min="${min}" max="${today}" required></label><button class="btn" type="submit">Apply dates</button>${u.customError ? `<span class="u-custom-err" role="alert">${ux(u.customError)}</span>` : ''}</form>` : '';
-  const labels = { model: 'Model', account: 'Account', provider: 'Provider', client: 'Client' };
+  const labels = { model: 'Model', account: 'Account', provider: 'Provider', client: 'Client', entrypoint: 'Entrypoint' };
   const pills = Object.keys(labels).filter((k) => u.filters[k]).map((k) => {
     const v = u.filters[k];
     const value = k === 'account' ? usageAccountName(v) : k === 'client' ? usageSensitive(usageClientLabel(v)) : k === 'provider' ? ux(usageProvName(v)) : ux(v);
@@ -212,7 +259,21 @@ function usageCoverageLine(t) {
   const parts = [n ? `${(Math.floor((1 - unpriced / n) * 1000) / 10).toFixed(1)}% of calls priced` : 'No matching calls'];
   if (t.matched) parts.push(`${usageCount(t.matched)} matched across sources, counted once`);
   if (t.weak_identity) parts.push(`${usageCount(t.weak_identity)} history record${t.weak_identity === 1 ? '' : 's'} without a stable ID`);
-  for (const [k, label] of [['unpriced', 'unpriced'], ['partial', 'partial'], ['missing_usage', 'missing usage'], ['pricing_partial', 'with assumptions']]) if (t[k]) parts.push(`${usageCount(t[k])} ${label}`);
+  if (t.unpriced_reasons) {
+    const labels = { missing_usage: 'missing usage', incomplete_usage: 'incomplete usage', invalid_usage: 'invalid usage', unknown_model: 'without a model rate', unsupported_pricing: 'with unsupported pricing' };
+    let classified = 0;
+    for (const [key, label] of Object.entries(labels)) {
+      const count = Number(t.unpriced_reasons[key] || 0);
+      classified += count;
+      if (count) parts.push(`${usageCount(count)} ${label}`);
+    }
+    if (unpriced > classified) parts.push(`${usageCount(unpriced - classified)} unpriced`);
+  } else {
+    if (t.unpriced) parts.push(`${usageCount(t.unpriced)} unpriced`);
+  }
+  if (t.partial) parts.push(`${usageCount(t.partial)} partial`);
+  if (!t.unpriced_reasons && t.missing_usage) parts.push(`${usageCount(t.missing_usage)} missing usage`);
+  if (t.pricing_partial) parts.push(`${usageCount(t.pricing_partial)} with assumptions`);
   if (t.aggregation_overflow) parts.push('a total exceeds the supported range, amount unknown');
   return parts.join(' · ');
 }
@@ -221,7 +282,7 @@ function usageStaleLine() {
   const stale = (Usage.status?.collectors || []).filter((c) => !c.revoked && c.state === 'offline');
   return stale.map((c) => {
     const sources = (c.covered_sources || []).map((s) => usageSource(s).replace(' history', '')).join(' and ') || 'imported';
-    const since = c.last_sync_at_ms ? new Date(c.last_sync_at_ms).toLocaleString('en-GB', { timeZone: Usage.timezone, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).replace(',', '') : null;
+    const since = c.last_sync_at_ms ? UsageTools.timeText(c.last_sync_at_ms, Usage.timezone, 'weekday').replace(',', '') : null;
     return `${usageSensitive(c.label || c.id)} has not synced ${since ? `since ${ux(since)}` : 'yet'}, so its recent ${ux(sources)} history may be missing`;
   }).join('. ');
 }
@@ -253,8 +314,22 @@ function usageCostHTML() {
   </section>`;
 }
 
+// A snapshot's trend is immutable; hover, focus and section repaints reuse its
+// aggregation. Keep only the current chart so old snapshots can be reclaimed.
+let usageChartCache = null;
+const usageEmptyTrend = [];
+function usageChartData() {
+  const trend = usageCombined().trend || usageEmptyTrend;
+  const { start, end } = Usage.range, metric = Usage.metric;
+  const shade = typeof document !== 'undefined' && document.documentElement.dataset.shade;
+  const prev = usageChartCache;
+  if (prev && prev.trend === trend && prev.start === start && prev.end === end && prev.metric === metric && prev.shade === shade) return prev.chart;
+  const chart = UsageTools.chart(trend, UsageTools.dates(Usage.range), metric);
+  usageChartCache = { trend, start, end, metric, shade, chart };
+  return chart;
+}
 function usageChartHTML() {
-  const u = Usage, phone = usagePhone(), days = UsageTools.dates(u.range), c = UsageTools.chart(usageCombined().trend || [], days, u.metric);
+  const u = Usage, phone = usagePhone(), c = usageChartData(), days = c.series.map((d) => d.date);
   const calls = u.metric === 'calls', showVals = days.length <= 10 && !phone, today = usageToday();
   const hover = days.indexOf(u.hoverDay);
   const seg = (name, opts, act, label) => `<div class="seg u-seg" role="group" aria-label="${label}">${opts.map(([v, l]) => `<button type="button" data-usage-act="${act}" data-value="${v}" aria-pressed="${u[name] === v}">${l}</button>`).join('')}</div>`;
@@ -286,8 +361,83 @@ function usageReadoutHTML(c, hover) {
   return `<span class="${hover >= 0 ? '' : 'dim'}">${ux(title)}</span><span class="mono">${ux(usageDayCost(d))}</span><span class="fg2">${usageCount(d.calls)} call${d.calls === 1 ? '' : 's'}</span>${parts}${before ? '<span class="dim">Before the proxy was set up · history only</span>' : ''}`;
 }
 
-const USAGE_DIMS = [['model', 'Model'], ['account', 'Account'], ['provider', 'Provider'], ['client', 'Client / origin']];
+// Claude Code names its entrypoint in the User-Agent. The Agent SDK labels (sdk-ts,
+// sdk-py, sdk-cli for `claude -p`) are reported to use the 5-hour window faster.
+const USAGE_ENTRYPOINTS = {
+  cli: 'Claude Code in a terminal', 'sdk-ts': 'Agent SDK · TypeScript', 'sdk-py': 'Agent SDK · Python', 'sdk-cli': 'claude -p',
+  'claude-vscode': 'VS Code extension', 't3-code': 'T3 Code', 'claude-desktop': 'Claude desktop app', mcp: 'MCP server',
+  'claude-code-github-action': 'GitHub Action', remote: 'Claude Code on the web',
+};
+const usageSdkEntrypoint = (id) => typeof id === 'string' && id.startsWith('sdk-');
+const USAGE_SDK_NOTE = 'Reported to use the 5-hour window about 1.8× faster than the terminal';
+function usageEntrypointData() {
+  const trend = Usage.entrypoints?.trend || [];
+  if (!trend.length) return null;
+  const days = UsageTools.dates(Usage.range), index = new Map(days.map((d, i) => [d, i]));
+  const series = days.map((date) => ({ date, sdk: 0, other: 0 }));
+  let sdk = 0, other = 0;
+  for (const r of trend) {
+    const n = Number(r.observations || 0), day = series[index.get(r.date)];
+    if (usageSdkEntrypoint(r.group)) { sdk += n; if (day) day.sdk += n; } else { other += n; if (day) day.other += n; }
+  }
+  const latest = [...series].reverse().find((d) => d.sdk + d.other > 0);
+  return { series, sdk, other, latest, max: Math.max(0, ...series.map((d) => d.sdk + d.other)) };
+}
+const usageShare = (part, whole) => (whole > 0 ? `${Math.round(part / whole * 100)}%` : '—');
+// Which entrypoints Claude Code calls named, by day: the SDK labels against the rest.
+function usageEntrypointsHTML() {
+  const c = usageEntrypointData();
+  if (!c) return '';
+  const phone = usagePhone(), days = c.series.map((d) => d.date), today = usageToday();
+  const all = c.sdk + c.other;
+  const legend = `<div class="u-legend"><span><i class="u-ep-sdk"></i>SDK labels</span><span><i class="u-ep-other"></i>Other labels</span></div>`;
+  const latest = c.latest && days.length > 1
+    ? `<div class="u-ep-fig"><b>${ux(usageShare(c.latest.sdk, c.latest.sdk + c.latest.other))}</b><span>${c.latest.date === today ? 'today so far' : ux(`on ${UsageTools.dayLabel(c.latest.date)}`)}</span></div>` : '';
+  const bars = days.length > 1 ? c.series.map((d, i) => {
+    const total = d.sdk + d.other, h = c.max > 0 ? Math.max(total > 0 ? 1.5 : 0, total / c.max * 100) : 0;
+    const text = `${UsageTools.dayLabel(d.date)}: ${usageCount(d.sdk)} with an SDK label, ${usageCount(d.other)} with another${total ? `, ${usageShare(d.sdk, total)} SDK` : ''}`;
+    const edge = i < 2 ? ' lft' : i > days.length - 3 ? ' rgt' : '';
+    const tip = total ? `<span class="u-ep-tip${edge}" aria-hidden="true"><b>${ux(UsageTools.dayLabel(d.date))}</b><span><i class="u-ep-sdk"></i>SDK labels <span class="mono">${usageCount(d.sdk)}</span></span><span><i class="u-ep-other"></i>Other labels <span class="mono">${usageCount(d.other)}</span></span><span class="dim">SDK share ${ux(usageShare(d.sdk, total))}</span></span>` : '';
+    const segs = `${d.sdk ? `<i class="u-ep-sdk" style="flex:${d.sdk} 1 0px"></i>` : ''}${d.other ? `<i class="u-ep-other" style="flex:${d.other} 1 0px"></i>` : ''}`;
+    return `<span class="u-bar u-ep-bar" tabindex="0" role="img" aria-label="${ux(text)}"><span class="u-bar-s" style="height:${h.toFixed(2)}%">${segs}</span>${tip}</span>`;
+  }).join('') : '';
+  const labels = days.length > 1 ? c.series.map((d) => {
+    const p = UsageTools.parts(d.date);
+    const text = days.length <= 10 ? (phone ? p.w.slice(0, 2) : `${p.w} ${p.d}`) : p.monday ? `${p.m} ${p.d}` : '';
+    return `<span${d.date === today ? ' class="today"' : ''}>${ux(text)}</span>`;
+  }).join('') : '';
+  return `<section class="card u-ep" aria-labelledby="usage-ep-label">
+    <div class="u-chart-head"><span class="label" id="usage-ep-label">CLAUDE CODE ENTRYPOINTS · ${ux(usageRangeLabel().toUpperCase())}</span><span class="grow"></span>${legend}</div>
+    <div class="u-ep-figs"><div class="u-ep-fig"><b>${ux(usageShare(c.sdk, all))}</b><span>of ${ux(usageCount(all))} calls had an SDK label</span></div>${latest}</div>
+    ${bars ? `<div class="u-bars u-ep-bars${days.length > 20 ? ' dense' : ''}">${bars}</div><div class="u-days${days.length > 20 ? ' dense' : ''}" aria-hidden="true">${labels}</div>` : ''}
+    <p class="u-ep-note">Claude Code names its entrypoint in the User-Agent; Fusebox records it and passes it on unchanged. The Agent SDK labels (sdk-ts, sdk-cli) are reported to use the 5-hour window about 1.8× faster than cli (anthropics/claude-code#97074). Only calls that named one are counted.</p>
+  </section>`;
+}
+
+const USAGE_DIMS = [['model', 'Model'], ['account', 'Account'], ['provider', 'Provider'], ['client', 'Client / origin'], ['entrypoint', 'Entrypoint']];
+// The Entrypoint tab appears once a Claude Code call has named one.
+// The entrypoints read lists calls that named one; the rest of the summary's calls
+// make the "No entrypoint" row. Both reads use the same range and filters.
+function usageEntrypointRows() {
+  const rows = Usage.entrypoints?.breakdown;
+  if (!rows) return [];
+  const t = usageCombined().totals || {}, sum = (f) => rows.reduce((n, r) => n + Number(f(r) || 0), 0);
+  const rest = (total, f) => (total == null ? null : Math.max(0, Number(total) - sum(f)));
+  const observations = rest(t.observations ?? 0, (r) => r.observations);
+  if (!observations) return rows;
+  return rows.concat([{ id: null, observations, estimated_cost_nanos: rest(t.estimated_cost_nanos, (r) => r.estimated_cost_nanos),
+    unpriced: rest(t.unpriced ?? 0, (r) => r.unpriced), partial: rest(t.partial ?? 0, (r) => r.partial), missing_usage: rest(t.missing_usage ?? 0, (r) => r.missing_usage),
+    tokens: { input: rest(t.tokens?.input, (r) => r.tokens?.input), output: rest(t.tokens?.output, (r) => r.tokens?.output) } }]);
+}
+const usageBreakdowns = () => ({ ...(usageCombined().breakdowns || {}), entrypoint: usageEntrypointRows() });
+const usageDims = (b) => USAGE_DIMS.filter(([k]) => k !== 'entrypoint' || Usage.filters.entrypoint || (b.entrypoint || []).some((r) => r.id != null));
 function usageBreakdownRow(dim, r) {
+  if (dim === 'entrypoint') {
+    const sdk = usageSdkEntrypoint(r.id);
+    return { name: r.id ?? 'No entrypoint', mono: r.id != null, sub: r.id == null ? 'Other clients, imported history and earlier calls' : USAGE_ENTRYPOINTS[r.id] || 'Claude Code',
+      icon: `<span class="u-sq" aria-hidden="true"><i class="${r.id == null ? '' : sdk ? 'u-ep-sdk' : 'u-ep-other'}"></i></span>`,
+      tag: sdk ? `<span class="u-ep-tag" title="${ux(USAGE_SDK_NOTE)}">SDK</span>` : '' };
+  }
   if (dim === 'model') return { name: r.id || 'Unknown model', mono: true, sub: usageProvName(r.provider), logo: usageLogo(r.provider) };
   if (dim === 'provider') return { name: usageProvName(r.id), sub: r.accounts ? `${r.accounts} account${r.accounts === 1 ? '' : 's'}` : 'No account reported', logo: usageLogo(r.id) };
   if (dim === 'account') {
@@ -300,6 +450,13 @@ function usageBreakdownRow(dim, r) {
 }
 function usageCoverage(r) {
   const n = Number(r.observations || 0);
+  if (r.unpriced_reasons) {
+    const reasons = r.unpriced_reasons;
+    const missing = Number(reasons.missing_usage || 0) + Number(reasons.incomplete_usage || 0);
+    const noRate = Number(reasons.unknown_model || 0);
+    if (missing && missing === Number(r.unpriced)) return [`${usageCount(missing)} missing usage`, 'warn'];
+    if (noRate && noRate === Number(r.unpriced)) return [`${usageCount(noRate)} no model rate`, 'warn'];
+  }
   if (n && Number(r.unpriced || 0) >= n) return ['Unpriced', 'fg2'];
   if (r.unpriced) return [`${usageCount(r.unpriced)} unpriced`, 'warn'];
   if (r.partial) return [`${usageCount(r.partial)} partial`, 'warn'];
@@ -312,24 +469,26 @@ function usageCostShare(r, total) {
   return [share, total > 0 && r.estimated_cost_nanos ? (share * 100 < 1 ? '<1%' : `${Math.round(share * 100)}%`) : '—'];
 }
 function usageBreakdownHTML() {
-  const u = Usage, b = usageCombined().breakdowns || {}, phone = usagePhone();
+  const u = Usage, b = usageBreakdowns(), phone = usagePhone();
+  // A range without entrypoints has no Entrypoint tab to stay on.
+  if (!usageDims(b).some(([k]) => k === u.dim)) u.dim = 'model';
   const rows = b[u.dim] || [], total = Number(usageCombined().totals?.estimated_cost_nanos || 0);
   const rowLimit = u.dim === 'model' ? 20 : 8;
   const shown = u.showAll ? rows : rows.slice(0, rowLimit);
   u.rows = shown.map((r) => r.id);
-  const tabs = `<div class="u-tabs" role="tablist" aria-label="Breakdown">${USAGE_DIMS.map(([k, l]) => `<button type="button" role="tab" data-usage-act="dim" data-value="${k}" aria-selected="${u.dim === k}">${l} <span class="mono dim">${(b[k] || []).length}</span></button>`).join('')}</div>`;
+  const tabs = `<div class="u-tabs" role="tablist" aria-label="Breakdown">${usageDims(b).map(([k, l]) => `<button type="button" role="tab" data-usage-act="dim" data-value="${k}" aria-selected="${u.dim === k}">${l} <span class="mono dim">${(b[k] || []).length}</span></button>`).join('')}</div>`;
   const body = shown.map((r, i) => {
     const x = usageBreakdownRow(u.dim, r), selected = r.id != null && u.filters[u.dim] === r.id;
     const [share, pct] = usageCostShare(r, total);
     const [cov, covCls] = usageCoverage(r);
     const coverageTitle = ux(usageCoverageLine(r));
     const name = x.sensitive ? usageSensitive(x.name) : ux(x.name);
-    const icon = x.square ? '<span class="u-sq" aria-hidden="true"><i></i></span>' : x.logo || '<span class="u-sq" aria-hidden="true"><i></i></span>';
+    const icon = x.icon || (x.square ? '<span class="u-sq" aria-hidden="true"><i></i></span>' : x.logo || '<span class="u-sq" aria-hidden="true"><i></i></span>');
     const cost = r.estimated_cost_nanos != null ? UsageTools.dollars(r.estimated_cost_nanos) : 'Unpriced';
     const attrs = r.id != null ? `data-usage-act="filter-row" data-index="${i}" aria-pressed="${selected}"` : 'disabled';
     const bar = `<span class="u-share-bar"><i style="width:${(share * 100).toFixed(1)}%"></i></span>`;
-    if (phone) return `<button type="button" class="u-bd-item${selected ? ' on' : ''}" ${attrs}><span class="u-bd-l1">${icon}<span class="u-bd-name${x.mono ? ' mono' : ''}">${name}</span><span class="u-bd-cost${cost === 'Unpriced' ? ' dim' : ''}">${ux(cost)}</span></span><span class="u-bd-l2">${bar}<span class="dim">${ux(pct)} · ${usageCount(r.observations)} calls</span>${cov !== 'Full' ? `<span class="${covCls}" title="${coverageTitle}">${ux(cov)}</span>` : ''}</span></button>`;
-    return `<button type="button" class="u-bd-row${selected ? ' on' : ''}" ${attrs}><span class="u-bd-who">${icon}<span class="cell2"><span class="${x.mono ? 'mono' : ''}">${name}</span>${x.sub ? `<span class="dim">${ux(x.sub)}</span>` : ''}</span></span><span class="u-share">${bar}<span class="fg2">${ux(pct)}</span></span><span class="r">${usageCount(r.observations)}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.input))}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.output))}</span><span class="r u-bd-cost${cost === 'Unpriced' ? ' dim' : ''}">${ux(cost)}</span><span class="r ${covCls}" title="${coverageTitle}">${ux(cov)}</span></button>`;
+    if (phone) return `<button type="button" class="u-bd-item${selected ? ' on' : ''}" ${attrs}><span class="u-bd-l1">${icon}<span class="u-bd-name${x.mono ? ' mono' : ''}">${name}</span>${x.tag || ''}<span class="u-bd-cost${cost === 'Unpriced' ? ' dim' : ''}">${ux(cost)}</span></span><span class="u-bd-l2">${bar}<span class="dim">${ux(pct)} · ${usageCount(r.observations)} calls</span>${cov !== 'Full' ? `<span class="${covCls}" title="${coverageTitle}">${ux(cov)}</span>` : ''}</span></button>`;
+    return `<button type="button" class="u-bd-row${selected ? ' on' : ''}" ${attrs}><span class="u-bd-who">${icon}<span class="cell2">${x.tag ? `<span class="u-ep-name"><span class="${x.mono ? 'mono' : ''}">${name}</span>${x.tag}</span>` : `<span class="${x.mono ? 'mono' : ''}">${name}</span>`}${x.sub ? `<span class="dim">${ux(x.sub)}</span>` : ''}</span></span><span class="u-share">${bar}<span class="fg2">${ux(pct)}</span></span><span class="r">${usageCount(r.observations)}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.input))}</span><span class="r mono fg2 u-wide">${ux(UsageTools.compact(r.tokens?.output))}</span><span class="r u-bd-cost${cost === 'Unpriced' ? ' dim' : ''}">${ux(cost)}</span><span class="r ${covCls}" title="${coverageTitle}">${ux(cov)}</span></button>`;
   }).join('');
   const more = rows.length > rowLimit ? `<button type="button" class="u-more" data-usage-act="show-all">${u.showAll ? `Show top ${rowLimit}` : `Show all ${rows.length}`}</button>` : '';
   const empty = rows.length ? '' : '<p class="u-empty">No records match these filters.</p>';
@@ -521,16 +680,35 @@ function usageRenderChart() {
   if (cost) usagePainted.delete(cost);
   if (focus) el.querySelector(focus)?.focus({ preventScroll: true });
 }
+// A pointer/focus move changes only selection and its readout. Retaining the bar
+// elements also keeps the browser's hovered/focused target stable.
+function usageHover(day) {
+  if (S.route !== 'usage' || Usage.hoverDay === day) return;
+  Usage.hoverDay = day;
+  const el = document.getElementById('usage-chart');
+  const readout = el?.querySelector('.u-readout');
+  if (!readout) return usageRenderChart();
+  const chart = usageChartData(), hover = chart.series.findIndex((d) => d.date === day);
+  for (const bar of el.querySelectorAll('[data-usage-day]')) {
+    const selected = hover >= 0 && bar.dataset.usageDay === day;
+    const cls = `u-bar${hover >= 0 && !selected ? ' dim' : ''}${selected ? ' on' : ''}`;
+    if (bar.className !== cls) bar.className = cls;
+  }
+  readout.innerHTML = usageReadoutHTML(chart, hover);
+  const cost = document.getElementById('usage-part-cost');
+  if (cost) usagePainted.delete(cost);
+}
 // Account changes reach account names in the filter and the breakdown.
 function usageAccountsChanged() {
   usageRender(undefined, ['head', 'breakdown']);
 }
 // What each read feeds.
 const USAGE_READ_PARTS = {
-  summary: ['head', 'notices', 'cost', 'breakdown', 'clients'],
+  summary: ['head', 'notices', 'cost', 'entrypoints', 'breakdown', 'clients'],
   status: ['head', 'notices', 'cost', 'drawer'],
+  entrypoints: ['entrypoints', 'breakdown'],
 };
-const USAGE_LOAD_PARTS = ['head', 'notices', 'cost', 'breakdown', 'clients'];
+const USAGE_LOAD_PARTS = ['head', 'notices', 'cost', 'entrypoints', 'breakdown', 'clients'];
 const usageQuery = () => UsageTools.query(Usage.range, Usage.filters, Usage.timezone);
 function usageSelectStack(summary) {
   const combined = summary?.combined;
@@ -566,7 +744,8 @@ async function usageRead(field, path, sequence) {
   } catch (e) {
     if (current() && e.name !== 'AbortError') {
       if (field !== 'status') Usage[field] = null;
-      Usage.error = e.message === 'locked' ? 'Management authentication required.' : e.message;
+      // Without entrypoints the page only lacks their card and tab.
+      if (field !== 'entrypoints') Usage.error = e.message === 'locked' ? 'Management authentication required.' : e.message;
     }
   } finally {
     const active = current();
@@ -584,6 +763,7 @@ async function usageLoad() {
     // Each section renders as soon as its own read completes.
     await Promise.allSettled([
       usageRead('summary', `/usage/dashboard?${query}&stack=${u.stack}`, sequence),
+      usageRead('entrypoints', `/usage/entrypoints?${query}`, sequence),
       usageRead('status', '/usage/status', sequence),
     ]);
   } catch (e) { if (sequence === u.sequence) u.error = e.message === 'locked' ? 'Management authentication required.' : e.message; }
@@ -594,7 +774,7 @@ function usageLoadStack() {
   usageSelectStack(Usage.summary); usageRenderChart();
 }
 // Range and filter changes read everything again.
-function usageReload() { Usage.hoverDay = null; Usage.summary = null; return usageLoad(); }
+function usageReload() { Usage.hoverDay = null; Usage.summary = null; Usage.entrypoints = null; return usageLoad(); }
 async function usageMutate(path, body, after) {
   Usage.busy = true; Usage.actionError = ''; usageRender();
   try {
@@ -669,26 +849,22 @@ if (typeof document !== 'undefined') {
       usageMutate('/usage/imports', { source, root, enabled: true }, () => { delete Usage.roots[source]; });
     }
   });
-  const hoverDay = (day) => {
-    if (S.route !== 'usage' || Usage.hoverDay === day) return;
-    Usage.hoverDay = day; usageRenderChart();
-  };
   document.addEventListener('mouseover', (event) => {
     if (usagePhone()) return;
     const bar = event.target.closest?.('[data-usage-day]');
-    if (bar) hoverDay(bar.dataset.usageDay);
+    if (bar) usageHover(bar.dataset.usageDay);
   });
   document.addEventListener('mouseout', (event) => {
     const bars = event.target.closest?.('[data-usage-bars]');
-    if (bars && !bars.contains(event.relatedTarget) && !usagePhone()) hoverDay(null);
+    if (bars && !bars.contains(event.relatedTarget) && !usagePhone()) usageHover(null);
   });
   document.addEventListener('focusin', (event) => {
     const bar = event.target.closest?.('[data-usage-day]');
-    if (bar && !usagePhone()) hoverDay(bar.dataset.usageDay);
+    if (bar && !usagePhone()) usageHover(bar.dataset.usageDay);
   });
   document.addEventListener('click', (event) => {
     const bar = event.target.closest('[data-usage-day]');
-    if (bar) return hoverDay(Usage.hoverDay === bar.dataset.usageDay && usagePhone() ? null : bar.dataset.usageDay);
+    if (bar) return usageHover(Usage.hoverDay === bar.dataset.usageDay && usagePhone() ? null : bar.dataset.usageDay);
     const el = event.target.closest('[data-usage-act]');
     if (!el || el.disabled) return;
     const act = el.dataset.usageAct, index = Number(el.dataset.index);
@@ -698,7 +874,7 @@ if (typeof document !== 'undefined') {
       if (Usage.preset === 'custom') return usageRender('#usage-range [name="start"]');
       Usage.range = UsageTools.range(Number(Usage.preset)); return usageReload();
     }
-    if (act === 'stack') { if (Usage.stack !== el.dataset.value) { Usage.stack = el.dataset.value; usageRenderChart(); usageLoadStack(); } return; }
+    if (act === 'stack') { if (Usage.stack !== el.dataset.value) { Usage.stack = el.dataset.value; usageLoadStack(); } return; }
     if (act === 'metric') { Usage.metric = el.dataset.value; return usageRenderChart(); }
     if (act === 'dim') { Usage.dim = el.dataset.value; Usage.showAll = false; return usageRender(); }
     if (act === 'show-all') { Usage.showAll = !Usage.showAll; return usageRender(); }

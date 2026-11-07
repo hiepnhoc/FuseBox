@@ -74,6 +74,45 @@ fn a_fault_is_sent_once_after_two_checks_and_survives_a_restart() {
 }
 
 #[test]
+fn a_dismissed_fault_stays_hidden_until_it_clears_or_becomes_an_error() {
+    let temp = Temp::new();
+    let push = Push::load(&temp.0);
+    let t0 = Instant::now();
+    let warn = |key: &str| Fault { key: key.into(), level: "warn", ..Default::default() };
+    let err = |key: &str| Fault { key: key.into(), level: "err", ..Default::default() };
+    let keys = |list: Vec<Fault>| list.into_iter().map(|f| f.key).collect::<Vec<_>>();
+    let split = |push: &Push, faults: Vec<Fault>, secs: u64| {
+        let (shown, dismissed) = push.split(faults, t0 + Duration::from_secs(secs));
+        (keys(shown), keys(dismissed))
+    };
+
+    push.dismiss(&warn("rate:a"));
+    push.dismiss(&warn("quota:b"));
+    assert_eq!(
+        split(&push, vec![warn("rate:a"), warn("quota:b"), err("signin:c")], 0),
+        (vec!["signin:c".to_string()], vec!["rate:a".to_string(), "quota:b".to_string()])
+    );
+    // Dismissals are kept across a restart.
+    let push = Push::load(&temp.0);
+    // A warning that turns into an error shows again.
+    assert_eq!(split(&push, vec![err("rate:a"), warn("quota:b")], 1).0, ["rate:a"]);
+    assert_eq!(split(&push, vec![warn("rate:a"), warn("quota:b")], 2).0, ["rate:a"], "not dismissed any more");
+    // Gone briefly (flapping), it stays dismissed; gone a minute, it has cleared and shows when it trips again.
+    assert!(split(&push, vec![], 10).0.is_empty());
+    assert_eq!(split(&push, vec![warn("quota:b")], 30).1, ["quota:b"]);
+    assert!(split(&push, vec![], 40).0.is_empty());
+    assert!(split(&push, vec![], 99).0.is_empty());
+    assert!(push.has_dismissed(), "gone for 59 seconds");
+    assert!(split(&push, vec![], 100).0.is_empty());
+    assert_eq!(split(&push, vec![warn("quota:b")], 101).0, ["quota:b"]);
+    assert!(!push.has_dismissed());
+
+    push.dismiss(&warn("quota:b"));
+    assert!(push.restore(Some("quota:b")));
+    assert!(!push.restore(None), "nothing left to restore");
+}
+
+#[test]
 fn settings_choose_what_is_sent() {
     let temp = Temp::new();
     let push = Push::load(&temp.0);
@@ -288,4 +327,177 @@ fn a_used_up_account_is_not_an_error_once_its_limit_renews() {
     assert!(kinds().is_empty(), "nor is an ended rate limit");
     account.cool(None, Utc::now() - Span::seconds(1), "403: forbidden");
     assert_eq!(kinds(), ["error"], "other errors stay after their cooldown");
+}
+
+#[tokio::test]
+async fn the_iphone_app_registers_and_apple_answers_are_handled() {
+    let temp = Temp::new();
+    let cfg = Config { auth_dir: temp.0.to_string_lossy().into(), management_key: "k".into(), ..Default::default() };
+    let app = App::new(cfg.clone(), temp.0.join("config.yaml"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::mgmt::router(app.clone()).with_state(app.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+    });
+    let client = reqwest::Client::new();
+    let token = "a1".repeat(32);
+    let register = |token: &str, environment: &str| {
+        client
+            .post(format!("{origin}/push/apns"))
+            .bearer_auth("k")
+            .json(&json!({ "token": token, "environment": environment, "label": "John's iPhone" }))
+            .send()
+    };
+
+    // Without a key the app hears why, and nothing is saved.
+    let resp = register(&token, "production").await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(resp.json::<Value>().await.unwrap()["error"].as_str().unwrap().contains("apns"));
+    assert!(app.push.subscriptions().is_empty());
+
+    let key = temp.0.join("AuthKey_KEY1234567.p8");
+    let der = crypto::Vapid::generate().unwrap();
+    std::fs::write(
+        &key,
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            base64::engine::general_purpose::STANDARD.encode(der)
+        ),
+    )
+    .unwrap();
+    let apns = crate::config::Apns {
+        team_id: "ABCDE12345".into(),
+        key_id: "KEY1234567".into(),
+        key_file: key.to_string_lossy().into(),
+        topic: "com.digitalpals.fusebox".into(),
+    };
+    app.set_config(Config { apns: Some(apns.clone()), ..cfg });
+
+    for (bad, environment) in [("zz".repeat(32), "production"), (token.clone(), "staging")] {
+        assert!(register(&bad, environment).await.unwrap().status().is_client_error());
+    }
+    let created: Value = register(&token.to_uppercase(), "development").await.unwrap().json().await.unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+    let again: Value = register(&token, "production").await.unwrap().json().await.unwrap();
+    assert_eq!(again["id"], id.as_str(), "the same token is the same device");
+    let status: Value =
+        client.get(format!("{origin}/push")).bearer_auth("k").send().await.unwrap().json().await.unwrap();
+    assert_eq!(status["apns"], true);
+    assert_eq!(status["subscriptions"][0]["kind"], "apns");
+    assert_eq!(status["subscriptions"][0]["label"], "John's iPhone");
+    let sub = app.push.subscriptions().remove(0);
+    let device = sub.apns.clone().unwrap();
+    assert_eq!(device.environment, apns::Environment::Production);
+    assert_eq!(device.token, token);
+
+    // Apple's side: the first push is accepted, then the token is refused as unknown,
+    // then the provider token is refused.
+    let (tx, mut rx) = mpsc::unbounded_channel::<Received>();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = Router::new().route(
+        "/3/device/{token}",
+        post(move |headers: HeaderMap, body: Bytes| {
+            let tx = tx.clone();
+            let calls = calls.clone();
+            async move {
+                let _ = tx.send(Received { headers, body });
+                match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => (StatusCode::OK, String::new()),
+                    1 => (StatusCode::BAD_REQUEST, r#"{"reason":"BadDeviceToken"}"#.into()),
+                    _ => (StatusCode::FORBIDDEN, r#"{"reason":"InvalidProviderToken"}"#.into()),
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let service = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+    let fault = Fault {
+        key: "provider:claude".into(),
+        provider: "claude".into(),
+        title: "Every Claude account is used up".into(),
+        body: "The first is back in 2h 10m.".into(),
+        path: "#/accounts".into(),
+        kind: "provider",
+        level: "err",
+        ..Default::default()
+    };
+    let send = || apns::send(&client, &base, &app.push.apns, Some(&apns), &device, &fault, 2, true, TTL_SECONDS);
+    assert_eq!(send().await.unwrap(), StatusCode::OK);
+    let got = rx.recv().await.unwrap();
+    assert_eq!(got.headers["apns-topic"], "com.digitalpals.fusebox");
+    assert_eq!(got.headers["apns-push-type"], "alert");
+    assert_eq!(got.headers["apns-priority"], "10");
+    assert_eq!(got.headers["apns-collapse-id"], "provider:claude");
+    assert!(got.headers["authorization"].to_str().unwrap().starts_with("bearer ey"));
+    let body: Value = serde_json::from_slice(&got.body).unwrap();
+    assert_eq!(body["aps"]["alert"]["title"], "Every Claude account is used up");
+    assert_eq!(body["aps"]["badge"], 2);
+    assert_eq!(body["path"], "#/accounts");
+    assert_eq!(send().await.unwrap(), StatusCode::GONE, "an unknown token means the device is gone");
+    let refused = send().await.unwrap_err().to_string();
+    assert!(refused.contains("InvalidProviderToken"), "{refused}");
+    assert!(
+        apns::send(&client, &base, &app.push.apns, None, &device, &fault, 0, false, TTL_SECONDS)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("isn't set up")
+    );
+
+    let removed = client.delete(format!("{origin}/push/subscriptions/{id}")).bearer_auth("k").send().await.unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::OK);
+    assert!(app.push.subscriptions().is_empty());
+    server.abort();
+    service.abort();
+}
+
+#[tokio::test]
+async fn the_iphone_app_registers_through_the_relay_without_an_apns_key() {
+    let temp = Temp::new();
+    let cfg = Config { auth_dir: temp.0.to_string_lossy().into(), management_key: "k".into(), ..Default::default() };
+    assert_eq!(cfg.push_relay, relay::DEFAULT_URL, "the relay is on by default");
+    let app = App::new(cfg.clone(), temp.0.join("config.yaml"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::mgmt::router(app.clone()).with_state(app.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+    });
+    let client = reqwest::Client::new();
+    let handle = URL_SAFE_NO_PAD.encode([5u8; 32]);
+    let key = base64::engine::general_purpose::STANDARD.encode([6u8; 32]);
+    let register = |body: Value| client.post(format!("{origin}/push/apns")).bearer_auth("k").json(&body).send();
+
+    let status: Value =
+        client.get(format!("{origin}/push")).bearer_auth("k").send().await.unwrap().json().await.unwrap();
+    assert_eq!((status["apns"].clone(), status["relay"].clone()), (json!(false), json!(relay::DEFAULT_URL)));
+    // Without apns, a device token can't be used directly.
+    let direct = register(json!({ "token": "ab".repeat(32), "environment": "production" })).await.unwrap();
+    assert_eq!(direct.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(direct.json::<Value>().await.unwrap()["error"].as_str().unwrap().contains("relay"));
+    for bad in [json!({ "label": "x" }), json!({ "relay": { "handle": "short", "key": key } })] {
+        assert_eq!(register(bad).await.unwrap().status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let body = json!({ "relay": { "handle": handle, "key": key }, "label": "John's iPhone" });
+    let created: Value = register(body.clone()).await.unwrap().json().await.unwrap();
+    let again: Value = register(body.clone()).await.unwrap().json().await.unwrap();
+    assert_eq!(created["id"], again["id"], "the same handle is the same device");
+    let status: Value =
+        client.get(format!("{origin}/push")).bearer_auth("k").send().await.unwrap().json().await.unwrap();
+    assert_eq!(status["subscriptions"][0]["kind"], "apns");
+    assert_eq!(status["subscriptions"][0]["via"], "relay");
+    assert_eq!(app.push.subscriptions()[0].relay.as_ref().unwrap().handle, handle);
+
+    // Turned off, the relay takes no new devices.
+    app.set_config(Config { push_relay: String::new(), ..cfg });
+    let status: Value =
+        client.get(format!("{origin}/push")).bearer_auth("k").send().await.unwrap().json().await.unwrap();
+    assert_eq!(status["relay"], Value::Null);
+    let off = register(json!({ "relay": { "handle": URL_SAFE_NO_PAD.encode([9u8; 32]), "key": key } })).await.unwrap();
+    assert_eq!(off.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(Config::parse("push-relay: http://push.example.com\n").is_err(), "the relay takes https only");
+    assert_eq!(Config::parse("push-relay: ''\n").unwrap().push_relay, "");
+    server.abort();
 }

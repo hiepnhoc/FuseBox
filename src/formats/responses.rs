@@ -412,32 +412,16 @@ pub struct Parser {
 }
 
 pub fn usage_of(u: &Value) -> Option<Usage> {
-    if !u.is_object() {
-        return None;
-    }
-    let input = u["input_tokens"].as_u64().unwrap_or(0);
-    let details = &u["input_tokens_details"];
-    let cached = details["cached_tokens"].as_u64().unwrap_or(0);
-    let write = details["cache_write_tokens"]
-        .as_u64()
-        .or_else(|| details["cache_creation_tokens"].as_u64())
-        .or_else(|| u["cache_creation_input_tokens"].as_u64())
-        .unwrap_or(0);
-    Some(Usage {
-        input: input.saturating_sub(cached).saturating_sub(write),
-        cache_read: cached,
-        output: u["output_tokens"].as_u64().unwrap_or(0),
-        reasoning: u["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
-        cache_write: write,
-        write_30m: details["cache_write_tokens_details"]["ttl_30m_tokens"].as_u64(),
-        write_12h: details["cache_write_tokens_details"]["ttl_12h_tokens"].as_u64(),
-        credits: None,
-    })
+    super::openai_usage(u, crate::ir::Format::Responses)
 }
 
 fn status_of_code(code: &str) -> u16 {
     match code {
-        "rate_limit_exceeded" | "usage_limit_reached" | "insufficient_quota" | "quota_exhausted" => 429,
+        "rate_limit_exceeded"
+        | "usage_limit_reached"
+        | "insufficient_quota"
+        | "quota_exhausted"
+        | "turn_rate_limit_exceeded" => 429,
         "invalid_prompt" | "invalid_request_error" | "context_length_exceeded" => 400,
         "server_is_overloaded" | "slow_down" => 503,
         _ => 500,
@@ -809,7 +793,7 @@ fn request_echo(req: &Request) -> Value {
     })
 }
 
-fn error_code(status: u16) -> &'static str {
+pub(crate) fn error_code(status: u16) -> &'static str {
     match status {
         429 => "rate_limit_exceeded",
         400 | 404 | 413 => "invalid_request_error",
@@ -827,13 +811,7 @@ fn usage_json(u: &Usage) -> Value {
         "output_tokens_details": { "reasoning_tokens": u.reasoning },
         "total_tokens": u.prompt_total() + u.output,
     });
-    if u.cache_write > 0 || u.write_30m.is_some() || u.write_12h.is_some() {
-        // Canonical name, read by Codex. The legacy alias carries the same count for
-        // clients that read Fusebox's earlier spelling; it is not an additional amount.
-        usage["input_tokens_details"]["cache_write_tokens"] = u.cache_write.into();
-        usage["input_tokens_details"]["cache_creation_tokens"] = u.cache_write.into();
-    }
-    super::write_openai_cache_lifetimes(&mut usage["input_tokens_details"], u);
+    super::write_openai_cache_details(&mut usage["input_tokens_details"], u);
     usage
 }
 

@@ -106,8 +106,32 @@ fn rate(v: &Value, id: &str, name: &str, scope: Scope, out: &mut Reading) {
     }
 }
 
+/// ChatGPT Pro plans currently have no 5-hour limit. Usage then lists a single account
+/// window, a week, as `primary_window` with `secondary_window: null`, where plans with
+/// the limit list it as a window of its own. So both slots must be there, every window
+/// must say how long it is, and none may be shorter than a day; anything less proves nothing.
+pub(super) fn codex_no_five_hour(v: &Value) -> bool {
+    let rate = field(v, "rate_limit", "rateLimit");
+    let mut windows = 0;
+    for (snake, camel) in [("primary_window", "primaryWindow"), ("secondary_window", "secondaryWindow")] {
+        let Some(w) = rate.get(snake).or_else(|| rate.get(camel)) else { return false };
+        if w.is_null() {
+            continue;
+        }
+        match number(field(w, "limit_window_seconds", "limitWindowSeconds")) {
+            Some(s) if (86_400.0..366.0 * 86_400.0).contains(&s) && s.fract() == 0.0 => windows += 1,
+            _ => return false,
+        }
+    }
+    windows > 0
+}
+
 pub(super) fn codex(v: &Value) -> Reading {
-    let mut out = Reading { plan: text(field(v, "plan_type", "planType")), ..Default::default() };
+    let mut out = Reading {
+        plan: text(field(v, "plan_type", "planType")),
+        no_five_hour: codex_no_five_hour(v),
+        ..Default::default()
+    };
     rate(field(v, "rate_limit", "rateLimit"), "codex", "Account allowance", Scope::Account, &mut out);
     rate(
         field(v, "code_review_rate_limit", "codeReviewRateLimit"),
@@ -154,8 +178,75 @@ pub(super) fn codex(v: &Value) -> Reading {
     out
 }
 
+/// A typed limit's use: a number from 0 to 100, or nothing.
+fn percent(w: &Value) -> Option<f64> {
+    number(&w["percent"]).filter(|p| (0.0..=100.0).contains(p))
+}
+
+/// Verified Ultra accounts have no 5-hour limit: usage says `five_hour: null`, and its
+/// typed list, which names every account-wide limit, has a valid weekly entry but no
+/// session. A null alone is not enough, since plans with the limit report an idle window
+/// that way, and a list with any entry it can't classify proves nothing.
+pub fn claude_no_five_hour(v: &Value) -> bool {
+    let Some(typed) = v["limits"].as_array() else { return false };
+    v.get("five_hour").is_some_and(Value::is_null)
+        && typed.iter().all(|w| w["kind"].as_str().is_some_and(|k| !k.trim().is_empty()))
+        && !typed.iter().any(|w| w["kind"] == "session" || w["group"] == "session")
+        && typed.iter().any(|w| w["kind"] == "weekly_all" && percent(w).is_some())
+}
+
+/// What a Claude usage reading says of the 5-hour window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiveHour {
+    /// Missing, malformed or ambiguous data.
+    Unknown,
+    /// The account has no 5-hour limit (a verified Ultra account).
+    Absent,
+    /// Not started: no use and no renewal time.
+    Idle,
+    /// Started; renews then.
+    Active(DateTime<Utc>),
+    /// `five_hour: null` with no typed list, as older readings put it: an idle window
+    /// on plans that have one, but on Ultra possibly no window at all.
+    Null,
+}
+
+/// The `five_hour` block when it is there, else the typed `session` entry. Only explicit
+/// data proves a window idle; a zero-percent window with a future reset has started.
+pub fn claude_five_hour(v: &Value, now: DateTime<Utc>) -> FiveHour {
+    if claude_no_five_hour(v) {
+        return FiveHour::Absent;
+    }
+    let classify = |used: Option<f64>, reset: Option<&Value>| {
+        let Some(used) = used else { return FiveHour::Unknown };
+        match reset {
+            Some(Value::Null) if used == 0.0 => FiveHour::Idle,
+            Some(Value::String(s)) => match DateTime::parse_from_rfc3339(s) {
+                Ok(at) if at > now => FiveHour::Active(at.with_timezone(&Utc)),
+                // An old reset alone cannot prove a fresh window has not begun.
+                _ => FiveHour::Unknown,
+            },
+            _ => FiveHour::Unknown,
+        }
+    };
+    match v.get("five_hour") {
+        Some(w) if w.is_object() => {
+            let used = w["utilization"].as_f64().filter(|u| u.is_finite() && (0.0..=100.0).contains(u));
+            return classify(used, w.get("resets_at"));
+        }
+        Some(Value::Null) => {}
+        _ => return FiveHour::Unknown,
+    }
+    let Some(typed) = v.get("limits") else { return FiveHour::Null };
+    let Some(typed) = typed.as_array() else { return FiveHour::Unknown };
+    match typed.iter().find(|w| w["kind"] == "session") {
+        Some(w) => classify(percent(w), w.get("resets_at")),
+        None => FiveHour::Unknown,
+    }
+}
+
 pub(super) fn claude(v: &Value) -> Reading {
-    let mut out = Reading::default();
+    let mut out = Reading { no_five_hour: claude_no_five_hour(v), ..Default::default() };
     for (key, name, model) in [
         ("five_hour", "5h", None),
         ("seven_day", "week", None),
@@ -207,6 +298,24 @@ pub(super) fn claude(v: &Value) -> Reading {
     }
     for w in typed {
         let Some(used) = number(&w["percent"]) else { continue };
+        // The account-wide entries repeat `five_hour` and `seven_day`; they stand in only
+        // when those are missing.
+        let whole = match w["kind"].as_str() {
+            Some("session") => Some("5h"),
+            Some("weekly_all") => Some("week"),
+            _ => None,
+        };
+        if let Some(name) = whole {
+            if !out.windows.iter().any(|old| old.name == name && old.model.is_none()) {
+                out.windows.push(Window {
+                    name: name.into(),
+                    used: used.clamp(0.0, 100.0),
+                    resets_at: reset(w),
+                    model: None,
+                });
+            }
+            continue;
+        }
         let model = &w["scope"]["model"];
         let display = text(field(model, "display_name", "displayName")).unwrap_or_default();
         if w["kind"] == "weekly_scoped" && matches!(display.to_ascii_lowercase().as_str(), "fable" | "fable 5") {
@@ -232,6 +341,42 @@ pub(super) fn claude(v: &Value) -> Reading {
         l.enabled = field(extra, "is_enabled", "isEnabled").as_bool();
         l.resets_at = reset(extra);
         out.limits.push(l);
+    }
+    out
+}
+
+/// Meta's subscription snapshot: a short window (300 minutes today) and a weekly
+/// one, each a verbatim used percent (over 100 is valid) and an epoch-seconds
+/// reset. Stream frames carry it as `subscription`; a key mint may carry it as
+/// `subs_usage` (on 3 November 2026 Meta's mint sent none). The tier id (the
+/// frame's `tier`, the mint's `subs_tier_id`) is an opaque number, never a plan;
+/// the tier's name lives in the account file (see `Account::meta_plan_name`).
+pub(super) fn meta(v: &Value) -> Reading {
+    let snap = [&v["subscription"], &v["subs_usage"], v]
+        .into_iter()
+        .find(|s| s["window"].is_object() || s["weekly"].is_object());
+    let tier = text(&v["subscription"]["tier"]).or_else(|| text(&v["subs_tier_id"]));
+    let subscription_active = v["is_subs_active"].as_bool();
+    let mut out = Reading { tier, subscription_active, ..Default::default() };
+    let Some(snap) = snap else { return out };
+    let window = &snap["window"];
+    let mins = number(&window["window_duration_mins"]).filter(|m| *m >= 1.0 && m.fract() == 0.0 && *m < 366.0 * 1440.0);
+    if let (Some(used), Some(mins)) = (number(&window["used_percent"]), mins) {
+        out.windows.push(Window {
+            name: label(mins as i64 * 60),
+            used: used.clamp(0.0, 100.0),
+            resets_at: reset(window),
+            model: None,
+        });
+    }
+    let weekly = &snap["weekly"];
+    if let Some(used) = number(&weekly["used_percent"]) {
+        out.windows.push(Window {
+            name: "week".into(),
+            used: used.clamp(0.0, 100.0),
+            resets_at: reset(weekly),
+            model: None,
+        });
     }
     out
 }
@@ -422,5 +567,102 @@ mod tests {
         );
         assert!(st.quota.exhausted("gpt-fast"));
         assert!(!st.quota.exhausted("gpt-normal"));
+    }
+
+    /// A real `response.subscription_usage` frame as Meta sent it on 2026-11-03,
+    /// with the reset stamps moved to 2100 so the windows stay live.
+    fn meta_frame() -> Value {
+        json!({"type": "response.subscription_usage", "subscription": {
+            "tier": "28367280949604159",
+            "weekly": { "resets_at": 4102444800i64, "used_percent": 1 },
+            "window": { "resets_at": 4102444800i64, "used_percent": 3, "window_duration_mins": 300 },
+        }})
+    }
+
+    #[test]
+    fn meta_frames_and_mints_read_as_five_hour_and_weekly_windows() {
+        let mut st = crate::accounts::AccountState::default();
+        usage(&mut st, Provider::Meta, &meta_frame());
+        assert_eq!(st.quota.plan, None, "a tier id is not a plan anyone can read");
+        assert_eq!(st.quota.meta_tier.as_deref(), Some("28367280949604159"));
+        assert_eq!(st.quota.five_hour_remaining("muse-wonder-1.0"), Some(97.0));
+        assert_eq!(st.quota.weekly_remaining("muse-wonder-1.0"), Some(99.0));
+        assert_eq!(st.quota.weekly_reset("muse-wonder-1.0"), ts(4102444800));
+        assert!(st.quota.refreshed_at.is_some(), "a full reading is a refresh");
+
+        // The mint carries the same snapshot under `subs_usage`, plus tier names.
+        let mut st = crate::accounts::AccountState::default();
+        usage(
+            &mut st,
+            Provider::Meta,
+            &json!({"api_key": "k", "is_subs_active": true,
+            "subs_tier_id": "tier-9", "subs_tier_name": "Power Usage",
+            "subs_usage": {
+                "window": { "resets_at": 4102444800i64, "used_percent": 40, "window_duration_mins": 300 },
+                "weekly": { "resets_at": 4102444800i64, "used_percent": 130 },
+            }}),
+        );
+        assert_eq!(st.quota.plan, None);
+        assert_eq!(st.quota.plan_name, None, "the tier name is kept in the account file");
+        assert_eq!(st.quota.meta_tier.as_deref(), Some("tier-9"));
+        assert_eq!(st.quota.five_hour_remaining("muse-spark-1.3"), Some(60.0));
+        assert!(st.quota.exhausted("muse-spark-1.3"), "over-100 weekly use still exhausts");
+    }
+
+    #[test]
+    fn only_a_meta_mint_says_whether_the_subscription_is_active() {
+        let mut st = crate::accounts::AccountState::default();
+        let lapsed = json!({"api_key": "k", "is_subs_active": false, "subs_tier_id": "28367280949604159", "subs_tier_name": null});
+        usage(&mut st, Provider::Meta, &lapsed);
+        assert!(st.quota.subscription_inactive);
+        assert_eq!(serde_json::to_value(&st.quota).unwrap()["subscription_inactive"], true);
+        // Meta kept sending usage frames while the subscription had lapsed.
+        usage(&mut st, Provider::Meta, &meta_frame());
+        assert!(st.quota.subscription_inactive);
+        // The mint after renewing on 2026-11-04: active, named, with its usage.
+        usage(
+            &mut st,
+            Provider::Meta,
+            &json!({"api_key": "k", "is_subs_active": true, "subs_tier_id": "28367280949604159",
+            "subs_tier_name": "Muse Code Max Usage", "subs_usage": {
+                "window": {"used_percent": 14, "window_duration_mins": 300, "resets_at": 4102444800i64},
+                "weekly": {"used_percent": 8, "resets_at": 4102444800i64}, "tier": "28367280949604159"}}),
+        );
+        assert!(!st.quota.subscription_inactive);
+        assert!(serde_json::to_value(&st.quota).unwrap().get("subscription_inactive").is_none());
+        assert_eq!(st.quota.weekly_remaining("muse-spark-1.3"), Some(92.0));
+        // A mint that does not say keeps what the last one said.
+        usage(&mut st, Provider::Meta, &lapsed);
+        usage(&mut st, Provider::Meta, &json!({"api_key": "k"}));
+        assert!(st.quota.subscription_inactive);
+    }
+
+    #[test]
+    fn meta_readings_without_a_subscription_or_a_duration_stay_unknown() {
+        // The mint as Meta answered on 3 November 2026: no `subs_usage`, a tier id and
+        // a null tier name. No windows, no plan, and no refresh claim.
+        let mut st = crate::accounts::AccountState::default();
+        usage(
+            &mut st,
+            Provider::Meta,
+            &json!({"api_key": "k", "is_subs_active": false, "subs_tier_id": "28367280949604159", "subs_tier_name": null}),
+        );
+        assert!(st.quota.windows.is_empty());
+        assert!(st.quota.refreshed_at.is_none());
+        assert_eq!((st.quota.plan.as_deref(), st.quota.plan_name.as_deref()), (None, None));
+        assert!(st.quota.subscription_inactive, "that mint came while the subscription had lapsed");
+
+        // A window that does not say how long it is cannot be named or routed on.
+        let mut st = crate::accounts::AccountState::default();
+        usage(
+            &mut st,
+            Provider::Meta,
+            &json!({"subscription": {
+                "window": { "resets_at": 4102444800i64, "used_percent": 90 },
+                "weekly": { "resets_at": 4102444800i64, "used_percent": 10 },
+            }}),
+        );
+        assert_eq!(st.quota.five_hour_remaining("muse-wonder-1.0"), None);
+        assert_eq!(st.quota.weekly_remaining("muse-wonder-1.0"), Some(90.0));
     }
 }

@@ -1,3 +1,7 @@
+# Goldens are exact captures of upstream requests, compared byte for byte: keep them
+# LF on every platform (a Windows checkout would otherwise turn them into CRLF).
+tests/golden/** text eol=lf
+
 # Shell scripts must keep LF line endings even on Windows checkouts,
 # or bash on macOS/Linux fails on the carriage returns.
 *.sh text eol=lf

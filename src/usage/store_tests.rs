@@ -175,7 +175,7 @@ async fn copy_revision_purge_and_atomic_checkpoint() {
 }
 #[test]
 fn exact_price_cache_reasoning_thresholds_and_historical() {
-    let c = Catalogue::load(None).unwrap();
+    let c = Catalogue::provider_fixture();
     let mut a = event("proxy", "a");
     assert_eq!(c.price(&a).cost_nanos, Some(3_010_000));
     a.tokens.reasoning = Some(0);
@@ -303,7 +303,7 @@ async fn durable_transaction_rollback_and_request_id_namespace() {
 }
 #[test]
 fn overflow_missing_unsupported_regions_tools_and_catalogue_validation() {
-    let c = Catalogue::load(None).unwrap();
+    let c = Catalogue::provider_fixture();
     let mut a = event("proxy", "a");
     assert!(c.price(&a).partial);
     a.service_tier = Some("standard".into());
@@ -559,13 +559,13 @@ async fn replay_lifecycle_counts_respect_raw_date_and_client_filters() {
     a.logical_request_id = Some("one".into());
     a.attempt_id = Some("one".into());
     a.client_id = Some("client-one".into());
-    a.event_at_ms = boundary("2026-10-05T10:00:00Z", chrono_tz::UTC).unwrap();
+    a.event_at_ms = boundary("2026-10-05T10:00:00Z", &crate::zone::Zone::utc()).unwrap();
     let mut b = a.clone();
     b.source_event_id = "second-day".into();
     b.logical_request_id = Some("two".into());
     b.attempt_id = Some("two".into());
     b.client_id = Some("client-two".into());
-    b.event_at_ms = boundary("2026-10-06T10:00:00Z", chrono_tz::UTC).unwrap();
+    b.event_at_ms = boundary("2026-10-06T10:00:00Z", &crate::zone::Zone::utc()).unwrap();
     store.call(move |c| insert_batch(c, &[a, b])).await.unwrap();
     let value = store.reference_summary(all()).await.unwrap();
     assert_eq!(value["trend"].as_array().unwrap().len(), 2);
@@ -687,9 +687,15 @@ async fn large_exact_integer_cost_overflow_returns_explicit_null() {
 fn dashboard_metrics(value: &mut Value) {
     match value {
         Value::Object(fields) => {
-            for key in
-                ["logical_requests", "attempts", "logical_requests_unknown", "attempts_unknown", "trends", "models"]
-            {
+            for key in [
+                "logical_requests",
+                "attempts",
+                "logical_requests_unknown",
+                "attempts_unknown",
+                "trends",
+                "models",
+                "unpriced_reasons",
+            ] {
                 fields.remove(key);
             }
             for value in fields.values_mut() {
@@ -716,6 +722,79 @@ async fn assert_dashboard_matches(store: &Store, q: Query) {
         assert_eq!(fast["pricing"][field], full["pricing"][field]);
     }
 }
+
+#[tokio::test]
+async fn unpriced_reasons_separate_missing_evidence_from_rates_with_source_deduplication() {
+    let p = path("unpriced-reasons");
+    let store = Store::open(&p, 64, 3650, None).unwrap();
+    let at = boundary("2026-10-01T12:00:00Z", &crate::zone::Zone::utc()).unwrap();
+    let mut priced = event("proxy", "priced");
+    priced.event_at_ms = at;
+    priced.response_id = Some("shared-priced-response".into());
+    priced.account_id = Some("test-account".into());
+    let mut missing = event("proxy", "cancelled");
+    missing.event_at_ms = at;
+    missing.actual_model = Some("unknown-model-without-usage".into());
+    missing.tokens = Tokens::default();
+    missing.completeness = "missing".into();
+    missing.status = Some(499);
+    let mut incomplete = event("proxy", "incomplete");
+    incomplete.event_at_ms = at;
+    incomplete.tokens.cache_read = None;
+    incomplete.completeness = "partial".into();
+    let mut no_rate = event("proxy", "internal-model");
+    no_rate.event_at_ms = at;
+    no_rate.actual_model = Some("codex-auto-review".into());
+    let mut reported = event("claude_code", "reported-cost-without-tokens");
+    reported.event_at_ms = at;
+    reported.provider = "anthropic".into();
+    reported.tokens = Tokens::default();
+    reported.completeness = "missing".into();
+    reported.numeric_metadata.insert("reported_cost_nanos".into(), 42_000);
+    let mut matched = event("codex", "imported-missing-copy");
+    matched.event_at_ms = at;
+    matched.response_id = priced.response_id.clone();
+    matched.tokens = Tokens::default();
+    matched.completeness = "missing".into();
+    let mut outside = missing.clone();
+    outside.source_event_id = "outside-window".into();
+    outside.event_at_ms = at + 2 * 86_400_000;
+    store
+        .call(move |c| insert_batch(c, &[priced, missing, incomplete, no_rate, reported, matched, outside]))
+        .await
+        .unwrap();
+    let q = Query {
+        start: Some("2026-10-01".into()),
+        end: Some("2026-10-02".into()),
+        timezone: Some("UTC".into()),
+        ..Default::default()
+    };
+    let value = store.dashboard(q.clone()).await.unwrap();
+    let totals = &value["combined"]["totals"];
+    assert_eq!(totals["observations"], 5);
+    assert_eq!(totals["unpriced"], 3);
+    assert_eq!(totals["matched"], 1);
+    assert_eq!(totals["missing_usage"], 2, "a reported price may coexist with missing tokens");
+    assert_eq!(totals["unpriced_reasons"], json!({"missing_usage":1,"incomplete_usage":1,"unknown_model":1}));
+    for model in value["combined"]["breakdowns"]["model"].as_array().unwrap() {
+        let sum: i64 = model["unpriced_reasons"].as_object().unwrap().values().map(|v| v.as_i64().unwrap()).sum();
+        assert_eq!(sum, model["unpriced"].as_i64().unwrap());
+    }
+    assert_eq!(value, store.dashboard_scan(q.clone()).await.unwrap());
+    let only_imported = Query { source: Some("codex".into()), ..q.clone() };
+    let imported = store.dashboard(only_imported).await.unwrap();
+    assert_eq!(imported["combined"]["totals"]["observations"], 0);
+    assert_eq!(imported["combined"]["totals"]["unpriced_reasons"], json!({}));
+    let only_unknown = Query { model: Some("codex-auto-review".into()), ..q };
+    let filtered = store.dashboard(only_unknown).await.unwrap();
+    assert_eq!(filtered["combined"]["totals"]["unpriced_reasons"], json!({"unknown_model":1}));
+    store.call(|c| {
+        let plan: String = c.query_row("EXPLAIN QUERY PLAN SELECT event_at_ms,pricing_basis FROM usage_entries WHERE cost_nanos IS NULL AND event_at_ms>=0 AND event_at_ms<2000000000000", [], |row|row.get(3))?;
+        assert!(plan.contains("usage_entries_unpriced_time"), "{plan}");
+        Ok(())
+    }).await.unwrap();
+    store.shutdown().await.unwrap();
+}
 #[tokio::test]
 async fn dashboard_matches_full_summary_with_overlap_revisions_filters_and_fresh_writes() {
     let p = path("dashboard-equivalence");
@@ -725,7 +804,7 @@ async fn dashboard_matches_full_summary_with_overlap_revisions_filters_and_fresh
     let mut records = Vec::new();
     for i in 0..40 {
         let mut o = event(["proxy", "codex", "claude_code"][i % 3], &format!("dashboard-{i}"));
-        o.event_at_ms = boundary("2026-10-01T22:00:00Z", chrono_tz::UTC).unwrap() + i as i64 * 3_600_000;
+        o.event_at_ms = boundary("2026-10-01T22:00:00Z", &crate::zone::Zone::utc()).unwrap() + i as i64 * 3_600_000;
         o.provider = if i % 2 == 0 { "anthropic" } else { "openai" }.into();
         o.actual_model =
             if i % 5 == 0 { None } else { Some(if i % 2 == 0 { "claude-sonnet-4-6" } else { "gpt-6.1-sol" }.into()) };
@@ -785,7 +864,7 @@ async fn dashboard_matches_full_summary_with_overlap_revisions_filters_and_fresh
         before["combined"]["totals"]["observations"].as_i64().unwrap() + 1
     );
     assert_dashboard_matches(&store, base.clone()).await;
-    store.purge(boundary("2026-10-03T00:00:00Z", chrono_tz::UTC).unwrap()).await.unwrap();
+    store.purge(boundary("2026-10-03T00:00:00Z", &crate::zone::Zone::utc()).unwrap()).await.unwrap();
     assert_dashboard_matches(&store, base).await;
     assert!(store.dashboard(Query { timezone: Some("invalid".into()), ..all() }).await.is_err());
     store.shutdown().await.unwrap();
@@ -797,7 +876,7 @@ async fn dashboard_groups_dst_days_and_bounds_facets_and_breakdowns() {
     let mut records = Vec::new();
     for i in 0..520 {
         let mut o = event("proxy", &format!("dst-{i}"));
-        o.event_at_ms = boundary("2026-03-28T22:30:00Z", chrono_tz::UTC).unwrap() + i * 900_000;
+        o.event_at_ms = boundary("2026-03-28T22:30:00Z", &crate::zone::Zone::utc()).unwrap() + i * 900_000;
         o.actual_model = Some(format!("unknown-{i:03}"));
         o.account_id = Some(format!("account-{i:03}"));
         o.client_id = Some(format!("client-{i:03}"));
@@ -976,7 +1055,7 @@ fn anthropic(source: &str, id: &str, response: Option<&str>, at: &str) -> Observ
     o.provider = "anthropic".into();
     o.actual_model = Some("claude-sonnet-4-6".into());
     o.response_id = response.map(Into::into);
-    o.event_at_ms = boundary(at, chrono_tz::UTC).unwrap();
+    o.event_at_ms = boundary(at, &crate::zone::Zone::utc()).unwrap();
     o
 }
 #[tokio::test]
@@ -993,7 +1072,7 @@ async fn combined_set_counts_shared_response_once_and_proxy_wins() {
     p3.account_id = Some("acct".into());
     let c3 = anthropic("claude_code", "c3", Some("r3"), "2026-10-02T00:00:30Z");
     let mut weak = event("codex", "weak");
-    weak.event_at_ms = boundary("2026-10-02T12:00:00Z", chrono_tz::UTC).unwrap();
+    weak.event_at_ms = boundary("2026-10-02T12:00:00Z", &crate::zone::Zone::utc()).unwrap();
     let key = association_key(&p1);
     store.call(move |c| insert_batch(c, &[p1, c1, c2, p3, c3, weak])).await.unwrap();
     // Root cause: the account-scoped proxy key and the imported key both survive.
@@ -1019,7 +1098,7 @@ async fn combined_set_counts_shared_response_once_and_proxy_wins() {
     let acct = account.iter().find(|a| a["id"] == "acct").unwrap();
     assert_eq!((acct["observations"].as_i64(), acct["provider"].as_str()), (Some(2), Some("anthropic")));
     let first = combined["proxy_first_event_at_ms"].as_i64().unwrap();
-    assert_eq!(first, boundary("2026-10-01T10:00:00Z", chrono_tz::UTC).unwrap());
+    assert_eq!(first, boundary("2026-10-01T10:00:00Z", &crate::zone::Zone::utc()).unwrap());
     // The imported copy after midnight is still matched to the proxy row before it.
     let late = store.reference_summary(range("2026-10-02", "2026-10-03")).await.unwrap();
     assert_eq!(late["combined"]["totals"]["observations"], 1);
@@ -1041,9 +1120,9 @@ async fn combined_trend_groups_by_provider_and_model_across_dst() {
     // Amsterdam moves from CET (+1) to CEST (+2) at 2026-03-29T01:00Z.
     let a = anthropic("claude_code", "a", Some("ra"), "2026-03-28T22:30:00Z");
     let mut b = event("proxy", "b");
-    b.event_at_ms = boundary("2026-03-28T23:30:00Z", chrono_tz::UTC).unwrap();
+    b.event_at_ms = boundary("2026-03-28T23:30:00Z", &crate::zone::Zone::utc()).unwrap();
     let mut c = event("codex", "c");
-    c.event_at_ms = boundary("2026-03-29T21:30:00Z", chrono_tz::UTC).unwrap();
+    c.event_at_ms = boundary("2026-03-29T21:30:00Z", &crate::zone::Zone::utc()).unwrap();
     let d = anthropic("proxy", "d", Some("rd"), "2026-03-29T22:30:00Z");
     store.call(move |conn| insert_batch(conn, &[a, b, c, d])).await.unwrap();
     let base = json!({"start":"2026-03-27","end":"2026-04-01","timezone":"Europe/Amsterdam"});
@@ -1096,7 +1175,7 @@ async fn combined_observations_report_matched_sources_and_origin_label() {
     let mut c2 = anthropic("claude_code", "c2", Some("r2"), "2026-10-01T11:00:00Z");
     c2.origin_id = origin;
     let mut weak = event("codex", "weak");
-    weak.event_at_ms = boundary("2026-10-01T12:00:00Z", chrono_tz::UTC).unwrap();
+    weak.event_at_ms = boundary("2026-10-01T12:00:00Z", &crate::zone::Zone::utc()).unwrap();
     store.call(move |c| insert_batch(c, &[p1, c1, copy, c2, weak])).await.unwrap();
     let base = json!({"start":"2026-10-01","end":"2026-10-02","timezone":"UTC"});
     assert_eq!(store.details(query(base.clone())).await.unwrap()["total"], 5);
@@ -1136,6 +1215,92 @@ fn insert_legacy(c: &mut Connection, observations: &[Observation]) -> Result<Val
     Ok(result)
 }
 #[tokio::test]
+async fn t3_repair_and_explicit_refresh_preserve_evidence_unknowns_and_audit() {
+    let p = path("t3-reprice");
+    let legacy = Catalogue::provider_fixture();
+    let store = Store::start(&p, 16, 3650, legacy, None).unwrap();
+    let mut haiku = event("proxy", "dated-haiku");
+    haiku.provider = "anthropic".into();
+    haiku.actual_model = Some("claude-haiku-4-5-20251001".into());
+    let mut fast = event("proxy", "requested-fast");
+    fast.service_tier = Some("default".into());
+    fast.set_requested_speed(Some("priority"));
+    let mut missing = event("proxy", "disconnected");
+    missing.tokens = Tokens::default();
+    missing.completeness = "missing".into();
+    missing.status = Some(499);
+    let mut custom = event("proxy", "custom");
+    custom.set_requested_speed(Some("priority"));
+    store.call(move |c| insert_batch(c, &[haiku, fast, missing, custom])).await.unwrap();
+    let before = store
+        .call(|c| {
+            let snapshot: String =
+                c.query_row("SELECT snapshot_json FROM usage_observations WHERE source_event_id='custom'", [], |r| {
+                    r.get(0)
+                })?;
+            let mut snapshot: Value = serde_json::from_str(&snapshot)?;
+            snapshot["local_override"] = true.into();
+            c.execute(
+                "UPDATE usage_observations SET snapshot_json=?1 WHERE source_event_id='custom'",
+                [serde_json::to_string(&snapshot)?],
+            )?;
+            let rows = c
+                .prepare("SELECT source_event_id,payload,fingerprint FROM usage_observations ORDER BY id")?
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap();
+    store.shutdown().await.unwrap();
+    drop(store);
+    let store = Store::open(&p, 16, 3650, None).unwrap();
+    assert_eq!(store.startup_repriced(), 1, "only the dated Haiku alias needs startup repair");
+    store
+        .call(|c| {
+            let cost = |c: &Connection, id: &str| {
+                c.query_row("SELECT cost_nanos FROM usage_observations WHERE source_event_id=?1", [id], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })
+            };
+            assert_eq!(cost(c, "dated-haiku")?, Some(1_510_000));
+            assert_eq!(cost(c, "requested-fast")?, Some(3_010_000), "startup retains established prices");
+            assert_eq!(cost(c, "disconnected")?, None);
+            assert_eq!(reprice_all(c)?, 1);
+            assert_eq!(cost(c, "requested-fast")?, Some(6_020_000));
+            assert_eq!(cost(c, "custom")?, Some(3_010_000));
+            assert_eq!(cost(c, "disconnected")?, None);
+            assert_eq!(reprice_all(c)?, 0);
+            assert_eq!(reprice(c)?, 0);
+            let revisions: i64 = c.query_row("SELECT count(*) FROM usage_price_revisions", [], |r| r.get(0))?;
+            assert_eq!(revisions, 2);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let after = store
+        .call(|c| {
+            let mut decoder = codec::Decoder::new(c);
+            let rows = c
+                .prepare("SELECT source_event_id,payload,fingerprint FROM usage_observations ORDER BY id")?
+                .query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, rusqlite::types::Value>(1)?, r.get::<_, String>(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .map(|(id, payload, fingerprint)| Ok((id, decoder.decode((&payload).into())?, fingerprint)))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .await
+        .unwrap();
+    assert_eq!(before, after, "repricing cannot rewrite returned tiers, tokens or request evidence");
+    let range = all();
+    assert_eq!(store.dashboard(range.clone()).await.unwrap(), store.dashboard_scan(range).await.unwrap());
+    assert_eq!(store.reference_summary(all()).await.unwrap()["proxy"]["unpriced"], 1);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
     let p = path("reprice");
     let store = Store::open(&p, 8, 3650, None).unwrap();
@@ -1148,7 +1313,7 @@ async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
     proxy.inference_geo = Some("global".into());
     old.push(proxy);
     let mut counter = event("codex", "counter:old");
-    counter.event_at_ms = boundary("2026-03-01T12:00:00Z", chrono_tz::UTC).unwrap();
+    counter.event_at_ms = boundary("2026-03-01T12:00:00Z", &crate::zone::Zone::utc()).unwrap();
     old.push(counter);
     let current = event("proxy", "current");
     store.call(move |c| insert_legacy(c, &old)).await.unwrap();
@@ -1201,7 +1366,7 @@ async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
         .await
         .unwrap();
     let item = &page["items"][0];
-    assert_eq!(item["pricing_basis"], "current_rate_equivalent");
+    assert_eq!(item["pricing_basis"], "t3_current_rate_equivalent");
     assert_eq!(item["pricing_snapshot"]["backdated"], true);
     assert_eq!(item["pricing_snapshot"]["partial"], false);
     store.shutdown().await.unwrap();
@@ -1210,7 +1375,7 @@ async fn startup_reprice_prices_old_unpriced_rows_once_and_keeps_priced_rows() {
 #[tokio::test]
 async fn startup_repairs_unpriced_claude_regions_and_preserves_priced_snapshots() {
     let p = path("region-reprice");
-    let store = Store::open(&p, 8, 3650, None).unwrap();
+    let store = Store::start(&p, 8, 3650, Catalogue::provider_fixture(), None).unwrap();
     let mut unavailable = anthropic("proxy", "unavailable", Some("msg-unavailable"), &Utc::now().to_rfc3339());
     unavailable.inference_geo = Some("not_available".into());
     let mut unknown = unavailable.clone();
@@ -1237,8 +1402,8 @@ async fn startup_repairs_unpriced_claude_regions_and_preserves_priced_snapshots(
         .unwrap();
     store.shutdown().await.unwrap();
     let store = Store::open(&p, 8, 3650, None).unwrap();
-    assert_eq!(store.startup_repriced(), 1);
-    assert_eq!(store.reference_summary(all()).await.unwrap()["proxy"]["unpriced"], 1);
+    assert_eq!(store.startup_repriced(), 2);
+    assert_eq!(store.reference_summary(all()).await.unwrap()["proxy"]["unpriced"], 0);
     store
         .call(move |c| {
             let (cost, raw): (i64, String) = c.query_row(
@@ -1248,13 +1413,8 @@ async fn startup_repairs_unpriced_claude_regions_and_preserves_priced_snapshots(
             )?;
             assert!(cost > 0);
             let snapshot: Value = serde_json::from_str(&raw)?;
-            assert_eq!(snapshot["partial"], true);
-            assert!(
-                snapshot["assumptions"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("inference_region_unavailable_global_rate_assumed"))
-            );
+            assert_eq!(snapshot["partial"], false);
+            assert!(snapshot["assumptions"].as_array().unwrap().contains(&json!("t3_flat_category_rates")));
             let after: String =
                 c.query_row("SELECT snapshot_json FROM usage_observations WHERE source_event_id='priced'", [], |r| {
                     r.get(0)
@@ -1323,7 +1483,7 @@ async fn migrations_chain_to_the_current_schema_and_keep_existing_rows() {
 #[tokio::test]
 async fn refreshed_catalogue_repairs_known_prices_and_keeps_an_audit() {
     let p = path("rate-correction");
-    let mut old = Catalogue::load(None).unwrap();
+    let mut old = Catalogue::provider_fixture();
     old.version = "2026-10-07.3".into();
     old.rates.retain(|r| !r.models.iter().any(|m| m == "claude-haiku-5-5"));
     for r in &mut old.rates {

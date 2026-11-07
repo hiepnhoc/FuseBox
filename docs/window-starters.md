@@ -51,6 +51,22 @@ organization IDs. Duplicate credential files for that identity share one journal
 The provider must explicitly report an inactive short window and available weekly
 quota; missing or malformed data and zero-percent active windows do not qualify.
 
+Verified Claude Ultra accounts (formerly Max 20x) have no five-hour limit. Their
+usage reports `five_hour: null` and its typed limit list has a weekly entry but no
+session entry. Such an account shows **No limit** for its five-hour window, has no
+starter on its page, gets no starter request, manual or automatic, and is rechecked
+hourly in case a limit returns. Settings still list it as a starter account, marked
+**no 5h limit**, so its selection survives if the limit returns. A new Ultra
+account keeps a temporary five-hour limit until Anthropic verifies it, and is
+started like any other until then. When `five_hour` is null, the list's session
+entry decides: idle only at 0% with no reset time, active with a future reset,
+unknown otherwise. A list with an entry that can't be classified, or that names a
+session in any way, proves nothing. A null without any list keeps its old meaning,
+an idle window, except on Ultra or an account already confirmed without a limit,
+where it is unknown and only a status check is made; only a reported five-hour
+window brings the limit back. Once an account reports a five-hour window again, the
+starter rechecks it within five minutes instead of at the hourly recheck.
+
 Before dispatch, Fusebox checks settings again and yields to in-flight requests,
 recent requests and recent coding sessions. It skips disabled accounts, applicable
 cooldowns and exhausted limits. Starters share an organization lock with banked

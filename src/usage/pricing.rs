@@ -13,10 +13,25 @@ pub struct Catalogue {
     pub version: String,
     pub verified_at: String,
     pub rates: Vec<Rate>,
+    #[serde(default, skip_serializing_if = "Calculation::is_provider")]
+    pub calculation: Calculation,
     #[serde(default)]
     pub local_override: bool,
     #[serde(default = "usd")]
     pub currency: String,
+}
+/// Legacy organization catalogues retain their provider-specific calculation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Calculation {
+    #[default]
+    Provider,
+    T3,
+}
+impl Calculation {
+    fn is_provider(&self) -> bool {
+        *self == Self::Provider
+    }
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -83,7 +98,97 @@ pub struct Snapshot {
 fn usd() -> String {
     "USD".into()
 }
+
+/// Per-call server-tool fees, bundled beside the rates but never inside the
+/// catalogue: catalogues are stored in the usage database under strict
+/// (`deny_unknown_fields`) types, so a fee field there would break older
+/// binaries reading them back on rollback. Web fetch carries no per-call
+/// fee (its content is billed as tokens); code execution is billed by
+/// container time, which a call count cannot price.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerToolFees {
+    pub version: String,
+    pub verified_at: String,
+    pub fees: Vec<ServerToolFee>,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerToolFee {
+    pub provider: String,
+    pub tool: String,
+    pub nanos_per_call: i64,
+    pub source_url: String,
+}
+impl ServerToolFees {
+    pub fn bundled() -> Option<&'static ServerToolFees> {
+        static BUNDLED: std::sync::LazyLock<Option<ServerToolFees>> =
+            std::sync::LazyLock::new(|| serde_json::from_str(include_str!("server_tool_fees.json")).ok());
+        BUNDLED.as_ref()
+    }
+    fn per_call(&self, provider: &str, tool: &str) -> Option<i64> {
+        self.fees.iter().find(|f| f.provider == provider && f.tool == tool).map(|f| f.nanos_per_call)
+    }
+}
+
+/// Adds per-call server-tool fees to a token cost. A counted call whose fee
+/// is unknown (code execution's time-based pricing, an unlisted provider)
+/// marks the snapshot partial and keeps the token cost, never treating the
+/// call as free; named-client budgets pick fees up through `cost_nanos`.
+fn add_server_tool_fees(o: &Observation, snapshot: &mut Snapshot) {
+    let count = |key: &str| o.numeric_metadata.get(key).copied().unwrap_or(0);
+    let (searches, fetches, executions) =
+        (count("web_search_requests"), count("web_fetch_requests"), count("code_execution_requests"));
+    if searches == 0 && fetches == 0 && executions == 0 {
+        return;
+    }
+    if executions > 0 {
+        snapshot.assumptions.push("code_execution_time_unpriced".into());
+        snapshot.partial = true;
+    }
+    if searches == 0 {
+        return;
+    }
+    let fee = ServerToolFees::bundled().and_then(|fees| fees.per_call(&o.provider, "web_search"));
+    match fee {
+        Some(per_call) => {
+            if let Some(cost) = snapshot.cost_nanos {
+                // An implausible count overflows: keep the token cost, say the fee is missing.
+                match i64::try_from(searches)
+                    .ok()
+                    .and_then(|n| n.checked_mul(per_call))
+                    .and_then(|f| cost.checked_add(f))
+                {
+                    Some(total) => {
+                        snapshot.cost_nanos = Some(total);
+                        snapshot.assumptions.push("server_tool_fees_included".into());
+                    }
+                    None => {
+                        snapshot.assumptions.push("server_tool_fees_unpriced".into());
+                        snapshot.partial = true;
+                    }
+                }
+            } else {
+                snapshot.assumptions.push("server_tool_fees_included".into());
+            }
+        }
+        None => {
+            snapshot.assumptions.push("server_tool_fees_unpriced".into());
+            snapshot.partial = true;
+        }
+    }
+}
 impl Catalogue {
+    pub fn basis(&self) -> &'static str {
+        match self.calculation {
+            Calculation::T3 => {
+                "T3 Code category-rate equivalent using requested Codex speed and reported Claude speed; no context, region or cache-lifetime premiums; never subscription bill"
+            }
+            Calculation::Provider => {
+                "API list-price equivalent estimate using the configured tier, context, region and cache-lifetime rules; never subscription bill"
+            }
+        }
+    }
     /// The catalogue built into this release, loaded once.
     pub fn bundled_catalogue() -> Option<&'static Catalogue> {
         static BUNDLED: std::sync::LazyLock<Option<Catalogue>> =
@@ -94,7 +199,7 @@ impl Catalogue {
     pub fn load(overrides: Option<&Path>) -> Result<Self> {
         let raw = match overrides {
             Some(p) => std::fs::read_to_string(p).context("read pricing catalogue")?,
-            None => include_str!("rates.json").to_owned(),
+            None => include_str!("rates-t3.json").to_owned(),
         };
         let mut catalogue: Self = serde_json::from_str(&raw).context("parse pricing catalogue")?;
         if overrides.is_some() {
@@ -242,6 +347,14 @@ impl Catalogue {
             local_override: self.local_override,
             backdated: false,
         };
+        if self.calculation == Calculation::T3
+            && !self.local_override
+            && let Some(cost) = o.numeric_metadata.get("reported_cost_nanos").and_then(|n| i64::try_from(*n).ok())
+        {
+            snapshot.cost_nanos = Some(cost);
+            snapshot.basis = "t3_provider_reported".into();
+            return snapshot;
+        }
         let Some(actual_model) = o.actual_model.as_ref() else {
             return snapshot;
         };
@@ -266,12 +379,20 @@ impl Catalogue {
             return snapshot;
         };
         snapshot.rate = Some(rate.clone());
+        if o.provider == "meta" && model.starts_with("muse-wonder-full") {
+            // Subscription-only, so Meta publishes no price; the catalogue uses Wonder's.
+            snapshot.assumptions.push("wonder_full_priced_at_wonder_rate".into());
+            snapshot.partial = true;
+        }
         if o.source == "codex" && o.source_event_id.starts_with("counter:") {
             snapshot.partial = true;
             if o.numeric_metadata.get("per_request_usage") != Some(&1) {
                 snapshot.basis = "cumulative_usage_not_per_request".into();
                 return snapshot;
             }
+        }
+        if self.calculation == Calculation::T3 {
+            return self.price_t3(o, rate, snapshot);
         }
         if o.service_tier.is_none() || o.service_tier.as_deref() == Some("auto") {
             snapshot.assumptions.push("standard_api_tier_assumed".into());
@@ -427,16 +548,115 @@ impl Catalogue {
         {
             snapshot.basis = "estimated_tokens".into();
         }
+        add_server_tool_fees(o, &mut snapshot);
         if self.local_override {
             snapshot.basis = format!("local_override:{}", snapshot.basis);
         }
         snapshot
     }
+
+    /// T3 Code's flat category rates and requested speed. Keep raw returned tier,
+    /// region, lifetime counts and final usage revisions on the observation.
+    fn price_t3(&self, o: &Observation, rate: &Rate, mut snapshot: Snapshot) -> Snapshot {
+        use super::types::Speed;
+        let speed = if o.provider == "anthropic" {
+            // Claude reports speed separately. Its contracted/ordinary service
+            // tier does not imply the Codex priority or ultrafast speeds.
+            if o.service_tier.as_deref().is_some_and(|t| t == "fast" || t.ends_with("+fast")) {
+                Speed::Fast
+            } else {
+                Speed::Standard
+            }
+        } else if o.provider == "meta" {
+            // Muse has one speed; T3 records its usage as standard.
+            Speed::Standard
+        } else {
+            o.requested_speed().unwrap_or_else(|| Speed::from_tier(o.service_tier.as_deref()))
+        };
+        snapshot.service_tier = speed.as_str().into();
+        snapshot.assumptions.push("t3_flat_category_rates".into());
+        if rate.source_url
+            != "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        {
+            snapshot.assumptions.push("published_provider_rate_fallback".into());
+        }
+        snapshot.assumptions.push(
+            if o.provider == "anthropic" {
+                "reported_claude_speed"
+            } else if o.provider == "meta" {
+                "single_speed_model"
+            } else if o.requested_speed().is_some() {
+                "requested_speed"
+            } else {
+                "requested_speed_unavailable_returned_tier_used"
+            }
+            .into(),
+        );
+        let multiplier = if speed == Speed::Standard {
+            [1, 1]
+        } else if let Some(multiplier) = rate.tier_multipliers.get(speed.as_str()) {
+            *multiplier
+        } else {
+            snapshot.assumptions.push("speed_rate_unavailable_standard_rate_used".into());
+            [1, 1]
+        };
+        snapshot.tier_multiplier = multiplier;
+        if o.tokens.validate().is_err() {
+            snapshot.basis = "invalid_tokens".into();
+            return snapshot;
+        }
+        if o.numeric_metadata.iter().any(|(k, v)| {
+            *v > 0
+                && matches!(k.as_str(), "audio_input_tokens" | "audio_output_tokens" | "image_tokens" | "tool_tokens")
+        }) {
+            snapshot.basis = "unsupported_modality_or_tools".into();
+            return snapshot;
+        }
+        let (Some(input), Some(read), Some(write), Some(output)) =
+            (o.tokens.input, o.tokens.cache_read, o.tokens.cache_write, o.tokens.output)
+        else {
+            snapshot.basis = "missing_tokens".into();
+            return snapshot;
+        };
+        let costs = [
+            (input, rate.input_nanos_per_token),
+            (read, rate.cache_read_nanos_per_token.unwrap_or(rate.input_nanos_per_token)),
+            (write, rate.cache_write_nanos_per_token.unwrap_or(rate.input_nanos_per_token)),
+            (output, rate.output_nanos_per_token),
+        ];
+        let sum = costs.into_iter().try_fold(0_i128, |total, (tokens, price)| {
+            total.checked_add(i128::from(tokens).checked_mul(i128::from(price))?)
+        });
+        let [n, d] = multiplier.map(i128::from);
+        snapshot.cost_nanos = sum
+            .and_then(|sum| sum.checked_mul(n)?.checked_add(d / 2)?.checked_div(d))
+            .and_then(|cost| i64::try_from(cost).ok());
+        snapshot.partial |= !matches!(o.provider.as_str(), "anthropic" | "meta") && o.requested_speed().is_none();
+        snapshot.backdated = snapshot.cost_nanos.is_some()
+            && rate.effective_from.is_none()
+            && date_ms(&self.verified_at).is_ok_and(|v| o.event_at_ms < v);
+        snapshot.basis = if snapshot.cost_nanos.is_some() {
+            if rate.effective_from.is_some() { "t3_api_rate_estimate" } else { "t3_current_rate_equivalent" }
+        } else {
+            "unsupported_rate_or_overflow"
+        }
+        .into();
+        add_server_tool_fees(o, &mut snapshot);
+        if self.local_override {
+            snapshot.basis = format!("local_override:{}", snapshot.basis);
+        }
+        snapshot
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_fixture() -> Self {
+        serde_json::from_str(include_str!("rates.json")).unwrap()
+    }
 }
 
 fn normalize_model(model: &str) -> String {
     let lower = model.trim().to_ascii_lowercase();
-    lower.strip_suffix("[1m]").unwrap_or(&lower).trim().to_owned()
+    lower.split('[').next().unwrap_or(&lower).trim().to_owned()
 }
 impl Rate {
     /// A rate without `effective_from` has no start date and applies to any earlier event.
@@ -452,9 +672,123 @@ pub fn date_ms(s: &str) -> Result<i64> {
 pub fn catalogue_info() -> serde_json::Value {
     match Catalogue::load(None) {
         Ok(c) => {
-            serde_json::json!({"version":c.version,"verified_at":c.verified_at,"currency":"USD","unit":"integer nanodollars","rate_count":c.rates.len(),"effective_dates":"null effective_from means no start date: usage older than the catalogue is priced at today's published rates, labelled a current-rate equivalent (backdated), and is not what was actually paid at the time; rates with an explicit effective_from leave earlier events unpriced","basis":"API list-price equivalent, standard tier/global region assumptions explicit; never subscription bill","sources":c.rates.iter().map(|r|r.source_url.clone()).collect::<std::collections::BTreeSet<_>>()})
+            serde_json::json!({"version":c.version,"verified_at":c.verified_at,"calculation":c.calculation,"currency":"USD","unit":"integer nanodollars","rate_count":c.rates.len(),"effective_dates":"null effective_from means no start date: usage older than the catalogue is priced at today's published rates, labelled a current-rate equivalent (backdated), and is not what was actually paid at the time; rates with an explicit effective_from leave earlier events unpriced","basis":c.basis(),"sources":c.rates.iter().map(|r|r.source_url.clone()).collect::<std::collections::BTreeSet<_>>(),"server_tool_fees":ServerToolFees::bundled().map(|f| serde_json::json!({"version":f.version,"verified_at":f.verified_at,"fees":f.fees.iter().map(|fee| serde_json::json!({"provider":fee.provider,"tool":fee.tool,"usd_per_call":fee.nanos_per_call as f64 / 1e9,"source":fee.source_url})).collect::<Vec<_>>()}))})
         }
         Err(e) => serde_json::json!({"error":e.to_string()}),
+    }
+}
+
+#[cfg(test)]
+mod t3_tests {
+    use super::*;
+    use crate::usage::types::Tokens;
+    use serde_json::Value;
+
+    #[test]
+    fn matches_fixtures_evaluated_by_the_installed_t3_pricer() {
+        let catalogue = Catalogue::load(None).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!("../../tests/fixtures/usage/t3-pricing.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let provider = case["provider"].as_str().unwrap();
+            let source = if case["reported_cost_nanos"].is_u64() { "claude_code" } else { "proxy" };
+            let mut o =
+                Observation::new(source, case["id"].as_str().unwrap().into(), provider, date_ms("2026-10-30").unwrap());
+            o.actual_model = Some(case["model"].as_str().unwrap().into());
+            let returned_tier = case["returned_tier"]
+                .as_str()
+                .unwrap_or_else(|| if provider == "anthropic" { case["speed"].as_str().unwrap() } else { "default" });
+            o.service_tier = Some(returned_tier.into());
+            o.set_requested_speed(case["speed"].as_str());
+            // T3 intentionally ignores these premiums; retaining the raw fields
+            // must not alter category costs or add reasoning to output twice.
+            o.inference_geo = Some("us".into());
+            o.completeness = "complete".into();
+            o.tokens = Tokens {
+                input: case["tokens"][0].as_u64(),
+                cache_read: case["tokens"][1].as_u64(),
+                cache_write: case["tokens"][2].as_u64(),
+                output: case["tokens"][3].as_u64(),
+                write_1h: if provider == "anthropic" { case["tokens"][2].as_u64() } else { None },
+                write_12h: if provider == "openai" { case["tokens"][2].as_u64() } else { None },
+                reasoning: case["tokens"][3].as_u64(),
+                ..Default::default()
+            };
+            if let Some(cost) = case["reported_cost_nanos"].as_u64() {
+                o.numeric_metadata.insert("reported_cost_nanos".into(), cost);
+            }
+            o.validate().unwrap();
+            let price = catalogue.price(&o);
+            assert_eq!(price.cost_nanos, case["expected_nanos"].as_i64(), "{}", case["id"]);
+            assert_eq!(o.service_tier.as_deref(), Some(returned_tier));
+        }
+    }
+
+    #[test]
+    fn missing_usage_stays_unknown_and_legacy_speed_is_labelled() {
+        let catalogue = Catalogue::load(None).unwrap();
+        let mut o = Observation::new("proxy", "disconnected".into(), "openai", date_ms("2026-10-30").unwrap());
+        o.actual_model = Some("gpt-6.1-sol".into());
+        o.status = Some(499);
+        o.set_requested_speed(Some("priority"));
+        assert_eq!(catalogue.price(&o).cost_nanos, None);
+        assert_eq!(catalogue.price(&o).basis, "missing_tokens");
+        o.tokens = Tokens {
+            input: Some(198),
+            cache_read: Some(200320),
+            cache_write: Some(0),
+            output: Some(735),
+            ..Default::default()
+        };
+        o.completeness = "complete".into();
+        o.service_tier = Some("default".into());
+        assert_eq!(catalogue.price(&o).cost_nanos, Some(55_556_000));
+        o.numeric_metadata.remove("requested_speed");
+        let price = catalogue.price(&o);
+        assert_eq!(price.cost_nanos, Some(27_778_000));
+        assert!(price.partial);
+        assert!(price.assumptions.iter().any(|a| a == "requested_speed_unavailable_returned_tier_used"));
+    }
+}
+
+#[cfg(test)]
+mod meta_t3_tests {
+    use super::*;
+    use crate::usage::types::Tokens;
+
+    fn muse(model: &str, tokens: [Option<u64>; 4]) -> Snapshot {
+        let mut o = Observation::new("proxy", "muse".into(), "meta", date_ms("2026-11-04").unwrap());
+        o.actual_model = Some(model.into());
+        o.completeness = if tokens.iter().all(Option::is_some) { "complete" } else { "partial" }.into();
+        let [input, cache_read, cache_write, output] = tokens;
+        o.tokens = Tokens { input, cache_read, cache_write, output, reasoning: Some(0), ..Default::default() };
+        Catalogue::load(None).unwrap().price(&o)
+    }
+
+    #[test]
+    fn muse_models_price_at_meta_rates_with_wonder_full_labelled_an_estimate() {
+        // Token counts from production Muse Code requests on 2026-11-04.
+        let spark = muse("muse-spark-1.3", [Some(3048), Some(15217), Some(0), Some(431)]);
+        assert_eq!(spark.cost_nanos, Some(3048 * 1250 + 15217 * 150 + 431 * 4250));
+        assert_eq!(spark.basis, "t3_current_rate_equivalent");
+        assert!(!spark.partial, "{:?}", spark.assumptions);
+        assert!(spark.assumptions.contains(&"single_speed_model".into()));
+        for model in ["muse-spark-1.1", "muse-spark-1.2"] {
+            assert_eq!(muse(model, [Some(3048), Some(15217), Some(0), Some(431)]).cost_nanos, spark.cost_nanos);
+        }
+        let contributor = muse("muse-spark-1.3-contributor", [Some(3048), Some(15217), Some(0), Some(431)]);
+        assert_eq!(contributor.cost_nanos, Some(3048 * 100 + 15217 * 2 + 431 * 200));
+
+        let tokens = [Some(457), Some(129_524), Some(0), Some(390)];
+        let full = muse("muse-wonder-full-1.0", tokens);
+        assert_eq!(full.cost_nanos, Some(457 * 4000 + 129_524 * 200 + 390 * 20_000));
+        assert_eq!(full.cost_nanos, muse("muse-wonder-1.0", tokens).cost_nanos);
+        assert!(full.partial && full.assumptions.contains(&"wonder_full_priced_at_wonder_rate".into()));
+        assert!(!muse("muse-wonder-1.0", tokens).partial);
+        assert_eq!(muse("muse-wonder-full-1.0-contributor", tokens).basis, "unknown_model");
+
+        // Requests stored before cache writes were counted have no input; they stay unpriced.
+        let old = muse("muse-wonder-full-1.0", [None, Some(129_524), None, Some(390)]);
+        assert_eq!((old.cost_nanos, old.basis.as_str()), (None, "missing_tokens"));
     }
 }
 
@@ -497,8 +831,8 @@ mod tier_tests {
         o
     }
     #[test]
-    fn wonder_standard_prices_cache_reads_without_a_context_premium_or_full_price() {
-        let c = Catalogue::load(None).unwrap();
+    fn wonder_standard_prices_cache_reads_without_a_context_premium_and_full_as_an_estimate() {
+        let c = Catalogue::provider_fixture();
         let mut o = event("meta", "muse-wonder-1.0");
         o.service_tier = Some("standard".into());
         o.tokens.cache_write = Some(0);
@@ -507,7 +841,13 @@ mod tier_tests {
         assert_eq!(c.price(&o).cost_nanos, Some(6_040_000));
         o.tokens.input = Some(1_000_000);
         assert_eq!(c.price(&o).cost_nanos, Some(4_002_040_000));
-        for model in ["muse-wonder-full-1.0", "muse-wonder-1.0-contributor", "muse-wonder-full-1.0-contributor"] {
+        let wonder = c.price(&o);
+        assert!(!wonder.partial && wonder.assumptions.is_empty());
+        o.actual_model = Some("muse-wonder-full-1.0".into());
+        let full = c.price(&o);
+        assert_eq!(full.cost_nanos, wonder.cost_nanos);
+        assert!(full.partial && full.assumptions.contains(&"wonder_full_priced_at_wonder_rate".into()));
+        for model in ["muse-wonder-1.0-contributor", "muse-wonder-full-1.0-contributor"] {
             o.actual_model = Some(model.into());
             assert_eq!(c.price(&o).basis, "unknown_model");
             assert!(c.price(&o).cost_nanos.is_none());
@@ -515,8 +855,45 @@ mod tier_tests {
     }
 
     #[test]
+    fn server_tool_fees_join_the_token_cost_and_unpriced_calls_stay_partial() {
+        let c = Catalogue::provider_fixture();
+        let mut o = event("openai", "gpt-6.1-terra");
+        o.service_tier = Some("standard".into());
+        let tokens_only = c.price(&o).cost_nanos.unwrap();
+        // Two searches at $10 per 1,000 calls add exactly 20,000,000 nanos;
+        // a web fetch carries no per-call fee.
+        o.numeric_metadata.insert("web_search_requests".into(), 2);
+        o.numeric_metadata.insert("web_fetch_requests".into(), 1);
+        let priced = c.price(&o);
+        assert_eq!(priced.cost_nanos, Some(tokens_only + 20_000_000));
+        assert!(priced.assumptions.contains(&"server_tool_fees_included".into()));
+        // Code execution is billed by container time: counted, never free.
+        o.numeric_metadata.insert("code_execution_requests".into(), 1);
+        let priced = c.price(&o);
+        assert_eq!(priced.cost_nanos, Some(tokens_only + 20_000_000));
+        assert!(priced.partial && priced.assumptions.contains(&"code_execution_time_unpriced".into()));
+        // A count so large the fee overflows keeps the token cost and is partial.
+        o.numeric_metadata.remove("code_execution_requests");
+        o.numeric_metadata.insert("web_search_requests".into(), 1_000_000_000_000);
+        let priced = c.price(&o);
+        assert_eq!(priced.cost_nanos, Some(tokens_only), "the token cost survives");
+        assert!(priced.partial && priced.assumptions.contains(&"server_tool_fees_unpriced".into()));
+        o.numeric_metadata.insert("web_search_requests".into(), 2);
+        // A bundled fee table decodes, and the strict catalogue types keep
+        // accepting a catalogue document without any fee fields in it.
+        let fees = ServerToolFees::bundled().unwrap();
+        assert_eq!(fees.per_call("anthropic", "web_search"), Some(10_000_000));
+        assert!(serde_json::from_str::<Catalogue>(include_str!("rates.json")).is_ok());
+        // Anthropic search counts price on a Claude model too.
+        let mut o = event("anthropic", "claude-sonnet-4-6");
+        let tokens_only = c.price(&o).cost_nanos;
+        o.numeric_metadata.insert("web_search_requests".into(), 1);
+        assert_eq!(c.price(&o).cost_nanos, tokens_only.map(|n| n + 10_000_000));
+    }
+
+    #[test]
     fn terra_prices_cache_lifetimes_tiers_and_context_boundaries() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("openai", "gpt-6.1-terra");
         o.service_tier = Some("standard".into());
         assert_eq!(c.price(&o).cost_nanos, Some(1_635_000));
@@ -540,7 +917,7 @@ mod tier_tests {
 
     #[test]
     fn haiku55_threshold_includes_cache_reads_and_both_write_lifetimes() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("anthropic", "claude-haiku-5-5");
         o.service_tier = Some("standard".into());
         o.tokens.input = Some(99700); // Cache reads/writes bring the prompt to 100K.
@@ -555,7 +932,7 @@ mod tier_tests {
 
     #[test]
     fn tier_context_and_region_are_exact() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("openai", "gpt-6.1-sol");
         o.service_tier = Some("standard".into());
         assert_eq!(c.price(&o).cost_nanos, Some(3_270_000));
@@ -570,7 +947,7 @@ mod tier_tests {
     }
     #[test]
     fn anthropic_batch_and_ttl_subsets() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("anthropic", "claude-sonnet-5-5");
         o.service_tier = Some("batch".into());
         assert_eq!(c.price(&o).cost_nanos, Some(1_672_500));
@@ -582,7 +959,7 @@ mod tier_tests {
     }
     #[test]
     fn sonnet_cache_discount_is_model_specific() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("anthropic", "claude-sonnet-5-5");
         o.service_tier = Some("standard".into());
         o.tokens = Tokens {
@@ -598,7 +975,7 @@ mod tier_tests {
     }
     #[test]
     fn haiku_threshold_prices_each_cache_ttl_and_includes_cached_input() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("anthropic", "claude-haiku-5-5");
         o.service_tier = Some("standard".into());
         o.tokens = Tokens {
@@ -622,7 +999,7 @@ mod tier_tests {
     }
     #[test]
     fn published_speed_multipliers_and_context_restrictions_are_model_specific() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("openai", "gpt-6.1-sol");
         o.service_tier = Some("ultrafast".into());
         assert_eq!(c.price(&o).cost_nanos, Some(19_620_000));
@@ -645,7 +1022,7 @@ mod tier_tests {
     }
     #[test]
     fn display_aliases_match_without_guessing_unknown_models_or_losing_exact_overrides() {
-        let mut c = Catalogue::load(None).unwrap();
+        let mut c = Catalogue::provider_fixture();
         let mut o = event("anthropic", "  CLAUDE-SONNET-5-5 [1M]  ");
         o.service_tier = Some("standard".into());
         let alias = c.price(&o).cost_nanos;
@@ -662,7 +1039,7 @@ mod tier_tests {
     }
     #[test]
     fn unavailable_claude_region_is_an_explicit_global_estimate() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("anthropic", "claude-opus-5-5");
         o.service_tier = Some("standard".into());
         let global = c.price(&o).cost_nanos.unwrap();
@@ -680,7 +1057,7 @@ mod tier_tests {
     }
     #[test]
     fn override_is_distinct_and_historical_boundary_is_exclusive() {
-        let mut c = Catalogue::load(None).unwrap();
+        let mut c = Catalogue::provider_fixture();
         let rate = c.rates.iter_mut().find(|r| r.models.contains(&"gpt-6.1-sol".into())).unwrap();
         rate.effective_from = Some("2025-01-01".into());
         rate.effective_until = Some("2026-10-07".into());
@@ -699,7 +1076,7 @@ mod tier_tests {
     }
     #[test]
     fn no_start_rate_backdates_older_events_without_partial() {
-        let c = Catalogue::load(None).unwrap();
+        let c = Catalogue::provider_fixture();
         let mut o = event("anthropic", "claude-sonnet-4-6");
         o.service_tier = Some("standard".into());
         o.event_at_ms = date_ms("2025-01-01").unwrap();
@@ -715,7 +1092,7 @@ mod tier_tests {
     }
     #[test]
     fn explicit_start_rate_keeps_older_events_unpriced() {
-        let mut c = Catalogue::load(None).unwrap();
+        let mut c = Catalogue::provider_fixture();
         let rate = c.rates.iter_mut().find(|r| r.models.contains(&"claude-sonnet-4-6".into())).unwrap();
         rate.effective_from = Some("2026-01-01".into());
         let mut o = event("anthropic", "claude-sonnet-4-6");
