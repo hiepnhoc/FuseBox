@@ -1048,6 +1048,9 @@ mod tests {
         credential.access_token = "FAKE_NEWER_ACCESS".into();
         assert!(publish_refreshed(&account, credential, vec![]));
         assert_eq!(account.state.lock().last_error(Utc::now()), Some("upstream returned 403"));
+    }
+
+    #[test]
     fn refresh_keeps_removed_account_settings_removed() {
         let directory = Directory::new();
         let path = directory.0.join("account.json");
