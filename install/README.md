@@ -28,14 +28,15 @@ bash install/install.sh --codex
 powershell -ExecutionPolicy Bypass -File install\install.ps1 -Codex
 ```
 
-Nếu fork này public, chạy thẳng từ GitHub mà không cần clone:
+Chạy thẳng từ GitHub mà không cần clone. URL phải là branch `kiro`: script trên
+`main` giống upstream và mặc định tải release của `DigitalPals/Fusebox`, không có HiBox.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/hiepnhoc/FuseBox/main/install/install.sh | bash -s -- --codex
+curl -fsSL https://raw.githubusercontent.com/hiepnhoc/FuseBox/kiro/install/install.sh | bash -s -- --codex
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/hiepnhoc/FuseBox/main/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/hiepnhoc/FuseBox/kiro/install/install.ps1 | iex
 ```
 
 Cờ `--codex` / `-Codex` ghi provider `fusebox` vào `~/.codex/config.toml`

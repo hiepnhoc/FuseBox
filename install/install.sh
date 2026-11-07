@@ -3,7 +3,7 @@
 # the latest GitHub release, and keep it running in the background on
 # http://127.0.0.1:8317. Running the script again updates to the newest release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/hiepnhoc/FuseBox/main/install/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/hiepnhoc/FuseBox/kiro/install/install.sh | bash
 #   bash install.sh [--codex] [--no-service] [--force] [--uninstall]
 #
 # Environment overrides:

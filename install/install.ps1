@@ -5,7 +5,7 @@
   Running the script again updates to the newest release.
 
 .EXAMPLE
-  irm https://raw.githubusercontent.com/hiepnhoc/FuseBox/main/install/install.ps1 | iex
+  irm https://raw.githubusercontent.com/hiepnhoc/FuseBox/kiro/install/install.ps1 | iex
   powershell -ExecutionPolicy Bypass -File install.ps1 [-Codex] [-NoService] [-Force] [-Uninstall]
 
 .PARAMETER Repo       GitHub repo whose releases are used (default hiepnhoc/FuseBox; DigitalPals/Fusebox for upstream)
