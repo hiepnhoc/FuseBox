@@ -178,7 +178,7 @@ pub async fn start_login_with(app: &Arc<App>, provider: Provider, opts: LoginOpt
                 tokio::spawn(async move {
                     let result = async {
                         let signed = crate::kiro::wait_device(&http, &dev).await?;
-                        save_signed(&app2, provider, signed)
+                        save_signed(&app2, provider, signed).await
                     }
                     .await;
                     settle(&app2, &state2, &result);

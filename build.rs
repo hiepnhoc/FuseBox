@@ -121,7 +121,7 @@ fn link_probe(args: &[&str]) -> bool {
 /// until it changes. Assets are listed after every asset they name.
 fn build_assets() {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
-    let mut declarations = String::from("static ASSETS: [(&str, Asset); 11] = [\n");
+    let mut declarations = String::from("static ASSETS: [(&str, Asset); 12] = [\n");
     let mut versions: Vec<(String, String)> = Vec::new();
     for (path, file, content_type) in [
         ("app.js", "app.js", "text/javascript; charset=utf-8"),

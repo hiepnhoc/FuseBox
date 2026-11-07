@@ -315,22 +315,22 @@ pub fn add_key(doc: &mut Yaml, k: &NewKey) {
 pub fn set_models(doc: &mut Yaml, group: &str, models: &[(String, Option<String>)]) -> bool {
     fn apply(list: Option<&mut Vec<Yaml>>, group: &str, models: &[(String, Option<String>)]) -> bool {
         let Some(e) = list.and_then(|l| {
-            l.iter_mut().filter_map(Yaml::as_mapping_mut).find(|e| e.get("name").and_then(Yaml::as_str) == Some(group))
+            l.iter_mut().filter_map(Yaml::as_object_mut).find(|e| e.get("name").and_then(Yaml::as_str) == Some(group))
         }) else {
             return false;
         };
-        e.insert(key("models"), models_yaml(models));
+        e.insert(mkey("models"), models_yaml(models));
         true
     }
-    let Some(root) = doc.as_mapping_mut() else { return false };
-    if apply(root.get_mut("openai-compatibility").and_then(Yaml::as_sequence_mut), group, models) {
+    let Some(root) = doc.as_object_mut() else { return false };
+    if apply(root.get_mut("openai-compatibility").and_then(Yaml::as_array_mut), group, models) {
         return true;
     }
     let v8 = root
         .get_mut("api-keys")
-        .and_then(Yaml::as_mapping_mut)
+        .and_then(Yaml::as_object_mut)
         .and_then(|m| m.get_mut("openai-compatibility"))
-        .and_then(Yaml::as_sequence_mut);
+        .and_then(Yaml::as_array_mut);
     apply(v8, group, models)
 }
 
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn set_models_replaces_one_groups_list_in_both_layouts() {
-        let mut flat: Yaml = serde_yaml::from_str(
+        let mut flat: Yaml = crate::yaml::from_str(
             "openai-compatibility:\n  - name: a\n    base-url: https://a/v1\n    models: [{name: old}]\n  - name: b\n    models: [{name: keep}]\n",
         )
         .unwrap();
@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(flat["openai-compatibility"][1]["models"][0]["name"].as_str(), Some("keep"));
         assert!(!set_models(&mut flat, "zzz", &[("x".into(), None)]));
         let mut v8: Yaml =
-            serde_yaml::from_str("api-keys:\n  openai-compatibility:\n    - name: a\n      models: [{name: old}]\n")
+            crate::yaml::from_str("api-keys:\n  openai-compatibility:\n    - name: a\n      models: [{name: old}]\n")
                 .unwrap();
         assert!(set_models(&mut v8, "a", &[("x".into(), None)]));
         assert_eq!(v8["api-keys"]["openai-compatibility"][0]["models"][0]["name"].as_str(), Some("x"));
