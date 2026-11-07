@@ -77,6 +77,7 @@ pub enum Action {
     Kill,
 }
 
+#[cfg(unix)]
 impl Action {
     fn signal(self) -> libc::c_int {
         match self {
@@ -100,6 +101,7 @@ pub fn order(action: Action, pids: &[i32]) -> Vec<i32> {
 
 /// Sends the action's signal to every pid. Processes that are already gone are fine;
 /// this server itself is never a target.
+#[cfg(unix)]
 pub fn signal(action: Action, pids: &[i32]) -> Result<usize> {
     let me = std::process::id() as i32;
     if pids.contains(&me) {
@@ -125,6 +127,17 @@ pub fn signal(action: Action, pids: &[i32]) -> Result<usize> {
     Ok(sent)
 }
 
+/// Windows has no POSIX signals, and the page only reads the process table on macOS,
+/// so there is nothing to act on here: refuse with the same self-protection as above.
+#[cfg(not(unix))]
+pub fn signal(_action: Action, pids: &[i32]) -> Result<usize> {
+    let me = std::process::id() as i32;
+    if pids.contains(&me) {
+        bail!("that would stop Fusebox itself");
+    }
+    bail!("process signals are only supported on macOS and Linux")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +157,7 @@ mod tests {
         assert!(e.to_string().contains("Fusebox itself"), "{e}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_gone_process_is_not_an_error() {
         // A pid this high is not in use on a test machine.
