@@ -1,7 +1,7 @@
 # Cài Fusebox chạy local trên từng máy
 
-Hai script trong thư mục này tải bản release mới nhất của Fusebox từ GitHub
-(mặc định `DigitalPals/Fusebox`, bản chính thức), kiểm tra SHA256, cài vào
+Hai script trong thư mục này tải bản release mới nhất của fork này từ GitHub
+(`hiepnhoc/FuseBox`, bản HiBox build từ branch `kiro`), kiểm tra SHA256, cài vào
 PATH và đăng ký cho Fusebox tự chạy nền khi đăng nhập máy, lắng nghe ở
 `http://127.0.0.1:8317`. **Chạy lại script là update.** Không cần cài Rust,
 Docker hay Node.
@@ -46,7 +46,23 @@ Các cờ khác: `--no-service` / `-NoService` chỉ cài binary, `--force` /
 `-Force` cài lại dù đã đúng version, `--uninstall` / `-Uninstall` gỡ service
 và binary nhưng giữ `~/.fusebox`. Biến môi trường `FUSEBOX_REPO` đổi repo
 lấy release (ví dụ sang fork của mình khi có sửa code riêng),
-`FUSEBOX_VERSION` ghim một tag cụ thể.
+`FUSEBOX_VERSION` ghim một tag cụ thể. Đặt `FUSEBOX_REPO=DigitalPals/Fusebox`
+để lấy bản gốc upstream thay cho bản HiBox.
+
+## Ra bản mới
+
+Release được GitHub Actions build khi push một tag trùng với `version` trong
+`Cargo.toml` của branch `kiro`, ví dụ `0.10.1-hibox.1` → tag `v0.10.1-hibox.1`:
+
+```sh
+git checkout kiro
+# sửa version trong Cargo.toml và dòng version của package fusebox trong Cargo.lock
+git commit -am "Prepare v0.10.1-hibox.2"
+git tag v0.10.1-hibox.2 && git push origin kiro v0.10.1-hibox.2
+```
+
+Workflow build Mac ARM, Mac Intel, Windows x64, Linux x64 và Linux ARM, rồi tạo
+Release kèm SHA256SUMS. Xong thì chạy lại script cài trên từng máy.
 
 ## Sau khi cài, trên mỗi máy
 

@@ -8,7 +8,7 @@
   irm https://raw.githubusercontent.com/hiepnhoc/FuseBox/main/install/install.ps1 | iex
   powershell -ExecutionPolicy Bypass -File install.ps1 [-Codex] [-NoService] [-Force] [-Uninstall]
 
-.PARAMETER Repo       GitHub repo whose releases are used (default DigitalPals/Fusebox)
+.PARAMETER Repo       GitHub repo whose releases are used (default hiepnhoc/FuseBox; DigitalPals/Fusebox for upstream)
 .PARAMETER Version    "latest" or a tag such as v0.14.0
 .PARAMETER Codex      also point ~/.codex/config.toml at Fusebox
 .PARAMETER NoService  install the binary only, don't register the background task
@@ -18,7 +18,7 @@
 #>
 [CmdletBinding()]
 param(
-  [string]$Repo = $(if ($env:FUSEBOX_REPO) { $env:FUSEBOX_REPO } else { 'DigitalPals/Fusebox' }),
+  [string]$Repo = $(if ($env:FUSEBOX_REPO) { $env:FUSEBOX_REPO } else { 'hiepnhoc/FuseBox' }),
   [string]$Version = $(if ($env:FUSEBOX_VERSION) { $env:FUSEBOX_VERSION } else { 'latest' }),
   [switch]$Codex,
   [switch]$NoService,
@@ -126,8 +126,12 @@ if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
 # ------------------------------------------------------------- resolve tag ----
 if ($Version -eq 'latest') {
   try {
-    $Tag = (Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" `
-      -Headers @{ 'User-Agent' = 'fusebox-install' }).tag_name
+    # Newest release including pre-releases such as v0.10.1-hibox.1, which
+    # GitHub's /releases/latest skips.
+    $rel = @(Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases?per_page=1" `
+      -Headers @{ 'User-Agent' = 'fusebox-install' })
+    $Tag = $rel[0].tag_name
+    if (-not $Tag) { throw 'no releases' }
   } catch {
     # API rate-limited or blocked: follow the /releases/latest redirect instead.
     $resp = [Net.HttpWebRequest]::Create("https://github.com/$Repo/releases/latest")

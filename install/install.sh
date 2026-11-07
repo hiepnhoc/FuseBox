@@ -7,13 +7,13 @@
 #   bash install.sh [--codex] [--no-service] [--force] [--uninstall]
 #
 # Environment overrides:
-#   FUSEBOX_REPO=DigitalPals/Fusebox   GitHub repo whose releases are used
+#   FUSEBOX_REPO=hiepnhoc/FuseBox      GitHub repo whose releases are used (DigitalPals/Fusebox for upstream)
 #   FUSEBOX_VERSION=latest             or a tag such as v0.14.0
 #   FUSEBOX_BIN_DIR=~/.local/bin       where the binary goes
 #   FUSEBOX_HOME=~/.fusebox            config.yaml, sign-ins, usage database
 set -euo pipefail
 
-REPO="${FUSEBOX_REPO:-DigitalPals/Fusebox}"
+REPO="${FUSEBOX_REPO:-hiepnhoc/FuseBox}"
 VERSION="${FUSEBOX_VERSION:-latest}"
 BIN_DIR="${FUSEBOX_BIN_DIR:-$HOME/.local/bin}"
 FUSEBOX_HOME="${FUSEBOX_HOME:-$HOME/.fusebox}"
@@ -159,8 +159,14 @@ fi
 # ------------------------------------------------------------- resolve tag ----
 need curl; need tar
 if [[ "$VERSION" == latest ]]; then
-  TAG="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
-  TAG="${TAG##*/}"
+  # Newest release including pre-releases such as v0.10.1-hibox.1, which
+  # GitHub's /releases/latest redirect skips. Fall back to that redirect.
+  TAG="$(curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/releases?per_page=1" 2>/dev/null \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1 || true)"
+  if [[ "$TAG" != v* ]]; then
+    TAG="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
+    TAG="${TAG##*/}"
+  fi
   [[ "$TAG" == v* ]] || die "could not resolve the latest release of $REPO"
 else
   TAG="$VERSION"; [[ "$TAG" == v* ]] || TAG="v$TAG"
